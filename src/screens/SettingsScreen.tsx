@@ -1,8 +1,7 @@
 import React, { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, ScrollView } from 'react-native';
 import { colors, fonts, fontSize } from '../theme';
-import { ensureIdentity } from '../services/identity';
-import { updateDisplayName } from '../db/database';
+import { ensureIdentity, updateDisplayName } from '../services/identity';
 import { TerminalHeader } from '../components/TerminalHeader';
 
 export function SettingsScreen() {

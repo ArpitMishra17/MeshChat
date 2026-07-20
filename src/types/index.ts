@@ -21,7 +21,9 @@ export interface Conversation {
   createdAt: number;
 }
 
-export type MessageStatus = 'sending' | 'sent' | 'failed';
+// P0.5 — Status ladder: sending -> sent (radio accepted) -> delivered (ACK received).
+// Phase 5 will add `queued` in front and `failed` is terminal.
+export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'failed';
 
 export interface Message {
   id: string;
@@ -30,6 +32,7 @@ export interface Message {
   text: string;
   status: MessageStatus;
   createdAt: number;
+  deliveredAt: number | null;
 }
 
 export interface HandshakePayload {
@@ -42,6 +45,7 @@ export interface MessagePayload {
   type: 'message';
   id: string;
   senderDeviceId: string;
+  senderDisplayName: string;
   text: string;
   timestamp: number;
 }

@@ -8,10 +8,11 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors, fonts, fontSize } from '../theme';
 import { bleService } from '../services/ble';
 import type { BLEState } from '../services/ble';
+import { messageRouter } from '../services/messageRouter';
 import {
-  getMessages, insertMessage, updateMessageStatus, messageExists,
+  getMessages, insertMessage, updateMessageStatus,
 } from '../db/database';
-import { getDeviceId } from '../services/identity';
+import { ensureIdentity } from '../services/identity';
 import { MessageBubble } from '../components/MessageBubble';
 import { StatusBadge } from '../components/StatusBadge';
 import type { Message, MessagePayload } from '../types';
@@ -26,42 +27,41 @@ export function ChatScreen({ route }: Props) {
   const [bleState, setBleState] = useState<BLEState>(bleService.getState());
   const flatListRef = useRef<FlatList>(null);
   const insets = useSafeAreaInsets();
-  const myDeviceId = getDeviceId();
+  const myDeviceId = ensureIdentity().deviceId;
+
+  // P0.1 — read-only view over the DB. The MessageRouter owns all writes
+  // (incoming messages, ACK flips). We just re-query on its emits.
+  const refresh = useCallback(() => {
+    setMessages(getMessages(conversationId));
+  }, [conversationId]);
 
   useEffect(() => {
-    setMessages(getMessages(conversationId));
-
-    bleService.setOnMessageReceived((payload: MessagePayload) => {
-      if (messageExists(payload.id)) return;
-      const msg = insertMessage(conversationId, payload.senderDeviceId, payload.text, 'sent', payload.id);
-      setMessages(prev => [...prev, msg]);
-      bleService.sendAck(payload.id);
-    });
-
-    bleService.setOnAckReceived(ackPayload => {
-      updateMessageStatus(ackPayload.messageId, 'sent');
-      setMessages(prev => prev.map(m => m.id === ackPayload.messageId ? { ...m, status: 'sent' } : m));
-    });
-
-    bleService.setOnStateChanged(setBleState);
-
+    refresh();
+    const unsubMessages = messageRouter.messagesChanged.subscribe(refresh);
+    const unsubState = bleService.subscribeState(setBleState);
     return () => {
-      bleService.setOnMessageReceived(null);
-      bleService.setOnAckReceived(null);
-      bleService.setOnStateChanged(null);
+      unsubMessages();
+      unsubState();
     };
-  }, [conversationId]);
+  }, [refresh]);
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
     if (!text) return;
     setInput('');
 
+    // P0.5 — insert as 'sending'. The BLE write resolving flips us to
+    // 'sent' (radio accepted); the receiver's ACK flips us to 'delivered'.
     const msg = insertMessage(conversationId, myDeviceId, text, 'sending');
     setMessages(prev => [...prev, msg]);
 
     const payload: MessagePayload = {
-      type: 'message', id: msg.id, senderDeviceId: myDeviceId, text, timestamp: msg.createdAt,
+      type: 'message',
+      id: msg.id,
+      senderDeviceId: myDeviceId,
+      senderDisplayName: ensureIdentity().displayName,
+      text,
+      timestamp: msg.createdAt,
     };
 
     try {
@@ -79,7 +79,12 @@ export function ChatScreen({ route }: Props) {
     setMessages(prev => prev.map(m => m.id === message.id ? { ...m, status: 'sending' as const } : m));
 
     const payload: MessagePayload = {
-      type: 'message', id: message.id, senderDeviceId: myDeviceId, text: message.text, timestamp: message.createdAt,
+      type: 'message',
+      id: message.id,
+      senderDeviceId: myDeviceId,
+      senderDisplayName: ensureIdentity().displayName,
+      text: message.text,
+      timestamp: message.createdAt,
     };
 
     try {
@@ -92,11 +97,16 @@ export function ChatScreen({ route }: Props) {
     }
   }, [myDeviceId]);
 
+  // P0.8 — compute the keyboard offset from the actual header height
+  // (insets.top + header padding) instead of a hard-coded 90.
+  const headerHeight = insets.top + 12 + 40; // paddingTop + paddingVertical(~) + content
+  const keyboardOffset = Platform.OS === 'ios' ? headerHeight : 0;
+
   return (
     <KeyboardAvoidingView
       style={styles.container}
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      keyboardVerticalOffset={90}>
+      keyboardVerticalOffset={keyboardOffset}>
       <View style={[styles.header, { paddingTop: insets.top + 12 }]}>
         <View style={styles.headerLeft}>
           <Text style={styles.headerPrompt}>{'>'}</Text>

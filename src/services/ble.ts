@@ -4,6 +4,7 @@ import BlePeripheral from '../../modules/BlePeripheral';
 import { ensureIdentity } from './identity';
 import { upsertPeer } from '../db/database';
 import { encodePayload, decodeChunk } from './protocol';
+import type { EncodeOptions } from './protocol';
 import type {
   Peer,
   BLEPayload,
@@ -17,25 +18,62 @@ const HANDSHAKE_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef1';
 const MESSAGE_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef2';
 const ACK_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef3';
 
+/** P0.3 — How long the central waits for the peripheral's HELLO notification. */
+const HANDSHAKE_TIMEOUT_MS = 8000;
+
 export type BLEState = 'idle' | 'scanning' | 'connecting' | 'connected' | 'error';
 
-type PeerDiscoveredCallback = (peer: Peer) => void;
-type MessageReceivedCallback = (payload: MessagePayload) => void;
-type AckReceivedCallback = (payload: AckPayload) => void;
 type StateChangedCallback = (state: BLEState) => void;
+
+/**
+ * Result of `connectToPeer`. The caller (NearbyScreen) awaits the handshake
+ * exchange before opening a conversation, so the conversation is keyed on the
+ * peer's real deviceId — never on the rotating BLE MAC (P0.3).
+ */
+export interface ConnectResult {
+  device: Device;
+  handshake: HandshakePayload;
+}
+
+/**
+ * Typed emitter that carries a payload to its listeners.
+ * Tiny wrapper around the payload-less `Emitter` in events.ts.
+ */
+class PayloadEmitter<T> {
+  private listeners = new Set<(payload: T) => void>();
+  subscribe(fn: (payload: T) => void): () => void {
+    this.listeners.add(fn);
+    return () => { this.listeners.delete(fn); };
+  }
+  emit(payload: T): void {
+    const snapshot = Array.from(this.listeners);
+    for (const fn of snapshot) {
+      try { fn(payload); } catch (e) { console.warn('[BLE emitter] listener threw:', e); }
+    }
+  }
+}
 
 class BLEService {
   private manager: BleManager;
   private scanning = false;
+  /** P0.4 — armed by startScan, cleared by stopScan / connectToPeer. */
+  private scanTimer: ReturnType<typeof setTimeout> | null = null;
   private connectedDevice: Device | null = null;
+  /** P0.7 — MTU negotiated on the central side, plumbed into encodePayload. */
+  private negotiatedMtu: number | null = null;
   private subscriptions: Subscription[] = [];
   private state: BLEState = 'idle';
   private peripheralStarted = false;
 
-  private onPeerDiscovered: PeerDiscoveredCallback | null = null;
-  private onMessageReceived: MessageReceivedCallback | null = null;
-  private onAckReceived: AckReceivedCallback | null = null;
-  private onStateChanged: StateChangedCallback | null = null;
+  // P0.1 — multi-subscriber emitters so the MessageRouter (always-on) and a
+  // mounted screen (ephemeral) can both listen without one clobbering the
+  // other. The previous single-slot setters caused the router to lose
+  // callbacks whenever a screen null'd the slot on unmount.
+  readonly peerDiscovered = new PayloadEmitter<Peer>();
+  readonly messageReceived = new PayloadEmitter<MessagePayload>();
+  readonly ackReceived = new PayloadEmitter<AckPayload>();
+  readonly handshakeReceived = new PayloadEmitter<{ payload: HandshakePayload; bleId: string | null }>();
+  readonly stateChanged = new PayloadEmitter<BLEState>();
 
   private discoveredDevices = new Map<string, number>();
   public lastLog = '';
@@ -48,24 +86,26 @@ class BLEService {
   // --- Peripheral (GATT Server) Setup ---
 
   private setupPeripheralListeners() {
-    // Listen for writes from connected centrals (incoming messages)
+    // Listen for writes from connected centrals (incoming messages / handshakes).
     const writeSubscription = BlePeripheral.addListener(
       'onCharacteristicWriteRequest',
       (event: { characteristicUUID: string; value: string; deviceAddress: string }) => {
-        console.log(`[BLE RECV] Write on ${event.characteristicUUID.slice(-4)} from ${event.deviceAddress.slice(-5)}, value len=${event.value?.length}`);
+        console.log(
+          `[BLE RECV] Write on ${event.characteristicUUID.slice(-4)} ` +
+            `from ${event.deviceAddress.slice(-5)}, value len=${event.value?.length}`,
+        );
         try {
           const sourceKey = `${event.deviceAddress}_${event.characteristicUUID}`;
           const payload = this.decodeFromPeripheral(event.value, sourceKey);
-
           // payload is null if still assembling fragments
           if (!payload) return;
 
           console.log('[BLE Peripheral] Decoded payload:', payload.type);
 
           if (payload.type === 'message') {
-            this.onMessageReceived?.(payload as MessagePayload);
+            this.messageReceived.emit(payload as MessagePayload);
           } else if (payload.type === 'ack') {
-            this.onAckReceived?.(payload as AckPayload);
+            this.ackReceived.emit(payload as AckPayload);
           } else if (payload.type === 'handshake') {
             const hp = payload as HandshakePayload;
             const peer: Peer = {
@@ -76,7 +116,14 @@ class BLEService {
               bleId: event.deviceAddress,
             };
             upsertPeer(peer);
-            this.onPeerDiscovered?.(peer);
+            this.peerDiscovered.emit(peer);
+            this.handshakeReceived.emit({ payload: hp, bleId: event.deviceAddress });
+
+            // P0.3 — peripheral responds with its own handshake notification
+            // so the central learns our real deviceId/name. Broadcast is fine
+            // here because Phase 0 is single-link; per-device addressing lands
+            // in Phase 3.
+            void this.notifyHandshake();
           }
         } catch (e) {
           console.warn('[BLE Peripheral] Failed to parse write:', e);
@@ -95,6 +142,8 @@ class BLEService {
         this.setState('idle');
       }
     });
+
+    void writeSubscription;
   }
 
   async startPeripheral(): Promise<string> {
@@ -118,18 +167,24 @@ class BLEService {
     return result;
   }
 
-  // --- Listeners ---
+  // --- Listeners (multi-subscriber; see PayloadEmitter) ---
+  //
+  // All BLE callbacks are exposed as emitters. This fixes the original
+  // single-slot bug where the MessageRouter (always-on) and a mounted
+  // screen (ephemeral) would fight over `onPeerDiscovered` — the screen's
+  // unmount would null the slot and the router would silently stop
+  // receiving events.
 
-  setOnPeerDiscovered(cb: PeerDiscoveredCallback | null) { this.onPeerDiscovered = cb; }
-  setOnMessageReceived(cb: MessageReceivedCallback | null) { this.onMessageReceived = cb; }
-  setOnAckReceived(cb: AckReceivedCallback | null) { this.onAckReceived = cb; }
-  setOnStateChanged(cb: StateChangedCallback | null) { this.onStateChanged = cb; }
+  /** Subscribe to BLE state changes. Returns an unsubscribe function. */
+  subscribeState(cb: StateChangedCallback): () => void {
+    return this.stateChanged.subscribe(cb);
+  }
 
   getState(): BLEState { return this.state; }
 
   private setState(newState: BLEState) {
     this.state = newState;
-    this.onStateChanged?.(newState);
+    this.stateChanged.emit(newState);
   }
 
   // --- Permissions ---
@@ -179,7 +234,8 @@ class BLEService {
     this.discoveredDevices.clear();
 
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
+      // P0.4 — track the timer so connectToPeer / stopScan can cancel it.
+      this.scanTimer = setTimeout(() => {
         this.stopScan();
         resolve();
       }, durationMs);
@@ -191,7 +247,7 @@ class BLEService {
         { allowDuplicates: false },
         (error, device) => {
           if (error) {
-            clearTimeout(timeout);
+            this.clearScanTimer();
             this.scanning = false;
             this.setState('error');
             reject(error);
@@ -210,9 +266,24 @@ class BLEService {
   }
 
   stopScan(): void {
+    // P0.4 — cancel the pending timeout so it can't fire setState('idle')
+    // after we've already moved on to connecting / connected.
+    this.clearScanTimer();
     this.manager.stopDeviceScan();
     this.scanning = false;
-    this.setState('idle');
+    // P0.4 — restore 'connected' if a link is up; otherwise we're idle.
+    this.setState(this.isAnyLinkUp() ? 'connected' : 'idle');
+  }
+
+  private clearScanTimer(): void {
+    if (this.scanTimer !== null) {
+      clearTimeout(this.scanTimer);
+      this.scanTimer = null;
+    }
+  }
+
+  private isAnyLinkUp(): boolean {
+    return this.connectedDevice !== null || BlePeripheral.getConnectedDeviceCount() > 0;
   }
 
   private handleDiscoveredDevice(device: Device) {
@@ -233,12 +304,18 @@ class BLEService {
     };
 
     upsertPeer(peer);
-    this.onPeerDiscovered?.(peer);
+    this.peerDiscovered.emit(peer);
   }
 
   // --- Connection (Central connects to Peripheral) ---
 
-  async connectToPeer(bleId: string): Promise<Device> {
+  /**
+   * Connect to a peer by BLE MAC and complete the mutual handshake before
+   * returning. The caller must NOT create a conversation from the BLE MAC —
+   * it should use the returned `handshake.deviceId` instead (P0.3).
+   */
+  async connectToPeer(bleId: string): Promise<ConnectResult> {
+    // P0.4 — stopScan clears the timer; state becomes 'connecting'.
     this.stopScan();
     this.setState('connecting');
 
@@ -246,22 +323,31 @@ class BLEService {
       const device = await this.manager.connectToDevice(bleId, { timeout: 10000 });
       // Request larger MTU so payloads don't get truncated (default is 20 bytes)
       const mtuDevice = await device.requestMTU(512);
-      console.log(`[BLE] Negotiated MTU: ${mtuDevice.mtu}`);
+      const mtu = mtuDevice.mtu ?? 23;
+      this.negotiatedMtu = mtu;
+      console.log(`[BLE] Negotiated MTU: ${mtu}`);
       await device.discoverAllServicesAndCharacteristics();
       this.connectedDevice = device;
       this.setState('connected');
 
       device.onDisconnected(() => {
         this.connectedDevice = null;
+        this.negotiatedMtu = null;
         this.cleanupSubscriptions();
         this.setState('idle');
       });
+
+      // P0.3 — subscribe to the peripheral's handshake notification BEFORE
+      // we send our own, so we don't race the reply. The promise resolves
+      // when the peripheral's HELLO arrives (or rejects on timeout).
+      const handshakePromise = this.subscribeToHandshake(device);
 
       await this.sendHandshake(device);
       this.subscribeToMessages(device);
       this.subscribeToAcks(device);
 
-      return device;
+      const handshake = await handshakePromise;
+      return { device, handshake };
     } catch (error) {
       this.setState('error');
       throw error;
@@ -272,13 +358,14 @@ class BLEService {
     if (this.connectedDevice) {
       try { await this.connectedDevice.cancelConnection(); } catch {}
       this.connectedDevice = null;
+      this.negotiatedMtu = null;
       this.cleanupSubscriptions();
       this.setState('idle');
     }
   }
 
   isConnected(): boolean {
-    return this.connectedDevice !== null || BlePeripheral.getConnectedDeviceCount() > 0;
+    return this.isAnyLinkUp();
   }
 
   // --- Handshake ---
@@ -291,6 +378,30 @@ class BLEService {
       displayName: identity.displayName,
     };
     await this.writeFragments(device, HANDSHAKE_CHAR_UUID, payload);
+  }
+
+  /**
+   * P0.3 — peripheral-side reply. Notifies our handshake back on the handshake
+   * characteristic so the central learns who we are. Broadcasts to all
+   * subscribed centrals (Phase 0 is single-link; per-device addressing is
+   * Phase 3's job).
+   */
+  private async notifyHandshake(): Promise<void> {
+    if (BlePeripheral.getConnectedDeviceCount() === 0) return;
+    const identity = ensureIdentity();
+    const payload: HandshakePayload = {
+      type: 'handshake',
+      deviceId: identity.deviceId,
+      displayName: identity.displayName,
+    };
+    try {
+      const fragments = this.encodeFragments(payload);
+      for (const frag of fragments) {
+        await BlePeripheral.sendNotification(HANDSHAKE_CHAR_UUID, frag);
+      }
+    } catch (e: any) {
+      console.warn('[BLE] notifyHandshake failed:', e?.message ?? e);
+    }
   }
 
   private async writeFragments(device: Device, charUUID: string, payload: BLEPayload): Promise<void> {
@@ -339,10 +450,69 @@ class BLEService {
           await BlePeripheral.sendNotification(ACK_CHAR_UUID, frag);
         }
       }
-    } catch {}
+    } catch (e: any) {
+      // P0.8 — was `catch {}`. Log so delivery failures surface during testing.
+      console.warn(`[BLE] sendAck failed for ${messageId}:`, e?.message ?? e);
+    }
   }
 
   // --- Central subscriptions (listen to peripheral's notifications) ---
+
+  /**
+   * P0.3 — Subscribe to the peripheral's handshake notification and resolve
+   * with the first HELLO we receive. Times out after `timeoutMs` so the
+   * caller isn't stuck if the peripheral never responds.
+   */
+  private subscribeToHandshake(device: Device): Promise<HandshakePayload> {
+    return new Promise((resolve, reject) => {
+      // Declare `sub` first so the timeout + monitor callbacks can reference
+      // it without a TDZ smell. Assigned immediately below.
+      let sub: Subscription;
+      const timeout = setTimeout(() => {
+        sub.remove();
+        const idx = this.subscriptions.indexOf(sub);
+        if (idx >= 0) this.subscriptions.splice(idx, 1);
+        reject(new Error('Handshake notification timeout'));
+      }, HANDSHAKE_TIMEOUT_MS);
+
+      sub = device.monitorCharacteristicForService(
+        SERVICE_UUID, HANDSHAKE_CHAR_UUID,
+        (error, characteristic) => {
+          if (error) {
+            clearTimeout(timeout);
+            console.warn('[BLE] Handshake monitor error:', error.message);
+            reject(error);
+            return;
+          }
+          if (!characteristic?.value) return;
+          try {
+            const payload = decodeChunk(characteristic.value, `central_handshake_${device.id}`);
+            if (payload?.type === 'handshake') {
+              clearTimeout(timeout);
+              const hp = payload as HandshakePayload;
+              const peer: Peer = {
+                deviceId: hp.deviceId,
+                displayName: hp.displayName,
+                lastSeen: Date.now(),
+                rssi: null,
+                bleId: device.id,
+              };
+              upsertPeer(peer);
+              this.peerDiscovered.emit(peer);
+              this.handshakeReceived.emit({ payload: hp, bleId: device.id });
+              sub.remove();
+              const idx = this.subscriptions.indexOf(sub);
+              if (idx >= 0) this.subscriptions.splice(idx, 1);
+              resolve(hp);
+            }
+          } catch (e: any) {
+            console.warn('[BLE] Failed to decode handshake notification:', e?.message ?? e);
+          }
+        },
+      );
+      this.subscriptions.push(sub);
+    });
+  }
 
   private subscribeToMessages(device: Device) {
     console.log(`[BLE] Subscribing to message notifications from ${device.id.slice(-8)}`);
@@ -359,7 +529,14 @@ class BLEService {
           const payload = decodeChunk(characteristic.value, `central_msg_${device.id}`);
           if (payload) {
             console.log('[BLE] Decoded message:', payload.type);
-            if (payload.type === 'message') this.onMessageReceived?.(payload);
+            if (payload.type === 'message') this.messageReceived.emit(payload);
+            else if (payload.type === 'handshake') {
+              // A late handshake notification (after the initial one resolved).
+              this.handshakeReceived.emit({
+                payload: payload as HandshakePayload,
+                bleId: device.id,
+              });
+            }
           }
         } catch (e: any) {
           console.warn('[BLE] Failed to decode notification:', e.message);
@@ -381,8 +558,10 @@ class BLEService {
         if (!characteristic?.value) return;
         try {
           const payload = decodeChunk(characteristic.value, `central_ack_${device.id}`);
-          if (payload?.type === 'ack') this.onAckReceived?.(payload);
-        } catch {}
+          if (payload?.type === 'ack') this.ackReceived.emit(payload);
+        } catch (e: any) {
+          console.warn('[BLE] Failed to decode ack notification:', e?.message ?? e);
+        }
       },
     );
     this.subscriptions.push(sub);
@@ -396,7 +575,11 @@ class BLEService {
   // --- Encoding / Decoding via binary protocol with fragmentation ---
 
   private encodeFragments(payload: BLEPayload): string[] {
-    return encodePayload(payload);
+    // P0.7 — use the negotiated MTU on the central path; peripheral-notify
+    // path falls back to the default (unknown MTU on the GATT server side).
+    const options: EncodeOptions | undefined =
+      this.negotiatedMtu != null ? { mtu: this.negotiatedMtu } : undefined;
+    return encodePayload(payload, options);
   }
 
   private decodeFromPeripheral(base64Value: string, sourceKey: string): BLEPayload | null {
@@ -409,6 +592,7 @@ class BLEService {
     this.stopScan();
     this.cleanupSubscriptions();
     this.connectedDevice = null;
+    this.negotiatedMtu = null;
     await BlePeripheral.stop();
     this.peripheralStarted = false;
     this.manager.destroy();

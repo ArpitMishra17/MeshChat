@@ -10,7 +10,10 @@ interface Props {
 
 const statusIndicator: Record<MessageStatus, { symbol: string; color: string }> = {
   sending: { symbol: '...', color: colors.sending },
-  sent: { symbol: '>>>', color: colors.primaryDim },
+  // P0.5 — 'sent' = radio accepted the write; 'delivered' = ACK received.
+  // Distinct glyphs so the user can see the difference at a glance.
+  sent: { symbol: '>>', color: colors.primaryDim },
+  delivered: { symbol: '>>ok', color: colors.success },
   failed: { symbol: 'ERR', color: colors.error },
 };
 

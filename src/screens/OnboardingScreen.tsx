@@ -1,8 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, StatusBar } from 'react-native';
 import { colors, fonts, fontSize } from '../theme';
-import { ensureIdentity } from '../services/identity';
-import { updateDisplayName } from '../db/database';
+import { createIdentity, updateDisplayName } from '../services/identity';
 
 interface Props {
   onComplete: () => void;
@@ -25,7 +24,8 @@ export function OnboardingScreen({ onComplete }: Props) {
   const [visibleLines, setVisibleLines] = useState<string[]>([]);
   const [showInput, setShowInput] = useState(false);
   const [name, setName] = useState('');
-  const [identity] = useState(() => ensureIdentity());
+  // P0.8 — onboarding is the only creator of an identity.
+  const [identity] = useState(() => createIdentity());
 
   useEffect(() => {
     let idx = 0;

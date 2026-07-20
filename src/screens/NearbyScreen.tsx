@@ -5,8 +5,9 @@ import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { colors, fonts, fontSize } from '../theme';
 import { bleService } from '../services/ble';
 import type { BLEState } from '../services/ble';
+import { messageRouter } from '../services/messageRouter';
 import { getOrCreateConversation, getAllPeers } from '../db/database';
-import { getDeviceId } from '../services/identity';
+import { ensureIdentity } from '../services/identity';
 import { PeerCard } from '../components/PeerCard';
 import { StatusBadge } from '../components/StatusBadge';
 import { TerminalHeader } from '../components/TerminalHeader';
@@ -23,8 +24,18 @@ export function NearbyScreen() {
   const [log, setLog] = useState('// idle');
 
   useEffect(() => {
-    setPeers(getAllPeers());
-    bleService.setOnPeerDiscovered(peer => {
+    const refresh = () => setPeers(getAllPeers());
+    refresh();
+
+    // P0.1 — peer table is owned by the MessageRouter / bleService; we just
+    // re-query on its emits instead of owning the callback ourselves.
+    const unsubPeers = messageRouter.peersChanged.subscribe(refresh);
+    const unsubState = bleService.subscribeState(setBleState);
+
+    // Subscribe directly to peer discovery too, so the list updates
+    // immediately on each scan hit (the router's emit is also fired, but
+    // this avoids waiting for a DB round-trip per discovery).
+    const unsubPeerDisc = bleService.peerDiscovered.subscribe(peer => {
       setPeers(prev => {
         const key = peer.bleId || peer.deviceId;
         const idx = prev.findIndex(p => (p.bleId || p.deviceId) === key);
@@ -33,7 +44,6 @@ export function NearbyScreen() {
           updated[idx] = peer;
           return updated;
         }
-        // Also check by display name to avoid duplicates
         const nameIdx = prev.findIndex(p => p.displayName === peer.displayName);
         if (nameIdx >= 0) {
           const updated = [...prev];
@@ -43,10 +53,11 @@ export function NearbyScreen() {
         return [peer, ...prev];
       });
     });
-    bleService.setOnStateChanged(setBleState);
+
     return () => {
-      bleService.setOnPeerDiscovered(null);
-      bleService.setOnStateChanged(null);
+      unsubPeers();
+      unsubState();
+      unsubPeerDisc();
     };
   }, []);
 
@@ -66,13 +77,17 @@ export function NearbyScreen() {
     async (peer: Peer) => {
       setLog(`// connecting to ${peer.displayName}...`);
       try {
-        if (peer.bleId) await bleService.connectToPeer(peer.bleId);
-        setLog(`// connected to ${peer.displayName}`);
-        const conversation = getOrCreateConversation(peer.deviceId, peer.displayName);
+        if (!peer.bleId) throw new Error('No BLE address for peer');
+        // P0.3 — connectToPeer completes the mutual handshake and returns
+        // the peer's real identity. We key the conversation on that, never
+        // on the rotating BLE MAC.
+        const { handshake } = await bleService.connectToPeer(peer.bleId);
+        setLog(`// connected to ${handshake.displayName}`);
+        const conversation = getOrCreateConversation(handshake.deviceId, handshake.displayName);
         navigation.navigate('Chat', {
           conversationId: conversation.id,
-          peerName: peer.displayName,
-          peerDeviceId: peer.deviceId,
+          peerName: handshake.displayName,
+          peerDeviceId: handshake.deviceId,
         });
       } catch (err: any) {
         setLog(`// connect ERR: ${err.message}`);
@@ -82,7 +97,7 @@ export function NearbyScreen() {
   );
 
   const isScanning = bleState === 'scanning';
-  const myId = getDeviceId();
+  const myId = ensureIdentity().deviceId;
 
   return (
     <View style={styles.container}>

@@ -1,9 +1,10 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { View, Text, FlatList, TouchableOpacity, StyleSheet } from 'react-native';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { colors, fonts, fontSize } from '../theme';
 import { getAllConversations } from '../db/database';
+import { messageRouter } from '../services/messageRouter';
 import { TerminalHeader } from '../components/TerminalHeader';
 import type { Conversation } from '../types';
 import type { RootStackParamList } from '../navigation';
@@ -24,7 +25,18 @@ export function ConversationsScreen() {
   const navigation = useNavigation<NavProp>();
   const [conversations, setConversations] = useState<Conversation[]>([]);
 
-  useFocusEffect(useCallback(() => { setConversations(getAllConversations()); }, []));
+  // P0.1 — refresh on focus (covers the case where we just came back from
+  // ChatScreen) AND on MessageRouter emits (covers new messages arriving
+  // while this screen is mounted but not focused).
+  useFocusEffect(useCallback(() => {
+    setConversations(getAllConversations());
+  }, []));
+
+  useEffect(() => {
+    return messageRouter.conversationsChanged.subscribe(() => {
+      setConversations(getAllConversations());
+    });
+  }, []);
 
   const handlePress = (conv: Conversation) => {
     navigation.navigate('Chat', {

@@ -5,6 +5,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { AppNavigator } from './src/navigation';
 import { OnboardingScreen } from './src/screens/OnboardingScreen';
 import { getDB, getIdentity } from './src/db/database';
+import { messageRouter } from './src/services/messageRouter';
 import { colors } from './src/theme';
 
 const navTheme = {
@@ -32,7 +33,21 @@ export default function App() {
     getDB();
     const identity = getIdentity();
     setShowOnboarding(!identity);
+    // P0.1 — start the app-level message router as soon as we know who we
+    // are. It owns the BLE message/ack callbacks for the lifetime of the
+    // app, so messages are persisted and ACKed regardless of which screen
+    // is mounted. Also started after onboarding completes (below).
+    if (identity) {
+      messageRouter.start();
+    }
   }, []);
+
+  // P0.1 — onboarding just created an identity; start the router now.
+  useEffect(() => {
+    if (showOnboarding === false) {
+      messageRouter.start();
+    }
+  }, [showOnboarding]);
 
   if (showOnboarding === null) return null;
 

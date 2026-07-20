@@ -1,5 +1,6 @@
 import * as SQLite from 'expo-sqlite';
 import type { Identity, Peer, Conversation, Message, MessageStatus } from '../types';
+import { generateMessageId, generateConversationId } from '../services/ids';
 
 let db: SQLite.SQLiteDatabase;
 
@@ -57,6 +58,29 @@ function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_messages_conversation
     ON messages(conversation_id, created_at);
   `);
+
+  runMigrations();
+}
+
+/**
+ * Sequential migrations keyed off `PRAGMA user_version`. Pre-release stance:
+ * additive ALTERs only. A wipe-and-recreate migration is deferred to Phase 2
+ * (when identity changes break the schema wholesale).
+ */
+function runMigrations() {
+  const versionRow = db.getAllSync<{ user_version: number }>('PRAGMA user_version');
+  let version = versionRow[0]?.user_version ?? 0;
+
+  // v1: add delivered_at column for the P0.5 status ladder.
+  if (version < 1) {
+    const cols = db.getAllSync<{ name: string }>('PRAGMA table_info(messages)');
+    if (!cols.some(c => c.name === 'delivered_at')) {
+      db.execSync('ALTER TABLE messages ADD COLUMN delivered_at INTEGER');
+    }
+    version = 1;
+  }
+
+  db.runSync(`PRAGMA user_version = ${version}`);
 }
 
 // --- Identity ---
@@ -155,7 +179,7 @@ export function getOrCreateConversation(
     };
   }
 
-  const id = generateId();
+  const id = generateConversationId();
   const now = Date.now();
   db.runSync(
     'INSERT INTO conversations (id, peer_device_id, peer_display_name, created_at) VALUES (?, ?, ?, ?)',
@@ -205,18 +229,30 @@ export function insertMessage(
   status: MessageStatus = 'sending',
   messageId?: string,
 ): Message {
-  const id = messageId || generateId();
+  const id = messageId || generateMessageId();
   const now = Date.now();
   db.runSync(
     'INSERT OR IGNORE INTO messages (id, conversation_id, sender_device_id, text, status, created_at) VALUES (?, ?, ?, ?, ?, ?)',
     [id, conversationId, senderDeviceId, text, status, now],
   );
   updateConversationLastMessage(conversationId, text, now);
-  return { id, conversationId, senderDeviceId, text, status, createdAt: now };
+  return { id, conversationId, senderDeviceId, text, status, createdAt: now, deliveredAt: null };
 }
 
 export function updateMessageStatus(messageId: string, status: MessageStatus): void {
   db.runSync('UPDATE messages SET status = ? WHERE id = ?', [status, messageId]);
+}
+
+/**
+ * P0.5 — Flip a message to `delivered` and stamp the delivery time. Distinct
+ * from `updateMessageStatus` so the delivered_at column is only ever written
+ * here, alongside the status transition that warrants it.
+ */
+export function markMessageDelivered(messageId: string): void {
+  db.runSync(
+    'UPDATE messages SET status = ?, delivered_at = ? WHERE id = ?',
+    ['delivered', Date.now(), messageId],
+  );
 }
 
 export function getMessages(conversationId: string): Message[] {
@@ -231,19 +267,11 @@ export function getMessages(conversationId: string): Message[] {
     text: row.text,
     status: row.status as MessageStatus,
     createdAt: row.created_at,
+    deliveredAt: row.delivered_at ?? null,
   }));
 }
 
 export function messageExists(messageId: string): boolean {
   const rows = db.getAllSync('SELECT 1 FROM messages WHERE id = ? LIMIT 1', [messageId]);
   return rows.length > 0;
-}
-
-function generateId(): string {
-  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-  let result = '';
-  for (let i = 0; i < 16; i++) {
-    result += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return `${Date.now().toString(36)}_${result}`;
 }

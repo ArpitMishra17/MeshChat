@@ -3,8 +3,8 @@ import { Platform, PermissionsAndroid } from 'react-native';
 import BlePeripheral from '../../modules/BlePeripheral';
 import { ensureIdentity } from './identity';
 import { upsertPeer } from '../db/database';
-import { encodePayload, decodeChunk } from './protocol';
-import type { EncodeOptions } from './protocol';
+import { encodeBLEPayload, decodeBLEChunk, BROADCAST_DST, DEFAULT_TTL } from './protocol';
+import { fingerprintFromDeviceId, generatePacketId } from './ids';
 import type {
   Peer,
   BLEPayload,
@@ -59,8 +59,17 @@ class BLEService {
   /** P0.4 — armed by startScan, cleared by stopScan / connectToPeer. */
   private scanTimer: ReturnType<typeof setTimeout> | null = null;
   private connectedDevice: Device | null = null;
-  /** P0.7 — MTU negotiated on the central side, plumbed into encodePayload. */
+  /** P0.7 — MTU negotiated on the central side, plumbed into encodeBLEPayload. */
   private negotiatedMtu: number | null = null;
+  /**
+   * Phase 1 — 8-byte fingerprints for the v2 packet header's src/dst fields.
+   * `myFingerprint` is derived from our own deviceId (Phase 2 swaps this for
+   * SHA-256(pubkey)); `peerFingerprint` is learned from the peer's HELLO.
+   * Phase 0 was single-link, so a single peer slot matches that assumption —
+   * Phase 3 will replace this with a per-link map.
+   */
+  private myFingerprint: Uint8Array | null = null;
+  private peerFingerprint: Uint8Array | null = null;
   private subscriptions: Subscription[] = [];
   private state: BLEState = 'idle';
   private peripheralStarted = false;
@@ -108,6 +117,9 @@ class BLEService {
             this.ackReceived.emit(payload as AckPayload);
           } else if (payload.type === 'handshake') {
             const hp = payload as HandshakePayload;
+            // Phase 1 — learn the peer's fingerprint so MESSAGE/ACK packets
+            // we notify back can carry a targeted dst instead of broadcast.
+            this.peerFingerprint = fingerprintFromDeviceId(hp.deviceId);
             const peer: Peer = {
               deviceId: hp.deviceId,
               displayName: hp.displayName,
@@ -139,6 +151,9 @@ class BLEService {
     BlePeripheral.addListener('onDeviceDisconnected', (event: { deviceAddress: string }) => {
       console.log('[BLE Peripheral] Central disconnected:', event.deviceAddress);
       if (BlePeripheral.getConnectedDeviceCount() === 0 && !this.connectedDevice) {
+        // Phase 1 — peer link is gone; forget the fingerprint so we don't
+        // address packets to a peer that is no longer reachable.
+        this.peerFingerprint = null;
         this.setState('idle');
       }
     });
@@ -333,6 +348,7 @@ class BLEService {
       device.onDisconnected(() => {
         this.connectedDevice = null;
         this.negotiatedMtu = null;
+        this.peerFingerprint = null;
         this.cleanupSubscriptions();
         this.setState('idle');
       });
@@ -347,6 +363,9 @@ class BLEService {
       this.subscribeToAcks(device);
 
       const handshake = await handshakePromise;
+      // Phase 1 — the peer's deviceId arrived in its HELLO; derive the
+      // fingerprint so subsequent MESSAGE/ACK packets are addressed to it.
+      this.peerFingerprint = fingerprintFromDeviceId(handshake.deviceId);
       return { device, handshake };
     } catch (error) {
       this.setState('error');
@@ -359,6 +378,7 @@ class BLEService {
       try { await this.connectedDevice.cancelConnection(); } catch {}
       this.connectedDevice = null;
       this.negotiatedMtu = null;
+      this.peerFingerprint = null;
       this.cleanupSubscriptions();
       this.setState('idle');
     }
@@ -486,7 +506,7 @@ class BLEService {
           }
           if (!characteristic?.value) return;
           try {
-            const payload = decodeChunk(characteristic.value, `central_handshake_${device.id}`);
+            const payload = decodeBLEChunk(characteristic.value, `central_handshake_${device.id}`);
             if (payload?.type === 'handshake') {
               clearTimeout(timeout);
               const hp = payload as HandshakePayload;
@@ -526,14 +546,16 @@ class BLEService {
         if (!characteristic?.value) return;
         console.log(`[BLE] Received notification on MESSAGE char, ${characteristic.value.length} bytes`);
         try {
-          const payload = decodeChunk(characteristic.value, `central_msg_${device.id}`);
+          const payload = decodeBLEChunk(characteristic.value, `central_msg_${device.id}`);
           if (payload) {
             console.log('[BLE] Decoded message:', payload.type);
             if (payload.type === 'message') this.messageReceived.emit(payload);
             else if (payload.type === 'handshake') {
               // A late handshake notification (after the initial one resolved).
+              const hp = payload as HandshakePayload;
+              this.peerFingerprint = fingerprintFromDeviceId(hp.deviceId);
               this.handshakeReceived.emit({
-                payload: payload as HandshakePayload,
+                payload: hp,
                 bleId: device.id,
               });
             }
@@ -557,7 +579,7 @@ class BLEService {
         }
         if (!characteristic?.value) return;
         try {
-          const payload = decodeChunk(characteristic.value, `central_ack_${device.id}`);
+          const payload = decodeBLEChunk(characteristic.value, `central_ack_${device.id}`);
           if (payload?.type === 'ack') this.ackReceived.emit(payload);
         } catch (e: any) {
           console.warn('[BLE] Failed to decode ack notification:', e?.message ?? e);
@@ -572,18 +594,34 @@ class BLEService {
     this.subscriptions = [];
   }
 
-  // --- Encoding / Decoding via binary protocol with fragmentation ---
+  // --- Encoding / Decoding via the v2 binary protocol with fragmentation ---
 
   private encodeFragments(payload: BLEPayload): string[] {
-    // P0.7 — use the negotiated MTU on the central path; peripheral-notify
-    // path falls back to the default (unknown MTU on the GATT server side).
-    const options: EncodeOptions | undefined =
-      this.negotiatedMtu != null ? { mtu: this.negotiatedMtu } : undefined;
-    return encodePayload(payload, options);
+    // Phase 1 — frame every payload as a v2 packet: src = our fingerprint,
+    // dst = the peer's (or broadcast for HELLO, since at handshake time we
+    // don't yet know who we're talking to / it's a discovery packet). msgId
+    // is a fresh random 64-bit id per packet (Phase 3 flooding dedup key).
+    // P0.7 — negotiated MTU on the central path; peripheral-notify path
+    // falls back to the default (unknown MTU on the GATT server side).
+    const isHandshake = payload.type === 'handshake';
+    return encodeBLEPayload(payload, {
+      src: this.getMyFingerprint(),
+      dst: isHandshake ? BROADCAST_DST : (this.peerFingerprint ?? BROADCAST_DST),
+      msgId: generatePacketId(),
+      ttl: DEFAULT_TTL,
+      mtu: this.negotiatedMtu ?? undefined,
+    });
+  }
+
+  private getMyFingerprint(): Uint8Array {
+    if (!this.myFingerprint) {
+      this.myFingerprint = fingerprintFromDeviceId(ensureIdentity().deviceId);
+    }
+    return this.myFingerprint;
   }
 
   private decodeFromPeripheral(base64Value: string, sourceKey: string): BLEPayload | null {
-    return decodeChunk(base64Value, sourceKey);
+    return decodeBLEChunk(base64Value, sourceKey);
   }
 
   // --- Cleanup ---
@@ -593,6 +631,8 @@ class BLEService {
     this.cleanupSubscriptions();
     this.connectedDevice = null;
     this.negotiatedMtu = null;
+    this.myFingerprint = null;
+    this.peerFingerprint = null;
     await BlePeripheral.stop();
     this.peripheralStarted = false;
     this.manager.destroy();

@@ -1,29 +1,46 @@
 /**
- * Binary protocol for BLE message encoding/decoding.
- * Inspired by BitChat's compact packet format.
+ * MeshChat Protocol v2 — versioned packets with addressing + TTL.
  *
- * Packet format:
- *   [type: 1 byte] [payload bytes...]
+ * Header (30 bytes fixed, laid out per PLAN.md Phase 1):
+ *   [0]      version     = 0x02
+ *   [1]      type        (HELLO / MESSAGE / ACK / POSITION / SYNC_*)
+ *   [2]      flags       bit0 = encrypted (Phase 2), bit1 = has-position (Phase 4)
+ *   [3]      ttl         decremented at each relay hop; packet dropped at 0 (Phase 3)
+ *   [4..11]  msgId       8 bytes — random 64-bit id (dedup key for flooding)
+ *   [12..19] src         8 bytes — sender fingerprint (Phase 2: pubkey hash)
+ *   [20..27] dst         8 bytes — destination fingerprint; 0x00*8 = broadcast
+ *   [28..29] payloadLen  2 bytes, big-endian
+ *   [30..]   payload     (type-specific body, `payloadLen` bytes)
  *
- * Types:
- *   0x01 = handshake:  [nameLen: 1] [name: utf8] [idLen: 1] [id: utf8]
- *   0x02 = message:    [idLen: 1] [id: utf8] [senderLen: 1] [senderId: utf8]
- *                      [senderNameLen: 1] [senderName: utf8] [text: utf8 rest]
- *   0x03 = ack:        [idLen: 1] [id: utf8]
+ * NOTE on size: PLAN.md says "20-byte fixed header" but the field list it
+ * gives sums to 30 (1+1+1+1+8+8+8+2). This implementation follows the field
+ * list — HEADER_SIZE is 30. The discrepancy is a miscount in the plan; every
+ * field and width listed there is honoured exactly.
  *
- * Fragmentation (for payloads > chunkSize):
- *   0xF0 = fragmentStart:    [totalLen: 2 BE] [seqTotal: 1] [msgSeq: 1] [data...]
- *   0xF1 = fragmentContinue: [seqNum: 1] [msgSeq: 1] [data...]
- *   0xF2 = fragmentEnd:      [seqNum: 1] [msgSeq: 1] [data...]
+ * Packet types (header.type):
+ *   0x01 HELLO       mutual handshake (pubkey + name + optional position)
+ *   0x02 MESSAGE     chat message (payload encrypted from Phase 2)
+ *   0x03 ACK         end-to-end delivery receipt, routed back like a MESSAGE
+ *   0x04 POSITION    position beacon (Phase 4, reserved now)
+ *   0x05 SYNC_OFFER  history sync (Phase 6, reserved now)
+ *   0x06 SYNC_REQ    history sync (Phase 6, reserved now)
  *
- * P0.2 — ids are 16 hex chars everywhere (no truncation on the wire).
- * P0.6 — a 1-byte msgSeq tags every fragment of a message so a stale
- *        FRAG_CONTINUE from message N cannot land in message N+1's buffer.
- *        Reassembly buffers also carry a timestamp and are swept after 10 s.
- * P0.7 — encodePayload accepts the negotiated MTU so chunks fill the link
- *        instead of being stuck at 18 bytes.
- * P0.8 — UTF-8 codec is TextEncoder/TextDecoder (Hermes ships both on
- *        RN 0.83), replacing the hand-rolled CESU-8 codec.
+ * Version negotiation: a v2 node receiving a v1 packet whose first byte is
+ * 0x01 (v1 HANDSHAKE) or 0x03 (v1 ACK) sees version != 0x02 and drops it. A
+ * v1 MESSAGE's first byte is 0x02, which collides with v2's version byte; the
+ * next byte (v1's id-length, 0x10) is not a valid v2 type, so it is dropped
+ * by type validation. No backward compatibility is provided — all test phones
+ * update together (PLAN.md Phase 1, task 2).
+ *
+ * Fragmentation: the existing 0xF0 / 0xF1 / 0xF2 scheme (with the P0.6
+ * fixes — per-buffer msgSeq tag + 10 s sweep) now wraps the *whole* v2 packet
+ * (header + body), not just the serialized body. The scheme itself is
+ * unchanged, so a v2 single-chunk packet's first byte is 0x02 (version),
+ * which is distinct from the 0xF0+ fragment markers.
+ *
+ * The pure core (`encodePacket` / `decodePacket` and the body serializers)
+ * has zero non-type imports — it is the part of the app that is cheaply
+ * unit-testable without BLE hardware or expo native modules.
  */
 
 import type {
@@ -33,20 +50,96 @@ import type {
   AckPayload,
 } from '../types';
 
-const TYPE_HANDSHAKE = 0x01;
-const TYPE_MESSAGE = 0x02;
-const TYPE_ACK = 0x03;
+// --- Protocol constants ---
+
+export const PROTOCOL_VERSION = 0x02;
+export const HEADER_SIZE = 30;
+
+export const TYPE_HELLO = 0x01;
+export const TYPE_MESSAGE = 0x02;
+export const TYPE_ACK = 0x03;
+export const TYPE_POSITION = 0x04;      // reserved — Phase 4
+export const TYPE_SYNC_OFFER = 0x05;    // reserved — Phase 6
+export const TYPE_SYNC_REQ = 0x06;      // reserved — Phase 6
+
+export const FLAG_ENCRYPTED = 0x01;     // Phase 2
+export const FLAG_HAS_POSITION = 0x02;  // Phase 4
+
+/** Default TTL for originated packets (Phase 3 floods with this). */
+export const DEFAULT_TTL = 5;
+
+export const FINGERPRINT_SIZE = 8;
+export const MSGID_SIZE = 8;
+
+/** All-zero dst = broadcast (delivered locally AND relayed by every node). */
+export const BROADCAST_DST = new Uint8Array(FINGERPRINT_SIZE);
+
+// Fragment markers (unchanged from v1 fragmentation scheme).
 const TYPE_FRAG_START = 0xf0;
 const TYPE_FRAG_CONTINUE = 0xf1;
 const TYPE_FRAG_END = 0xf2;
 
 // Conservative fallback when no MTU is known (peripheral-notify path).
 const DEFAULT_CHUNK_SIZE = 18;
-
-// P0.6 — buffers older than this are assumed orphaned (lost FRAG_END).
+// P0.6 — reassembly buffers older than this are assumed orphaned (lost END).
 const REASSEMBLY_TTL_MS = 10_000;
 
-// --- UTF-8 (P0.8) ---
+// --- Errors ---
+
+export class ProtocolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProtocolError';
+  }
+}
+
+/** Thrown when a packet's version byte is not PROTOCOL_VERSION. */
+export class ProtocolVersionError extends ProtocolError {
+  readonly receivedVersion: number;
+  constructor(version: number) {
+    super(
+      `Unsupported protocol version: 0x${version.toString(16)} ` +
+        `(expected 0x${PROTOCOL_VERSION.toString(16)})`,
+    );
+    this.name = 'ProtocolVersionError';
+    this.receivedVersion = version;
+  }
+}
+
+// --- Header / packet types ---
+
+export interface PacketHeader {
+  version: number;
+  type: number;
+  flags: number;
+  ttl: number;
+  msgId: Uint8Array;   // 8 bytes
+  src: Uint8Array;     // 8 bytes
+  dst: Uint8Array;     // 8 bytes
+  payloadLen: number;
+}
+
+export interface DecodedPacket {
+  header: PacketHeader;
+  payload: Uint8Array; // body bytes, length === header.payloadLen
+}
+
+export interface PacketInput {
+  type: number;
+  /** Flags byte; defaults to 0 when omitted at the higher level. */
+  flags?: number;
+  ttl: number;
+  /** 8-byte random packet id (flooding dedup key). */
+  msgId: Uint8Array;
+  /** 8-byte sender fingerprint. */
+  src: Uint8Array;
+  /** 8-byte destination fingerprint (use BROADCAST_DST for broadcast). */
+  dst: Uint8Array;
+  /** Type-specific body bytes. */
+  payload: Uint8Array;
+}
+
+// --- UTF-8 (P0.8: TextEncoder/TextDecoder, available in Hermes on RN 0.83) ---
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder('utf-8', { fatal: false });
@@ -78,16 +171,21 @@ function base64ToBytes(b64: string): Uint8Array {
   return bytes;
 }
 
-// --- Serialize payload to bytes ---
+// --- Body (de)serialization — pure, no header type byte ---
+//
+// The v1 protocol prepended a 1-byte type to the payload body. In v2 the type
+// lives in the header, so the body is just the type-specific fields. Length
+// prefixes stay 1 byte (displayName / id / sender fields are well under 255
+// bytes; message text is the un-prefixed tail and is bounded by payloadLen).
+// Exported so the pure core is unit-testable in isolation.
 
-function serializePayload(payload: BLEPayload): Uint8Array {
+export function encodeBody(payload: BLEPayload): Uint8Array {
   switch (payload.type) {
     case 'handshake': {
       const nameBytes = strToBytes(payload.displayName);
       const idBytes = strToBytes(payload.deviceId);
-      const out = new Uint8Array(1 + 1 + nameBytes.length + 1 + idBytes.length);
+      const out = new Uint8Array(1 + nameBytes.length + 1 + idBytes.length);
       let p = 0;
-      out[p++] = TYPE_HANDSHAKE;
       out[p++] = nameBytes.length;
       out.set(nameBytes, p); p += nameBytes.length;
       out[p++] = idBytes.length;
@@ -95,17 +193,16 @@ function serializePayload(payload: BLEPayload): Uint8Array {
       return out;
     }
     case 'message': {
-      // P0.2 — no truncation. The id and senderDeviceId are wire-safe hex
-      // already (16 chars); the sender name is variable-length.
+      // P0.2 — ids are wire-safe 16-hex-char strings, never truncated.
       const idBytes = strToBytes(payload.id);
       const senderIdBytes = strToBytes(payload.senderDeviceId);
       const senderNameBytes = strToBytes(payload.senderDisplayName);
       const textBytes = strToBytes(payload.text);
       const out = new Uint8Array(
-        1 + 1 + idBytes.length + 1 + senderIdBytes.length + 1 + senderNameBytes.length + textBytes.length,
+        1 + idBytes.length + 1 + senderIdBytes.length +
+        1 + senderNameBytes.length + textBytes.length,
       );
       let p = 0;
-      out[p++] = TYPE_MESSAGE;
       out[p++] = idBytes.length;
       out.set(idBytes, p); p += idBytes.length;
       out[p++] = senderIdBytes.length;
@@ -117,9 +214,8 @@ function serializePayload(payload: BLEPayload): Uint8Array {
     }
     case 'ack': {
       const idBytes = strToBytes(payload.messageId);
-      const out = new Uint8Array(1 + 1 + idBytes.length);
+      const out = new Uint8Array(1 + idBytes.length);
       let p = 0;
-      out[p++] = TYPE_ACK;
       out[p++] = idBytes.length;
       out.set(idBytes, p);
       return out;
@@ -127,14 +223,10 @@ function serializePayload(payload: BLEPayload): Uint8Array {
   }
 }
 
-// --- Deserialize bytes to payload ---
-
-function deserializePayload(bytes: Uint8Array): BLEPayload {
-  const type = bytes[0];
-  let offset = 1;
-
+export function decodeBody(type: number, bytes: Uint8Array): BLEPayload {
   switch (type) {
-    case TYPE_HANDSHAKE: {
+    case TYPE_HELLO: {
+      let offset = 0;
       const nameLen = bytes[offset++];
       const displayName = bytesToStr(bytes.subarray(offset, offset + nameLen));
       offset += nameLen;
@@ -143,6 +235,7 @@ function deserializePayload(bytes: Uint8Array): BLEPayload {
       return { type: 'handshake', deviceId, displayName };
     }
     case TYPE_MESSAGE: {
+      let offset = 0;
       const idLen = bytes[offset++];
       const id = bytesToStr(bytes.subarray(offset, offset + idLen));
       offset += idLen;
@@ -163,24 +256,100 @@ function deserializePayload(bytes: Uint8Array): BLEPayload {
       };
     }
     case TYPE_ACK: {
+      let offset = 0;
       const idLen = bytes[offset++];
       const messageId = bytesToStr(bytes.subarray(offset, offset + idLen));
       return { type: 'ack', messageId };
     }
     default:
-      throw new Error(`Unknown packet type: 0x${type.toString(16)}`);
+      throw new ProtocolError(
+        `Unsupported/reserved packet type: 0x${type.toString(16)}`,
+      );
   }
 }
 
-// --- Fragmentation ---
+function bodyType(payload: BLEPayload): number {
+  switch (payload.type) {
+    case 'handshake': return TYPE_HELLO;
+    case 'message': return TYPE_MESSAGE;
+    case 'ack': return TYPE_ACK;
+  }
+}
 
-export interface EncodeOptions {
-  /**
-   * P0.7 — Negotiated ATT MTU. The BLE spec reserves 3 bytes for the ATT
-   * header, so the usable payload per write is `mtu - 3`. Pass the value
-   * from `device.requestMTU(...).mtu` on the central path; omit (or pass 0)
-   * on the peripheral-notify path, which falls back to DEFAULT_CHUNK_SIZE.
-   */
+// --- Pure packet encode / decode (the unit-testable core) ---
+
+export function encodePacket(input: PacketInput): Uint8Array {
+  if (input.msgId.length !== MSGID_SIZE) {
+    throw new ProtocolError(`msgId must be ${MSGID_SIZE} bytes, got ${input.msgId.length}`);
+  }
+  if (input.src.length !== FINGERPRINT_SIZE) {
+    throw new ProtocolError(`src must be ${FINGERPRINT_SIZE} bytes, got ${input.src.length}`);
+  }
+  if (input.dst.length !== FINGERPRINT_SIZE) {
+    throw new ProtocolError(`dst must be ${FINGERPRINT_SIZE} bytes, got ${input.dst.length}`);
+  }
+  if (input.payload.length > 0xffff) {
+    throw new ProtocolError(`payload too large: ${input.payload.length} > 65535`);
+  }
+  const flags = input.flags ?? 0;
+  const out = new Uint8Array(HEADER_SIZE + input.payload.length);
+  let p = 0;
+  out[p++] = PROTOCOL_VERSION;
+  out[p++] = input.type;
+  out[p++] = flags;
+  out[p++] = input.ttl;
+  out.set(input.msgId, p); p += MSGID_SIZE;
+  out.set(input.src, p); p += FINGERPRINT_SIZE;
+  out.set(input.dst, p); p += FINGERPRINT_SIZE;
+  out[p++] = (input.payload.length >> 8) & 0xff;
+  out[p++] = input.payload.length & 0xff;
+  out.set(input.payload, p);
+  return out;
+}
+
+export function decodePacket(bytes: Uint8Array): DecodedPacket {
+  if (bytes.length < HEADER_SIZE) {
+    throw new ProtocolError(`Truncated header: ${bytes.length} < ${HEADER_SIZE}`);
+  }
+  const version = bytes[0];
+  if (version !== PROTOCOL_VERSION) {
+    throw new ProtocolVersionError(version);
+  }
+  const type = bytes[1];
+  const flags = bytes[2];
+  const ttl = bytes[3];
+  const msgId = bytes.subarray(4, 4 + MSGID_SIZE);
+  const srcOff = 4 + MSGID_SIZE;
+  const src = bytes.subarray(srcOff, srcOff + FINGERPRINT_SIZE);
+  const dstOff = srcOff + FINGERPRINT_SIZE;
+  const dst = bytes.subarray(dstOff, dstOff + FINGERPRINT_SIZE);
+  const payloadLen = (bytes[HEADER_SIZE - 2] << 8) | bytes[HEADER_SIZE - 1];
+  if (bytes.length < HEADER_SIZE + payloadLen) {
+    throw new ProtocolError(
+      `Truncated payload: have ${bytes.length - HEADER_SIZE}, declared ${payloadLen}`,
+    );
+  }
+  const payload = bytes.subarray(HEADER_SIZE, HEADER_SIZE + payloadLen);
+  return {
+    header: { version, type, flags, ttl, msgId, src, dst, payloadLen },
+    payload,
+  };
+}
+
+// --- Fragmentation (wraps the whole v2 packet) ---
+
+export interface EncodeContext {
+  /** 8-byte sender fingerprint. */
+  src: Uint8Array;
+  /** 8-byte destination fingerprint; omit (or pass BROADCAST_DST) for broadcast. */
+  dst?: Uint8Array;
+  /** Random 8-byte packet id (flooding dedup key). */
+  msgId: Uint8Array;
+  /** Hop limit. Defaults to DEFAULT_TTL. */
+  ttl?: number;
+  /** Flags byte. Defaults to 0 (Phase 2 sets FLAG_ENCRYPTED). */
+  flags?: number;
+  /** Negotiated ATT MTU (central path). Omit on the peripheral-notify path. */
   mtu?: number;
 }
 
@@ -189,41 +358,53 @@ function resolveChunkSize(mtu?: number): number {
   return mtu - 3;
 }
 
-export function encodePayload(payload: BLEPayload, options?: EncodeOptions): string[] {
-  const bytes = serializePayload(payload);
-  const chunkSize = resolveChunkSize(options?.mtu);
+/**
+ * Monotonic per-process counter for fragment `msgSeq` tags. Wrapping at 0xff
+ * is fine — collisions only matter within the ~10 s reassembly window, and a
+ * fresh message that reuses an old msgSeq has already evicted the old buffer
+ * on its FRAG_START.
+ */
+let msgSeqCounter = 0;
+function nextMsgSeq(): number {
+  msgSeqCounter = (msgSeqCounter + 1) & 0xff;
+  return msgSeqCounter;
+}
 
-  // If it fits in one chunk, send directly (no fragment header).
-  if (bytes.length <= chunkSize) {
-    return [bytesToBase64(bytes)];
+function fragment(packet: Uint8Array, mtu?: number): string[] {
+  const chunkSize = resolveChunkSize(mtu);
+
+  // Fits in one chunk — send raw (no fragment header). The first byte is the
+  // version (0x02), distinct from the 0xF0+ fragment markers, so the receiver
+  // treats it as a non-fragmented packet.
+  if (packet.length <= chunkSize) {
+    return [bytesToBase64(packet)];
   }
 
-  // Fragment: split into chunks. The first chunk carries a 5-byte header
-  // (type + totalLen(2) + seqTotal + msgSeq); continue/end carry 3 bytes
-  // (type + seqNum + msgSeq).
+  // First chunk carries a 5-byte header (type + totalLen(2) + seqTotal + msgSeq);
+  // continue/end carry 3 bytes (type + seqNum + msgSeq).
   const firstDataSize = chunkSize - 5;
   const contDataSize = chunkSize - 3;
 
   if (firstDataSize <= 0 || contDataSize <= 0) {
-    // MTU is too small to fragment — fall back to the default chunk size
-    // rather than emitting zero-length data chunks.
-    return encodePayload(payload, { mtu: DEFAULT_CHUNK_SIZE + 3 });
+    // MTU too small to fragment — fall back to the default chunk size rather
+    // than emitting zero-length data chunks.
+    return fragment(packet, DEFAULT_CHUNK_SIZE + 3);
   }
 
   const dataChunks: Uint8Array[] = [];
   let pos = 0;
-  dataChunks.push(bytes.subarray(pos, pos + firstDataSize));
+  dataChunks.push(packet.subarray(pos, pos + firstDataSize));
   pos += firstDataSize;
-  while (pos < bytes.length) {
-    dataChunks.push(bytes.subarray(pos, pos + contDataSize));
+  while (pos < packet.length) {
+    dataChunks.push(packet.subarray(pos, pos + contDataSize));
     pos += contDataSize;
   }
 
   const seqTotal = dataChunks.length;
-  const totalLen = bytes.length;
+  const totalLen = packet.length;
   // P0.6 — tag every fragment of this message so a stale fragment from a
   // previous (aborted) message cannot be misassembled into this one.
-  const msgSeq = (nextMsgSeq() & 0xff);
+  const msgSeq = nextMsgSeq();
   const fragments: string[] = [];
 
   for (let i = 0; i < dataChunks.length; i++) {
@@ -259,15 +440,6 @@ export function encodePayload(payload: BLEPayload, options?: EncodeOptions): str
   return fragments;
 }
 
-// Monotonic per-process counter; wrapping at 0xff is fine — collisions only
-// matter within the ~10 s reassembly window, and a fresh message that reuses
-// an old msgSeq has already evicted the old buffer on its FRAG_START.
-let msgSeqCounter = 0;
-function nextMsgSeq(): number {
-  msgSeqCounter = (msgSeqCounter + 1) & 0xff;
-  return msgSeqCounter;
-}
-
 // --- Reassembly ---
 
 interface ReassemblyBuffer {
@@ -284,48 +456,105 @@ function sweepStaleBuffers(): void {
   const now = Date.now();
   for (const [key, buf] of reassemblyBuffers) {
     if (now - buf.createdAt > REASSEMBLY_TTL_MS) {
-      console.warn(`[Protocol] Discarding stale reassembly buffer for ${key} (${now - buf.createdAt}ms old)`);
+      console.warn(
+        `[Protocol] Discarding stale reassembly buffer for ${key} ` +
+          `(${now - buf.createdAt}ms old)`,
+      );
       reassemblyBuffers.delete(key);
     }
   }
 }
 
-/**
- * Feed a received base64 chunk. Returns the decoded payload when complete, or
- * null if still assembling.
- */
-export function decodeChunk(
+function reassemble(buffer: ReassemblyBuffer): Uint8Array | null {
+  const out = new Uint8Array(buffer.totalLen);
+  let offset = 0;
+  for (let i = 0; i < buffer.seqTotal; i++) {
+    const chunk = buffer.chunks.get(i);
+    if (!chunk) {
+      console.warn(`[Protocol] Missing fragment ${i}`);
+      return null;
+    }
+    // Defensive: a malformed sender could over-claim seqTotal; never write
+    // past the declared total length.
+    const writeLen = Math.min(chunk.length, buffer.totalLen - offset);
+    if (writeLen <= 0) break;
+    out.set(chunk.subarray(0, writeLen), offset);
+    offset += writeLen;
+  }
+  return out.subarray(0, buffer.totalLen);
+}
+
+// --- High-level BLE-facing API ---
+//
+// `encodeBLEPayload` ties together body serialization, packet framing, and
+// fragmentation. `decodeBLEChunk` is the inverse: defragment, decode the
+// packet, deserialize the body. Both keep the same base64-in / base64-out
+// shape the BLE layer had under v1, so only the encode-call construction
+// (passing src/dst/msgId) changes in ble.ts.
+
+export function encodeBLEPayload(payload: BLEPayload, ctx: EncodeContext): string[] {
+  const body = encodeBody(payload);
+  const packet = encodePacket({
+    type: bodyType(payload),
+    flags: ctx.flags ?? 0,
+    ttl: ctx.ttl ?? DEFAULT_TTL,
+    msgId: ctx.msgId,
+    src: ctx.src,
+    dst: ctx.dst ?? BROADCAST_DST,
+    payload: body,
+  });
+  return fragment(packet, ctx.mtu);
+}
+
+export function decodeBLEChunk(
   base64Value: string,
   sourceKey: string = 'default',
 ): BLEPayload | null {
+  const decoded = decodeBLEChunkFull(base64Value, sourceKey);
+  return decoded ? decoded.payload : null;
+}
+
+/**
+ * Like `decodeBLEChunk` but also returns the decoded header. Phase 3's relay
+ * engine needs src/dst/ttl/msgId to make routing decisions; Phase 1 only uses
+ * the payload, but exposing the header keeps the surface stable.
+ */
+export function decodeBLEChunkFull(
+  base64Value: string,
+  sourceKey: string = 'default',
+): { header: PacketHeader; payload: BLEPayload } | null {
   const bytes = base64ToBytes(base64Value);
   if (bytes.length === 0) return null;
 
-  const type = bytes[0];
+  const firstByte = bytes[0];
 
-  // Non-fragmented packet
-  if (type !== TYPE_FRAG_START && type !== TYPE_FRAG_CONTINUE && type !== TYPE_FRAG_END) {
-    return deserializePayload(bytes);
+  // Non-fragmented packet — decode directly. (Version 0x02 is distinct from
+  // the 0xF0+ fragment markers.)
+  if (
+    firstByte !== TYPE_FRAG_START &&
+    firstByte !== TYPE_FRAG_CONTINUE &&
+    firstByte !== TYPE_FRAG_END
+  ) {
+    return decodePacketToPayload(bytes);
   }
 
   // Opportunistic sweep — cheap and prevents unbounded growth (P0.6).
   sweepStaleBuffers();
 
-  if (type === TYPE_FRAG_START) {
+  if (firstByte === TYPE_FRAG_START) {
     const totalLen = (bytes[1] << 8) | bytes[2];
     const seqTotal = bytes[3];
     const msgSeq = bytes[4];
     const data = bytes.subarray(5);
-    const buffer: ReassemblyBuffer = {
+    // A new FRAG_START always supersedes any in-flight buffer for this source
+    // (the previous message was either completed or abandoned).
+    reassemblyBuffers.set(sourceKey, {
       totalLen,
       seqTotal,
       msgSeq,
       chunks: new Map([[0, data]]),
       createdAt: Date.now(),
-    };
-    // A new FRAG_START always supersedes any in-flight buffer for this source
-    // (the previous message was either completed or abandoned).
-    reassemblyBuffers.set(sourceKey, buffer);
+    });
     return null;
   }
 
@@ -342,36 +571,52 @@ export function decodeChunk(
   // P0.6 — reject fragments from a different message in flight.
   if (buffer.msgSeq !== msgSeq) {
     console.warn(
-      `[Protocol] Discarding fragment seq=${seqNum} msgSeq=${msgSeq} (buffer has msgSeq=${buffer.msgSeq})`,
+      `[Protocol] Discarding fragment seq=${seqNum} msgSeq=${msgSeq} ` +
+        `(buffer has msgSeq=${buffer.msgSeq})`,
     );
     return null;
   }
 
   buffer.chunks.set(seqNum, data);
 
-  if (type === TYPE_FRAG_END) {
-    // Reassemble
-    const assembled: number[] = [];
-    for (let i = 0; i < buffer.seqTotal; i++) {
-      const chunk = buffer.chunks.get(i);
-      if (!chunk) {
-        console.warn(`[Protocol] Missing fragment ${i}`);
-        reassemblyBuffers.delete(sourceKey);
-        return null;
-      }
-      for (let j = 0; j < chunk.length; j++) assembled.push(chunk[j]);
-    }
+  if (firstByte === TYPE_FRAG_END) {
+    const assembled = reassemble(buffer);
     reassemblyBuffers.delete(sourceKey);
-
-    // Trim to totalLen (last chunk may have padding)
-    const trimmed = new Uint8Array(assembled.slice(0, buffer.totalLen));
-    return deserializePayload(trimmed);
+    if (!assembled) return null;
+    return decodePacketToPayload(assembled);
   }
 
   return null;
 }
 
-// Exposed for tests / manual reset; not used in production paths.
+function decodePacketToPayload(
+  bytes: Uint8Array,
+): { header: PacketHeader; payload: BLEPayload } | null {
+  try {
+    const { header, payload } = decodePacket(bytes);
+    const body = decodeBody(header.type, payload);
+    return { header, payload: body };
+  } catch (e) {
+    // P1 task 2 — version mismatch (v1 packet) / truncation / malformed body.
+    // Log and drop rather than propagating: a single bad chunk must not kill
+    // the BLE monitor callback that received it.
+    if (e instanceof ProtocolVersionError) {
+      console.warn(`[Protocol] Dropping packet: ${e.message}`);
+    } else if (e instanceof ProtocolError) {
+      console.warn('[Protocol] Dropping malformed packet:', e.message);
+    } else {
+      console.warn('[Protocol] Failed to decode packet:', e instanceof Error ? e.message : e);
+    }
+    return null;
+  }
+}
+
+// --- Test helpers (not used on production paths) ---
+
 export function _clearReassemblyBuffers(): void {
   reassemblyBuffers.clear();
+}
+
+export function _resetMsgSeq(): void {
+  msgSeqCounter = 0;
 }

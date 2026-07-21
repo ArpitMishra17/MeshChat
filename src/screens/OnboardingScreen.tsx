@@ -8,15 +8,18 @@ interface Props {
 }
 
 const bootLines = [
-  '[BOOT] MeshChat v0.1.0',
-  '[INIT] Generating device identity...',
+  '[BOOT] MeshChat v0.2.0',
+  '[INIT] Generating X25519 keypair...',
+  '[INIT] Deriving cryptographic fingerprint...',
   '[INIT] Initializing local database...',
   '[BLE ] Loading radio interface...',
+  '[E2E ] AES-256-GCM ready.',
   '[OK  ] All systems nominal.',
   '',
   '> This app works entirely on your device.',
   '> No servers. No accounts. No tracking.',
   '> Messages travel directly between phones via Bluetooth.',
+  '> End-to-end encrypted — no one can read your messages.',
   '',
 ];
 

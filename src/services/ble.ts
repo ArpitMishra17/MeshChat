@@ -1,10 +1,23 @@
 import { BleManager, Device, type Subscription } from 'react-native-ble-plx';
 import { Platform, PermissionsAndroid } from 'react-native';
 import BlePeripheral from '../../modules/BlePeripheral';
-import { ensureIdentity } from './identity';
-import { upsertPeer } from '../db/database';
-import { encodeBLEPayload, decodeBLEChunk, BROADCAST_DST, DEFAULT_TTL } from './protocol';
-import { fingerprintFromDeviceId, generatePacketId } from './ids';
+import { ensureIdentity, getCrypto } from './identity';
+import { upsertPeer, checkPeerKeyChange, getAllPeers } from '../db/database';
+import {
+  encodeBLEPayload,
+  encodeRawPacket,
+  decodeBLEChunkRaw,
+  encodeBody,
+  decodeBody,
+  buildHeaderBytes,
+  headerToAAD,
+  BROADCAST_DST,
+  DEFAULT_TTL,
+  TYPE_MESSAGE,
+  FLAG_ENCRYPTED,
+} from './protocol';
+import { fingerprintHexFromPubKey, NONCE_SIZE, GCM_TAG_SIZE } from './crypto';
+import { generatePacketId, bytesToHex } from './ids';
 import type {
   Peer,
   BLEPayload,
@@ -63,12 +76,10 @@ class BLEService {
   private negotiatedMtu: number | null = null;
   /**
    * Phase 1 — 8-byte fingerprints for the v2 packet header's src/dst fields.
-   * `myFingerprint` is derived from our own deviceId (Phase 2 swaps this for
-   * SHA-256(pubkey)); `peerFingerprint` is learned from the peer's HELLO.
-   * Phase 0 was single-link, so a single peer slot matches that assumption —
-   * Phase 3 will replace this with a per-link map.
+   * `peerFingerprint` is learned from the peer's HELLO (Phase 2: derived from
+   * their X25519 public key). Phase 0 was single-link, so a single peer slot
+   * matches that assumption — Phase 3 will replace this with a per-link map.
    */
-  private myFingerprint: Uint8Array | null = null;
   private peerFingerprint: Uint8Array | null = null;
   private subscriptions: Subscription[] = [];
   private state: BLEState = 'idle';
@@ -83,6 +94,8 @@ class BLEService {
   readonly ackReceived = new PayloadEmitter<AckPayload>();
   readonly handshakeReceived = new PayloadEmitter<{ payload: HandshakePayload; bleId: string | null }>();
   readonly stateChanged = new PayloadEmitter<BLEState>();
+  /** Phase 2 — fires when a known peer's public key has changed (TOFU violation). */
+  readonly keyWarning = new PayloadEmitter<{ deviceId: string; displayName: string }>();
 
   private discoveredDevices = new Map<string, number>();
   public lastLog = '';
@@ -105,8 +118,8 @@ class BLEService {
         );
         try {
           const sourceKey = `${event.deviceAddress}_${event.characteristicUUID}`;
-          const payload = this.decodeFromPeripheral(event.value, sourceKey);
-          // payload is null if still assembling fragments
+          const payload = this.decodeIncoming(event.value, sourceKey);
+          // payload is null if still assembling fragments or decrypt failed
           if (!payload) return;
 
           console.log('[BLE Peripheral] Decoded payload:', payload.type);
@@ -116,23 +129,10 @@ class BLEService {
           } else if (payload.type === 'ack') {
             this.ackReceived.emit(payload as AckPayload);
           } else if (payload.type === 'handshake') {
-            const hp = payload as HandshakePayload;
-            // Phase 1 — learn the peer's fingerprint so MESSAGE/ACK packets
-            // we notify back can carry a targeted dst instead of broadcast.
-            this.peerFingerprint = fingerprintFromDeviceId(hp.deviceId);
-            const peer: Peer = {
-              deviceId: hp.deviceId,
-              displayName: hp.displayName,
-              lastSeen: Date.now(),
-              rssi: null,
-              bleId: event.deviceAddress,
-            };
-            upsertPeer(peer);
-            this.peerDiscovered.emit(peer);
-            this.handshakeReceived.emit({ payload: hp, bleId: event.deviceAddress });
+            this.handleHandshakeReceived(payload as HandshakePayload, event.deviceAddress);
 
             // P0.3 — peripheral responds with its own handshake notification
-            // so the central learns our real deviceId/name. Broadcast is fine
+            // so the central learns our real identity. Broadcast is fine
             // here because Phase 0 is single-link; per-device addressing lands
             // in Phase 3.
             void this.notifyHandshake();
@@ -316,9 +316,15 @@ class BLEService {
       lastSeen: now,
       rssi: device.rssi,
       bleId: device.id,
+      publicKey: null,
+      keyPinned: false,
     };
 
-    upsertPeer(peer);
+    // Phase 2 — scan-discovered peers are NOT persisted to the DB. Their
+    // real identity (fingerprint + pubkey) is only learned at handshake
+    // time. Persisting a BLE MAC as deviceId would recreate the P0.3
+    // identity-fragmentation bug. The Nearby screen shows scan results
+    // live via the emitter; the DB only holds handshake-completed peers.
     this.peerDiscovered.emit(peer);
   }
 
@@ -363,9 +369,11 @@ class BLEService {
       this.subscribeToAcks(device);
 
       const handshake = await handshakePromise;
-      // Phase 1 — the peer's deviceId arrived in its HELLO; derive the
-      // fingerprint so subsequent MESSAGE/ACK packets are addressed to it.
-      this.peerFingerprint = fingerprintFromDeviceId(handshake.deviceId);
+      // Phase 2 — the peer's fingerprint is derived from their public key
+      // (received in HELLO). The crypto service has already remembered the
+      // peer's key (in handleHandshakeReceived) so MESSAGE encrypt/decrypt
+      // works. Store the 8-byte fingerprint for addressing packets.
+      this.peerFingerprint = getCrypto().rememberPeer(handshake.publicKey);
       return { device, handshake };
     } catch (error) {
       this.setState('error');
@@ -396,6 +404,7 @@ class BLEService {
       type: 'handshake',
       deviceId: identity.deviceId,
       displayName: identity.displayName,
+      publicKey: identity.publicKey,
     };
     await this.writeFragments(device, HANDSHAKE_CHAR_UUID, payload);
   }
@@ -405,6 +414,9 @@ class BLEService {
    * characteristic so the central learns who we are. Broadcasts to all
    * subscribed centrals (Phase 0 is single-link; per-device addressing is
    * Phase 3's job).
+   *
+   * Phase 2 — carries our 32-byte X25519 public key so the central can
+   * derive the shared secret and our fingerprint.
    */
   private async notifyHandshake(): Promise<void> {
     if (BlePeripheral.getConnectedDeviceCount() === 0) return;
@@ -413,6 +425,7 @@ class BLEService {
       type: 'handshake',
       deviceId: identity.deviceId,
       displayName: identity.displayName,
+      publicKey: identity.publicKey,
     };
     try {
       const fragments = this.encodeFragments(payload);
@@ -482,6 +495,10 @@ class BLEService {
    * P0.3 — Subscribe to the peripheral's handshake notification and resolve
    * with the first HELLO we receive. Times out after `timeoutMs` so the
    * caller isn't stuck if the peripheral never responds.
+   *
+   * Phase 2 — the HELLO carries the peer's 32-byte public key; we derive
+   * the fingerprint from it, remember the peer's shared key, and pin the
+   * pubkey (trust-on-first-use).
    */
   private subscribeToHandshake(device: Device): Promise<HandshakePayload> {
     return new Promise((resolve, reject) => {
@@ -506,20 +523,14 @@ class BLEService {
           }
           if (!characteristic?.value) return;
           try {
-            const payload = decodeBLEChunk(characteristic.value, `central_handshake_${device.id}`);
+            const payload = this.decodeIncoming(
+              characteristic.value,
+              `central_handshake_${device.id}`,
+            );
             if (payload?.type === 'handshake') {
               clearTimeout(timeout);
               const hp = payload as HandshakePayload;
-              const peer: Peer = {
-                deviceId: hp.deviceId,
-                displayName: hp.displayName,
-                lastSeen: Date.now(),
-                rssi: null,
-                bleId: device.id,
-              };
-              upsertPeer(peer);
-              this.peerDiscovered.emit(peer);
-              this.handshakeReceived.emit({ payload: hp, bleId: device.id });
+              this.handleHandshakeReceived(hp, device.id);
               sub.remove();
               const idx = this.subscriptions.indexOf(sub);
               if (idx >= 0) this.subscriptions.splice(idx, 1);
@@ -546,18 +557,13 @@ class BLEService {
         if (!characteristic?.value) return;
         console.log(`[BLE] Received notification on MESSAGE char, ${characteristic.value.length} bytes`);
         try {
-          const payload = decodeBLEChunk(characteristic.value, `central_msg_${device.id}`);
+          const payload = this.decodeIncoming(characteristic.value, `central_msg_${device.id}`);
           if (payload) {
             console.log('[BLE] Decoded message:', payload.type);
             if (payload.type === 'message') this.messageReceived.emit(payload);
             else if (payload.type === 'handshake') {
               // A late handshake notification (after the initial one resolved).
-              const hp = payload as HandshakePayload;
-              this.peerFingerprint = fingerprintFromDeviceId(hp.deviceId);
-              this.handshakeReceived.emit({
-                payload: hp,
-                bleId: device.id,
-              });
+              this.handleHandshakeReceived(payload as HandshakePayload, device.id);
             }
           }
         } catch (e: any) {
@@ -579,7 +585,7 @@ class BLEService {
         }
         if (!characteristic?.value) return;
         try {
-          const payload = decodeBLEChunk(characteristic.value, `central_ack_${device.id}`);
+          const payload = this.decodeIncoming(characteristic.value, `central_ack_${device.id}`);
           if (payload?.type === 'ack') this.ackReceived.emit(payload);
         } catch (e: any) {
           console.warn('[BLE] Failed to decode ack notification:', e?.message ?? e);
@@ -595,15 +601,24 @@ class BLEService {
   }
 
   // --- Encoding / Decoding via the v2 binary protocol with fragmentation ---
+  //
+  // Phase 2 — MESSAGE payloads are encrypted end-to-end (AES-256-GCM with
+  // the header as AAD). HELLO and ACK stay plaintext: HELLO must carry the
+  // pubkey to establish the shared key; ACKs leak only the msgId already
+  // visible in the header.
 
   private encodeFragments(payload: BLEPayload): string[] {
-    // Phase 1 — frame every payload as a v2 packet: src = our fingerprint,
-    // dst = the peer's (or broadcast for HELLO, since at handshake time we
-    // don't yet know who we're talking to / it's a discovery packet). msgId
-    // is a fresh random 64-bit id per packet (Phase 3 flooding dedup key).
+    // msgId is a fresh random 64-bit id per packet (Phase 3 flooding dedup key).
     // P0.7 — negotiated MTU on the central path; peripheral-notify path
     // falls back to the default (unknown MTU on the GATT server side).
     const isHandshake = payload.type === 'handshake';
+
+    if (payload.type === 'message') {
+      // Phase 2 — encrypt the message body end-to-end before framing.
+      return this.encodeEncryptedMessage(payload as MessagePayload);
+    }
+
+    // HELLO / ACK — plaintext.
     return encodeBLEPayload(payload, {
       src: this.getMyFingerprint(),
       dst: isHandshake ? BROADCAST_DST : (this.peerFingerprint ?? BROADCAST_DST),
@@ -613,15 +628,161 @@ class BLEService {
     });
   }
 
-  private getMyFingerprint(): Uint8Array {
-    if (!this.myFingerprint) {
-      this.myFingerprint = fingerprintFromDeviceId(ensureIdentity().deviceId);
+  /**
+   * Phase 2 — Encrypt a MESSAGE payload end-to-end and frame it as a v2
+   * packet. The plaintext is the serialized message body; the encrypted
+   * payload (nonce ‖ ciphertext ‖ tag) becomes the packet's payload field.
+   *
+   * The packet header (with TTL zeroed) is bound as AAD so a relay cannot
+   * alter src/dst/msgId without failing authentication. The encrypted
+   * length is deterministic (nonce + plaintext + tag), so we can compute
+   * the AAD header before encrypting.
+   */
+  private encodeEncryptedMessage(message: MessagePayload): string[] {
+    const myFp = this.getMyFingerprint();
+    const peerFp = this.peerFingerprint;
+    if (!peerFp) {
+      throw new Error('Cannot encrypt message — no peer fingerprint (handshake not complete)');
     }
-    return this.myFingerprint;
+
+    const msgId = generatePacketId();
+    const plaintext = encodeBody(message);
+
+    // Encrypted payload = nonce(12) + ciphertext + tag(16). Length is
+    // deterministic, so the AAD header (which includes payloadLen) can be
+    // built before encryption.
+    const encryptedLen = NONCE_SIZE + plaintext.length + GCM_TAG_SIZE;
+
+    // Build the header with the real fields, then zero the TTL byte for AAD.
+    // TTL is excluded from authentication because relays decrement it.
+    const headerForAAD = buildHeaderBytes({
+      type: TYPE_MESSAGE,
+      flags: FLAG_ENCRYPTED,
+      ttl: DEFAULT_TTL,
+      msgId,
+      src: myFp,
+      dst: peerFp,
+      payloadLen: encryptedLen,
+    });
+    const aad = headerToAAD(headerForAAD);
+
+    const encrypted = getCrypto().encrypt(peerFp, plaintext, aad);
+
+    return encodeRawPacket(TYPE_MESSAGE, encrypted, {
+      src: myFp,
+      dst: peerFp,
+      msgId,
+      ttl: DEFAULT_TTL,
+      flags: FLAG_ENCRYPTED,
+      mtu: this.negotiatedMtu ?? undefined,
+    });
   }
 
-  private decodeFromPeripheral(base64Value: string, sourceKey: string): BLEPayload | null {
-    return decodeBLEChunk(base64Value, sourceKey);
+  private getMyFingerprint(): Uint8Array {
+    // Phase 2 — fingerprint is SHA-256(pubkey)[:8], derived from the
+    // X25519 keypair. The crypto service caches it after ensureIdentity().
+    return getCrypto().getFingerprint();
+  }
+
+  /**
+   * Phase 2 — Unified decode path for all incoming BLE traffic.
+   *
+   * Reassembles fragments, decodes the packet header, and — if the
+   * FLAG_ENCRYPTED bit is set — decrypts the payload before body
+   * deserialization. For HELLO packets, the fingerprint is derived from
+   * the enclosed public key (done in `handleHandshakeReceived`).
+   *
+   * Returns null for: incomplete fragments, version mismatches, malformed
+   * packets, and decryption failures (so a single bad chunk never kills
+   * the monitor callback).
+   */
+  private decodeIncoming(base64Value: string, sourceKey: string): BLEPayload | null {
+    const raw = decodeBLEChunkRaw(base64Value, sourceKey);
+    if (!raw) return null;
+    const { header, headerBytes, payload } = raw;
+
+    if (header.flags & FLAG_ENCRYPTED) {
+      // Encrypted MESSAGE — decrypt before body deserialization.
+      try {
+        const aad = headerToAAD(headerBytes);
+        // header.src is the sender's fingerprint — the key we need to decrypt.
+        const plaintext = getCrypto().decrypt(header.src, payload, aad);
+        return decodeBody(header.type, plaintext);
+      } catch (e: any) {
+        console.warn('[BLE] Decrypt failed:', e?.message ?? e);
+        return null;
+      }
+    }
+
+    // Unencrypted (HELLO, ACK).
+    try {
+      return decodeBody(header.type, payload);
+    } catch (e: any) {
+      console.warn('[BLE] Body decode failed:', e?.message ?? e);
+      return null;
+    }
+  }
+
+  /**
+   * Phase 2 — Process a received HELLO: derive the sender's fingerprint
+   * from their public key, remember the shared key for encrypt/decrypt,
+   * persist the peer (with TOFU key pinning), and emit discovery events.
+   *
+   * Called from both the peripheral side (write handler) and the central
+   * side (handshake / message notification handler).
+   */
+  private handleHandshakeReceived(hp: HandshakePayload, bleId: string | null): void {
+    // Derive the fingerprint from the public key (replaces the old
+    // UUID-based deviceId). The HELLO body leaves deviceId empty; we
+    // fill it in here.
+    hp.deviceId = fingerprintHexFromPubKey(hp.publicKey);
+
+    // Remember the peer's public key → derive + cache the shared AES key.
+    const peerFp = getCrypto().rememberPeer(hp.publicKey);
+    this.peerFingerprint = peerFp;
+
+    const pubKeyHex = bytesToHex(hp.publicKey);
+
+    // Trust-on-first-use: check if this fingerprint already has a different
+    // pinned key. First contact pins the key; a changed key emits a warning.
+    const keyStatus = checkPeerKeyChange(hp.deviceId, pubKeyHex);
+    if (keyStatus === 'changed') {
+      console.warn(
+        `[BLE] KEY CHANGE WARNING: peer ${hp.displayName} (${hp.deviceId}) ` +
+          `has a different public key than the pinned one. This could be a ` +
+          `reinstall or a man-in-the-middle attempt.`,
+      );
+      this.keyWarning.emit({ deviceId: hp.deviceId, displayName: hp.displayName });
+    } else if (keyStatus === 'unknown') {
+      // New fingerprint. Check if the display name matches an existing peer
+      // with a *different* fingerprint — that's the reinstall scenario
+      // (same person, new keypair → new fingerprint). The old peer row
+      // stays (history is preserved); we just warn the user.
+      const existingByName = getAllPeers().find(
+        p => p.displayName === hp.displayName && p.deviceId !== hp.deviceId,
+      );
+      if (existingByName) {
+        console.warn(
+          `[BLE] KEY CHANGE WARNING: "${hp.displayName}" has a new fingerprint ` +
+            `(was ${existingByName.deviceId.slice(0, 8)}, now ${hp.deviceId.slice(0, 8)}). ` +
+            `Likely a reinstall.`,
+        );
+        this.keyWarning.emit({ deviceId: hp.deviceId, displayName: hp.displayName });
+      }
+    }
+
+    const peer: Peer = {
+      deviceId: hp.deviceId,
+      displayName: hp.displayName,
+      lastSeen: Date.now(),
+      rssi: null,
+      bleId,
+      publicKey: pubKeyHex,
+      keyPinned: keyStatus !== 'unknown',
+    };
+    upsertPeer(peer);
+    this.peerDiscovered.emit(peer);
+    this.handshakeReceived.emit({ payload: hp, bleId });
   }
 
   // --- Cleanup ---
@@ -631,7 +792,6 @@ class BLEService {
     this.cleanupSubscriptions();
     this.connectedDevice = null;
     this.negotiatedMtu = null;
-    this.myFingerprint = null;
     this.peerFingerprint = null;
     await BlePeripheral.stop();
     this.peripheralStarted = false;

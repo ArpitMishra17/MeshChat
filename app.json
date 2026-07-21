@@ -59,7 +59,8 @@
           "bluetoothAlwaysPermission": "MeshChat uses Bluetooth to discover and communicate with nearby devices directly."
         }
       ],
-      "expo-sqlite"
+      "expo-sqlite",
+      "expo-secure-store"
     ],
     "extra": {
       "eas": {

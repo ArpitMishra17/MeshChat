@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, ScrollView } from 'react-native';
 import { colors, fonts, fontSize } from '../theme';
 import { ensureIdentity, updateDisplayName } from '../services/identity';
+import { bytesToHex } from '../services/ids';
 import { TerminalHeader } from '../components/TerminalHeader';
 
 export function SettingsScreen() {
@@ -17,6 +18,8 @@ export function SettingsScreen() {
     setTimeout(() => setSaved(false), 2000);
   };
 
+  const pubKeyHex = bytesToHex(identity.publicKey);
+
   return (
     <View style={styles.container}>
       <TerminalHeader title="settings" />
@@ -24,8 +27,13 @@ export function SettingsScreen() {
         <Text style={styles.sectionLabel}>{'// identity'}</Text>
 
         <View style={styles.field}>
-          <Text style={styles.label}>device_id</Text>
+          <Text style={styles.label}>fingerprint</Text>
           <Text style={styles.value}>{identity.deviceId}</Text>
+        </View>
+
+        <View style={styles.field}>
+          <Text style={styles.label}>public_key</Text>
+          <Text style={styles.valueMono}>{pubKeyHex.slice(0, 32)}...</Text>
         </View>
 
         <View style={styles.field}>
@@ -55,11 +63,11 @@ export function SettingsScreen() {
 
         <View style={styles.field}>
           <Text style={styles.label}>version</Text>
-          <Text style={styles.value}>0.1.0-alpha</Text>
+          <Text style={styles.value}>0.2.0-alpha</Text>
         </View>
         <View style={styles.field}>
           <Text style={styles.label}>protocol</Text>
-          <Text style={styles.value}>BLE direct (no relay)</Text>
+          <Text style={styles.value}>BLE v2 (versioned, addressed)</Text>
         </View>
         <View style={styles.field}>
           <Text style={styles.label}>storage</Text>
@@ -67,7 +75,11 @@ export function SettingsScreen() {
         </View>
         <View style={styles.field}>
           <Text style={styles.label}>encryption</Text>
-          <Text style={styles.valueDim}>planned for v0.2</Text>
+          <Text style={styles.valueAccent}>X25519 + AES-256-GCM</Text>
+        </View>
+        <View style={styles.field}>
+          <Text style={styles.label}>identity</Text>
+          <Text style={styles.value}>cryptographic (TOFU)</Text>
         </View>
 
         <View style={styles.separator} />
@@ -84,6 +96,7 @@ export function SettingsScreen() {
           <Text style={styles.footerText}>{'> MeshChat works entirely offline.'}</Text>
           <Text style={styles.footerText}>{'> No data leaves your device.'}</Text>
           <Text style={styles.footerText}>{'> No accounts. No servers. No tracking.'}</Text>
+          <Text style={styles.footerText}>{'> End-to-end encrypted by default.'}</Text>
         </View>
       </ScrollView>
     </View>
@@ -97,6 +110,8 @@ const styles = StyleSheet.create({
   field: { marginBottom: 16 },
   label: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textDim, marginBottom: 4 },
   value: { fontFamily: fonts.mono, fontSize: fontSize.sm, color: colors.text },
+  valueMono: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textDim },
+  valueAccent: { fontFamily: fonts.mono, fontSize: fontSize.sm, color: colors.success },
   valueDim: { fontFamily: fonts.mono, fontSize: fontSize.sm, color: colors.textMuted, fontStyle: 'italic' },
   inputRow: { flexDirection: 'row', alignItems: 'center' },
   input: {

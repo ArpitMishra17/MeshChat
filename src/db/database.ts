@@ -12,7 +12,14 @@ export function getDB(): SQLite.SQLiteDatabase {
   return db;
 }
 
+/**
+ * Phase 2 — schema creation. Tables are created *after* `runMigrations`
+ * so a wipe-and-recreate migration (user_version < 2) can DROP the old
+ * tables before the new schema is laid down.
+ */
 function initSchema() {
+  runMigrations();
+
   db.execSync(`
     CREATE TABLE IF NOT EXISTS identity (
       device_id TEXT PRIMARY KEY,
@@ -27,7 +34,9 @@ function initSchema() {
       display_name TEXT NOT NULL,
       last_seen INTEGER NOT NULL,
       rssi INTEGER,
-      ble_id TEXT
+      ble_id TEXT,
+      public_key TEXT,
+      key_pinned INTEGER NOT NULL DEFAULT 0
     );
   `);
 
@@ -50,6 +59,7 @@ function initSchema() {
       text TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'sending',
       created_at INTEGER NOT NULL,
+      delivered_at INTEGER,
       FOREIGN KEY (conversation_id) REFERENCES conversations(id)
     );
   `);
@@ -58,41 +68,53 @@ function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_messages_conversation
     ON messages(conversation_id, created_at);
   `);
-
-  runMigrations();
 }
 
 /**
- * Sequential migrations keyed off `PRAGMA user_version`. Pre-release stance:
- * additive ALTERs only. A wipe-and-recreate migration is deferred to Phase 2
- * (when identity changes break the schema wholesale).
+ * Sequential migrations keyed off `PRAGMA user_version`.
+ *
+ * v2 (Phase 2) is a **wipe-and-recreate**: identity changed from UUID to
+ * X25519 fingerprint, so every `device_id` column is now a different format.
+ * Pre-release, this is acceptable — PLAN.md explicitly allows it. The
+ * private key in `expo-secure-store` survives the wipe, so `createIdentity`
+ * reuses it and the user keeps their cryptographic identity.
+ *
+ * `delivered_at` (the v1 migration) is now baked into the CREATE TABLE for
+ * v2+ installs, so the v1 ALTER is no longer needed.
  */
 function runMigrations() {
   const versionRow = db.getAllSync<{ user_version: number }>('PRAGMA user_version');
   let version = versionRow[0]?.user_version ?? 0;
 
-  // v1: add delivered_at column for the P0.5 status ladder.
-  if (version < 1) {
-    const cols = db.getAllSync<{ name: string }>('PRAGMA table_info(messages)');
-    if (!cols.some(c => c.name === 'delivered_at')) {
-      db.execSync('ALTER TABLE messages ADD COLUMN delivered_at INTEGER');
-    }
-    version = 1;
+  if (version < 2) {
+    db.execSync('DROP TABLE IF EXISTS messages');
+    db.execSync('DROP TABLE IF EXISTS conversations');
+    db.execSync('DROP TABLE IF EXISTS peers');
+    db.execSync('DROP TABLE IF EXISTS identity');
+    version = 2;
   }
 
   db.runSync(`PRAGMA user_version = ${version}`);
 }
 
 // --- Identity ---
+//
+// Only `device_id` (fingerprint), `display_name`, and `created_at` are
+// stored here. The private key lives in `expo-secure-store`; the public
+// key is derived from it at runtime and never persisted to SQLite.
 
 export function getIdentity(): Identity | null {
   const rows = db.getAllSync<any>('SELECT * FROM identity LIMIT 1');
   if (rows.length === 0) return null;
   const row = rows[0];
+  // publicKey is not stored in SQLite — the caller (identity.ts) fills it in
+  // from the keypair. We return a zero-length array as a placeholder; the
+  // real value is set by ensureIdentity().
   return {
     deviceId: row.device_id,
     displayName: row.display_name,
     createdAt: row.created_at,
+    publicKey: new Uint8Array(0),
   };
 }
 
@@ -108,45 +130,72 @@ export function updateDisplayName(name: string): void {
 }
 
 // --- Peers ---
+//
+// Phase 2 — peers are keyed on `device_id` (the fingerprint, 16 hex chars),
+// NOT on the display name. This fixes P0.3 for good: renames and MAC
+// rotation no longer fork or merge peer rows. `public_key` stores the
+// peer's 32-byte X25519 pubkey as 64 hex chars for trust-on-first-use.
 
 export function upsertPeer(peer: Peer): void {
-  // Android rotates BLE MAC addresses, so the same physical device appears
-  // with different deviceIds across scans. Deduplicate by display name:
-  // if a peer with the same name already exists, update it instead of inserting.
-  const existing = db.getAllSync<any>(
-    'SELECT device_id FROM peers WHERE display_name = ? AND device_id != ? LIMIT 1',
-    [peer.displayName, peer.deviceId],
-  );
-  if (existing.length > 0) {
-    // Update existing record (keep the old device_id row, update its ble_id)
-    db.runSync(
-      `UPDATE peers SET last_seen = ?, rssi = ?, ble_id = ? WHERE device_id = ?`,
-      [peer.lastSeen, peer.rssi, peer.bleId, existing[0].device_id],
-    );
-    return;
-  }
-
   db.runSync(
-    `INSERT INTO peers (device_id, display_name, last_seen, rssi, ble_id)
-     VALUES (?, ?, ?, ?, ?)
+    `INSERT INTO peers (device_id, display_name, last_seen, rssi, ble_id, public_key, key_pinned)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(device_id) DO UPDATE SET
        display_name = excluded.display_name,
        last_seen = excluded.last_seen,
        rssi = excluded.rssi,
-       ble_id = excluded.ble_id`,
-    [peer.deviceId, peer.displayName, peer.lastSeen, peer.rssi, peer.bleId],
+       ble_id = excluded.ble_id,
+       public_key = COALESCE(excluded.public_key, peers.public_key),
+       key_pinned = peers.key_pinned`,
+    [
+      peer.deviceId,
+      peer.displayName,
+      peer.lastSeen,
+      peer.rssi,
+      peer.bleId,
+      peer.publicKey,
+      peer.keyPinned ? 1 : 0,
+    ],
   );
 }
 
-export function getAllPeers(): Peer[] {
-  // Group by display_name, keeping only the most recently seen entry per name
+/**
+ * Pin a peer's public key (trust-on-first-use). The first pubkey seen for
+ * a fingerprint is pinned; `checkPeerKeyChange` detects a different key
+ * on a subsequent connection.
+ */
+export function pinPeerKey(deviceId: string, publicKey: string): void {
+  db.runSync(
+    'UPDATE peers SET public_key = ?, key_pinned = 1 WHERE device_id = ?',
+    [publicKey, deviceId],
+  );
+}
+
+/**
+ * Check whether the peer's stored public key matches the one just received.
+ * Returns:
+ *   - 'match'   — keys match (or no key was pinned yet → pin it)
+ *   - 'changed' — a different key was pinned previously (TOFU violation)
+ *   - 'unknown' — peer not in the DB (first contact)
+ */
+export function checkPeerKeyChange(deviceId: string, publicKey: string): 'match' | 'changed' | 'unknown' {
   const rows = db.getAllSync<any>(
-    `SELECT p.* FROM peers p
-     INNER JOIN (
-       SELECT display_name, MAX(last_seen) as max_seen
-       FROM peers GROUP BY display_name
-     ) latest ON p.display_name = latest.display_name AND p.last_seen = latest.max_seen
-     ORDER BY p.last_seen DESC`,
+    'SELECT public_key, key_pinned FROM peers WHERE device_id = ? LIMIT 1',
+    [deviceId],
+  );
+  if (rows.length === 0) return 'unknown';
+  const row = rows[0];
+  if (!row.public_key || row.key_pinned === 0) {
+    // First contact — pin the key.
+    pinPeerKey(deviceId, publicKey);
+    return 'match';
+  }
+  return row.public_key === publicKey ? 'match' : 'changed';
+}
+
+export function getAllPeers(): Peer[] {
+  const rows = db.getAllSync<any>(
+    `SELECT * FROM peers ORDER BY last_seen DESC`,
   );
   return rows.map(row => ({
     deviceId: row.device_id,
@@ -154,6 +203,8 @@ export function getAllPeers(): Peer[] {
     lastSeen: row.last_seen,
     rssi: row.rssi,
     bleId: row.ble_id,
+    publicKey: row.public_key ?? null,
+    keyPinned: row.key_pinned === 1,
   }));
 }
 

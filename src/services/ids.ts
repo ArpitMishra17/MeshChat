@@ -28,39 +28,6 @@ export function generatePacketId(): Uint8Array {
   return Crypto.getRandomBytes(8);
 }
 
-/**
- * Phase 1 — derive a stable 8-byte node identifier (the "fingerprint") from a
- * deviceId, for the v2 packet header's `src` / `dst` fields.
- *
- * This is a PLACEHOLDER for Phase 2. Phase 2 replaces identity with a long-term
- * X25519 keypair and derives the fingerprint as SHA-256(pubkey) truncated to 8
- * bytes — same 8-byte width, so the header layout is unchanged. Until then we
- * need *some* deterministic 8-byte derivation of the existing UUID deviceId so
- * that two peers compute the same `dst` for a given conversation.
- *
- * FNV-1a 64-bit is used because it is synchronous and dependency-free (the
- * alternative, `Crypto.digestStringAsync`, is async and would force the whole
- * encode path to become async). It is not cryptographic, but it does not need
- * to be at this stage — it only has to be a stable, well-distributed 8-byte
- * tag. Phase 2's SHA-256 truncation is the real thing.
- */
-export function fingerprintFromDeviceId(deviceId: string): Uint8Array {
-  // FNV-1a 64-bit. Constants per the spec.
-  let h = 14695981039346656037n;          // offset basis (0xcbf29ce484222325)
-  const prime = 1099511628211n;           // 0x100000001b3
-  const mask = (1n << 64n) - 1n;
-  for (let i = 0; i < deviceId.length; i++) {
-    h = (h ^ BigInt(deviceId.charCodeAt(i))) & mask;
-    h = (h * prime) & mask;
-  }
-  const out = new Uint8Array(8);
-  for (let i = 7; i >= 0; i--) {
-    out[i] = Number(h & 0xffn);
-    h >>= 8n;
-  }
-  return out;
-}
-
 export function bytesToHex(bytes: Uint8Array): string {
   let out = '';
   for (let i = 0; i < bytes.length; i++) {

@@ -27,8 +27,12 @@ import {
   encodeBody,
   decodeBody,
   encodeBLEPayload,
+  encodeRawPacket,
   decodeBLEChunk,
   decodeBLEChunkFull,
+  decodeBLEChunkRaw,
+  buildHeaderBytes,
+  headerToAAD,
   _clearReassemblyBuffers,
   _resetMsgSeq,
 } from '../src/services/protocol';
@@ -64,16 +68,23 @@ const SRC = hexToBytes('0102030405060708');
 const DST = hexToBytes('0807060504030201');
 const MSGID = hexToBytes('1122334455667788');
 
+// Phase 2 — HELLO carries the 32-byte X25519 public key. deviceId (fingerprint)
+// is derived from the pubkey by the receiver, NOT sent on the wire.
+const PEER_PUBKEY = hexToBytes(
+  'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+);
+
 const handshake: HandshakePayload = {
   type: 'handshake',
-  deviceId: 'a1b2c3d4-e5f6-4788-9abc-def012345678',
+  deviceId: '', // not on the wire — derived from publicKey by the receiver
   displayName: 'alice',
+  publicKey: PEER_PUBKEY,
 };
 
 const message: MessagePayload = {
   type: 'message',
   id: 'a1b2c3d4e5f60718',
-  senderDeviceId: 'a1b2c3d4-e5f6-4788-9abc-def012345678',
+  senderDeviceId: '0102030405060708', // Phase 2 — fingerprint (16 hex chars)
   senderDisplayName: 'alice',
   text: 'hello world',
   timestamp: 0,
@@ -134,8 +145,11 @@ describe('encodePacket / decodePacket round-trip', () => {
     expect(header.type).toBe(TYPE_HELLO);
     expect(bytesToHex(header.dst)).toBe('0000000000000000'); // broadcast
     const decoded = decodeBody(header.type, payload) as HandshakePayload;
-    expect(decoded.deviceId).toBe(handshake.deviceId);
+    // Phase 2 — deviceId is NOT on the wire; it's derived from publicKey.
+    // decodeBody leaves it empty; the caller (ble.ts) fills it in.
+    expect(decoded.deviceId).toBe('');
     expect(decoded.displayName).toBe(handshake.displayName);
+    expect(bytesToHex(decoded.publicKey)).toBe(bytesToHex(PEER_PUBKEY));
   });
 
   it('round-trips an ACK', () => {

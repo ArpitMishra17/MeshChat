@@ -182,18 +182,25 @@ function base64ToBytes(b64: string): Uint8Array {
 export function encodeBody(payload: BLEPayload): Uint8Array {
   switch (payload.type) {
     case 'handshake': {
+      // Phase 2 — HELLO carries the 32-byte X25519 public key + display
+      // name. The fingerprint (deviceId) is derived from the pubkey by the
+      // receiver, so it is not sent on the wire.
       const nameBytes = strToBytes(payload.displayName);
-      const idBytes = strToBytes(payload.deviceId);
-      const out = new Uint8Array(1 + nameBytes.length + 1 + idBytes.length);
+      const pubBytes = payload.publicKey;
+      if (pubBytes.length !== 32) {
+        throw new ProtocolError(`handshake public key must be 32 bytes, got ${pubBytes.length}`);
+      }
+      const out = new Uint8Array(32 + 1 + nameBytes.length);
       let p = 0;
+      out.set(pubBytes, p); p += 32;
       out[p++] = nameBytes.length;
-      out.set(nameBytes, p); p += nameBytes.length;
-      out[p++] = idBytes.length;
-      out.set(idBytes, p);
+      out.set(nameBytes, p);
       return out;
     }
     case 'message': {
       // P0.2 — ids are wire-safe 16-hex-char strings, never truncated.
+      // Phase 2 — this body is encrypted end-to-end before framing; the
+      // encrypted bytes become the packet payload (see encodeRawPacket).
       const idBytes = strToBytes(payload.id);
       const senderIdBytes = strToBytes(payload.senderDeviceId);
       const senderNameBytes = strToBytes(payload.senderDisplayName);
@@ -226,13 +233,17 @@ export function encodeBody(payload: BLEPayload): Uint8Array {
 export function decodeBody(type: number, bytes: Uint8Array): BLEPayload {
   switch (type) {
     case TYPE_HELLO: {
-      let offset = 0;
-      const nameLen = bytes[offset++];
-      const displayName = bytesToStr(bytes.subarray(offset, offset + nameLen));
-      offset += nameLen;
-      const idLen = bytes[offset++];
-      const deviceId = bytesToStr(bytes.subarray(offset, offset + idLen));
-      return { type: 'handshake', deviceId, displayName };
+      // Phase 2 — [pubkey: 32][nameLen: 1][name]. The deviceId (fingerprint)
+      // is NOT in the wire body; it is derived from the pubkey by the caller
+      // (ble.ts) via `fingerprintHexFromPubKey`. We leave deviceId empty here
+      // to keep protocol.ts free of crypto dependencies.
+      if (bytes.length < 33) {
+        throw new ProtocolError(`HELLO body too short: ${bytes.length} < 33`);
+      }
+      const publicKey = bytes.subarray(0, 32);
+      const nameLen = bytes[32];
+      const displayName = bytesToStr(bytes.subarray(33, 33 + nameLen));
+      return { type: 'handshake', deviceId: '', displayName, publicKey };
     }
     case TYPE_MESSAGE: {
       let offset = 0;
@@ -334,6 +345,66 @@ export function decodePacket(bytes: Uint8Array): DecodedPacket {
     header: { version, type, flags, ttl, msgId, src, dst, payloadLen },
     payload,
   };
+}
+
+// --- Phase 2: AAD helpers ---
+//
+// The encrypted MESSAGE payload binds the packet header as Additional
+// Authenticated Data (AAD) so a relay cannot alter src/dst/msgId without
+// the ciphertext failing to authenticate. TTL is excluded (relays
+// decrement it) — we zero byte[3] of the header before using it as AAD.
+
+/**
+ * Build the raw 30-byte header from individual fields. Used by ble.ts to
+ * compute the AAD *before* encrypting the payload (the encrypted length is
+ * deterministic: nonce + plaintext + tag, so payloadLen is known up front).
+ */
+export function buildHeaderBytes(input: {
+  type: number;
+  flags: number;
+  ttl: number;
+  msgId: Uint8Array;
+  src: Uint8Array;
+  dst: Uint8Array;
+  payloadLen: number;
+}): Uint8Array {
+  if (input.msgId.length !== MSGID_SIZE) {
+    throw new ProtocolError(`msgId must be ${MSGID_SIZE} bytes`);
+  }
+  if (input.src.length !== FINGERPRINT_SIZE) {
+    throw new ProtocolError(`src must be ${FINGERPRINT_SIZE} bytes`);
+  }
+  if (input.dst.length !== FINGERPRINT_SIZE) {
+    throw new ProtocolError(`dst must be ${FINGERPRINT_SIZE} bytes`);
+  }
+  const out = new Uint8Array(HEADER_SIZE);
+  let p = 0;
+  out[p++] = PROTOCOL_VERSION;
+  out[p++] = input.type;
+  out[p++] = input.flags;
+  out[p++] = input.ttl;
+  out.set(input.msgId, p); p += MSGID_SIZE;
+  out.set(input.src, p); p += FINGERPRINT_SIZE;
+  out.set(input.dst, p); p += FINGERPRINT_SIZE;
+  out[p++] = (input.payloadLen >> 8) & 0xff;
+  out[p++] = input.payloadLen & 0xff;
+  return out;
+}
+
+/**
+ * Copy raw header bytes and zero the TTL byte (byte[3]) to produce the AAD
+ * for AES-GCM. The copy ensures the original packet bytes are not modified.
+ * TTL must be excluded from AAD because relays decrement it at each hop;
+ * every other header field is immutable and is authenticated.
+ */
+export function headerToAAD(headerBytes: Uint8Array): Uint8Array {
+  if (headerBytes.length < HEADER_SIZE) {
+    throw new ProtocolError(`header bytes must be >= ${HEADER_SIZE}, got ${headerBytes.length}`);
+  }
+  const aad = new Uint8Array(HEADER_SIZE);
+  aad.set(headerBytes.subarray(0, HEADER_SIZE));
+  aad[3] = 0; // zero TTL
+  return aad;
 }
 
 // --- Fragmentation (wraps the whole v2 packet) ---
@@ -491,17 +562,38 @@ function reassemble(buffer: ReassemblyBuffer): Uint8Array | null {
 // packet, deserialize the body. Both keep the same base64-in / base64-out
 // shape the BLE layer had under v1, so only the encode-call construction
 // (passing src/dst/msgId) changes in ble.ts.
+//
+// Phase 2 adds two lower-level entry points for encrypted MESSAGE traffic:
+//  - `encodeRawPacket(type, rawPayload, ctx)` frames pre-serialized (or
+//    pre-encrypted) bytes without running `encodeBody`.
+//  - `decodeBLEChunkRaw(base64, sourceKey)` stops after packet decode and
+//    returns the raw header + payload bytes, so ble.ts can decrypt before
+//    `decodeBody` runs.
 
 export function encodeBLEPayload(payload: BLEPayload, ctx: EncodeContext): string[] {
   const body = encodeBody(payload);
+  return encodeRawPacket(bodyType(payload), body, ctx);
+}
+
+/**
+ * Frame raw payload bytes (already serialized or encrypted) as a v2 packet
+ * and fragment it. Used by Phase 2's encrypted MESSAGE path: ble.ts
+ * encrypts the message body, then calls this with `type = TYPE_MESSAGE`
+ * and `flags |= FLAG_ENCRYPTED`.
+ */
+export function encodeRawPacket(
+  type: number,
+  rawPayload: Uint8Array,
+  ctx: EncodeContext,
+): string[] {
   const packet = encodePacket({
-    type: bodyType(payload),
+    type,
     flags: ctx.flags ?? 0,
     ttl: ctx.ttl ?? DEFAULT_TTL,
     msgId: ctx.msgId,
     src: ctx.src,
     dst: ctx.dst ?? BROADCAST_DST,
-    payload: body,
+    payload: rawPayload,
   });
   return fragment(packet, ctx.mtu);
 }
@@ -523,6 +615,33 @@ export function decodeBLEChunkFull(
   base64Value: string,
   sourceKey: string = 'default',
 ): { header: PacketHeader; payload: BLEPayload } | null {
+  const raw = decodeBLEChunkRaw(base64Value, sourceKey);
+  if (!raw) return null;
+  try {
+    const body = decodeBody(raw.header.type, raw.payload);
+    return { header: raw.header, payload: body };
+  } catch (e) {
+    if (e instanceof ProtocolError) {
+      console.warn('[Protocol] Dropping malformed body:', e.message);
+    } else {
+      console.warn('[Protocol] Failed to decode body:', e instanceof Error ? e.message : e);
+    }
+    return null;
+  }
+}
+
+/**
+ * Phase 2 — Reassemble fragments and decode the packet, but return the raw
+ * payload bytes (before body deserialization). This lets ble.ts decrypt an
+ * encrypted MESSAGE payload before running `decodeBody`.
+ *
+ * Returns the header struct, the raw 30-byte header bytes (for AAD
+ * computation via `headerToAAD`), and the raw payload bytes.
+ */
+export function decodeBLEChunkRaw(
+  base64Value: string,
+  sourceKey: string = 'default',
+): { header: PacketHeader; headerBytes: Uint8Array; payload: Uint8Array } | null {
   const bytes = base64ToBytes(base64Value);
   if (bytes.length === 0) return null;
 
@@ -535,7 +654,7 @@ export function decodeBLEChunkFull(
     firstByte !== TYPE_FRAG_CONTINUE &&
     firstByte !== TYPE_FRAG_END
   ) {
-    return decodePacketToPayload(bytes);
+    return decodePacketToRaw(bytes);
   }
 
   // Opportunistic sweep — cheap and prevents unbounded growth (P0.6).
@@ -583,19 +702,22 @@ export function decodeBLEChunkFull(
     const assembled = reassemble(buffer);
     reassemblyBuffers.delete(sourceKey);
     if (!assembled) return null;
-    return decodePacketToPayload(assembled);
+    return decodePacketToRaw(assembled);
   }
 
   return null;
 }
 
-function decodePacketToPayload(
+function decodePacketToRaw(
   bytes: Uint8Array,
-): { header: PacketHeader; payload: BLEPayload } | null {
+): { header: PacketHeader; headerBytes: Uint8Array; payload: Uint8Array } | null {
   try {
     const { header, payload } = decodePacket(bytes);
-    const body = decodeBody(header.type, payload);
-    return { header, payload: body };
+    // The raw header bytes (first HEADER_SIZE) are needed for AAD computation
+    // (Phase 2 encryption). Return a subarray view; `headerToAAD` copies
+    // before zeroing the ttl byte, so the original packet bytes are untouched.
+    const headerBytes = bytes.subarray(0, HEADER_SIZE);
+    return { header, headerBytes, payload };
   } catch (e) {
     // P1 task 2 — version mismatch (v1 packet) / truncation / malformed body.
     // Log and drop rather than propagating: a single bad chunk must not kill

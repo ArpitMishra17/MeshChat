@@ -511,6 +511,24 @@ function fragment(packet: Uint8Array, mtu?: number): string[] {
   return fragments;
 }
 
+/**
+ * Phase 3 — Re-fragment an already-assembled v2 packet for forwarding.
+ *
+ * Relays decrement the TTL byte (byte[3]) of the raw packet and re-send it to
+ * their neighbors. Because TTL is excluded from the AES-GCM AAD
+ * (`headerToAAD` zeroes it), mutating the TTL does NOT invalidate the
+ * ciphertext — the destination still decrypts successfully. The rest of the
+ * header (src/dst/msgId/flags/payloadLen) and the encrypted payload are
+ * preserved byte-for-byte, so the transport-level `msgId` dedup key is stable
+ * across hops.
+ *
+ * Callers should pass a *copy* of the packet bytes if they intend to mutate
+ * TTL (subarray views share the underlying buffer with `headerBytes`).
+ */
+export function fragmentPacket(packet: Uint8Array, mtu?: number): string[] {
+  return fragment(packet, mtu);
+}
+
 // --- Reassembly ---
 
 interface ReassemblyBuffer {
@@ -637,11 +655,17 @@ export function decodeBLEChunkFull(
  *
  * Returns the header struct, the raw 30-byte header bytes (for AAD
  * computation via `headerToAAD`), and the raw payload bytes.
+ *
+ * Phase 3 — also returns `packetBytes`: the full assembled packet
+ * (header + payload). The relay engine needs the whole packet to decrement
+ * TTL and re-fragment it for forwarding without re-encoding (re-encoding
+ * would change the msgId dedup key). `headerBytes` and `payload` are subarray
+ * views into the same buffer, so callers that mutate TTL must copy first.
  */
 export function decodeBLEChunkRaw(
   base64Value: string,
   sourceKey: string = 'default',
-): { header: PacketHeader; headerBytes: Uint8Array; payload: Uint8Array } | null {
+): { header: PacketHeader; headerBytes: Uint8Array; payload: Uint8Array; packetBytes: Uint8Array } | null {
   const bytes = base64ToBytes(base64Value);
   if (bytes.length === 0) return null;
 
@@ -710,14 +734,16 @@ export function decodeBLEChunkRaw(
 
 function decodePacketToRaw(
   bytes: Uint8Array,
-): { header: PacketHeader; headerBytes: Uint8Array; payload: Uint8Array } | null {
+): { header: PacketHeader; headerBytes: Uint8Array; payload: Uint8Array; packetBytes: Uint8Array } | null {
   try {
     const { header, payload } = decodePacket(bytes);
     // The raw header bytes (first HEADER_SIZE) are needed for AAD computation
     // (Phase 2 encryption). Return a subarray view; `headerToAAD` copies
     // before zeroing the ttl byte, so the original packet bytes are untouched.
     const headerBytes = bytes.subarray(0, HEADER_SIZE);
-    return { header, headerBytes, payload };
+    // Phase 3 — the full assembled packet, for the relay engine to forward.
+    // `headerBytes` and `payload` are views into this same buffer.
+    return { header, headerBytes, payload, packetBytes: bytes };
   } catch (e) {
     // P1 task 2 — version mismatch (v1 packet) / truncation / malformed body.
     // Log and drop rather than propagating: a single bad chunk must not kill

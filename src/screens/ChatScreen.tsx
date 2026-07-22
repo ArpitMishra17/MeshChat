@@ -65,14 +65,19 @@ export function ChatScreen({ route }: Props) {
     };
 
     try {
-      await bleService.sendMessage(payload);
+      // Phase 3 — sendMessage floods the (end-to-end-encrypted) packet to all
+      // neighbors; relays forward by `dst` until it reaches `peerDeviceId`.
+      // If the peer is a direct neighbor it's delivered on the first hop; if
+      // not, the mesh carries it. We pass the destination fingerprint so ble.ts
+      // can encrypt to the right pubkey (possibly a multi-hop peer).
+      await bleService.sendMessage(payload, peerDeviceId);
       updateMessageStatus(msg.id, 'sent');
       setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, status: 'sent' } : m));
     } catch {
       updateMessageStatus(msg.id, 'failed');
       setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, status: 'failed' } : m));
     }
-  }, [input, conversationId, myDeviceId]);
+  }, [input, conversationId, myDeviceId, peerDeviceId]);
 
   const handleRetry = useCallback(async (message: Message) => {
     updateMessageStatus(message.id, 'sending');
@@ -88,14 +93,14 @@ export function ChatScreen({ route }: Props) {
     };
 
     try {
-      await bleService.sendMessage(payload);
+      await bleService.sendMessage(payload, peerDeviceId);
       updateMessageStatus(message.id, 'sent');
       setMessages(prev => prev.map(m => m.id === message.id ? { ...m, status: 'sent' as const } : m));
     } catch {
       updateMessageStatus(message.id, 'failed');
       setMessages(prev => prev.map(m => m.id === message.id ? { ...m, status: 'failed' as const } : m));
     }
-  }, [myDeviceId]);
+  }, [myDeviceId, peerDeviceId]);
 
   // P0.8 — compute the keyboard offset from the actual header height
   // (insets.top + header padding) instead of a hard-coded 90.

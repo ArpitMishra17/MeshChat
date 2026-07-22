@@ -60,6 +60,7 @@ function initSchema() {
       status TEXT NOT NULL DEFAULT 'sending',
       created_at INTEGER NOT NULL,
       delivered_at INTEGER,
+      hops INTEGER,
       FOREIGN KEY (conversation_id) REFERENCES conversations(id)
     );
   `);
@@ -81,6 +82,10 @@ function initSchema() {
  *
  * `delivered_at` (the v1 migration) is now baked into the CREATE TABLE for
  * v2+ installs, so the v1 ALTER is no longer needed.
+ *
+ * v3 (Phase 3) adds the `hops` column to messages — the hop count a message
+ * travelled to reach us (`DEFAULT_TTL - header.ttl` on arrival). Additive
+ * ALTER for existing v2 installs; baked into CREATE TABLE for fresh installs.
  */
 function runMigrations() {
   const versionRow = db.getAllSync<{ user_version: number }>('PRAGMA user_version');
@@ -92,6 +97,14 @@ function runMigrations() {
     db.execSync('DROP TABLE IF EXISTS peers');
     db.execSync('DROP TABLE IF EXISTS identity');
     version = 2;
+  }
+
+  if (version < 3) {
+    // Phase 3 — hop indicator for delivered messages. `hops` is nullable:
+    // messages we originate never have a hop count; received messages get
+    // the value computed by the relay engine on arrival.
+    db.execSync('ALTER TABLE messages ADD COLUMN hops INTEGER');
+    version = 3;
   }
 
   db.runSync(`PRAGMA user_version = ${version}`);
@@ -208,6 +221,31 @@ export function getAllPeers(): Peer[] {
   }));
 }
 
+/**
+ * Phase 3 — Look up a single peer by fingerprint (device_id). Used by the
+ * relay engine and ble.ts to recover a peer's stored public key so an
+ * end-to-end shared AES key can be re-derived for a peer that isn't currently
+ * connected (multi-hop: the destination may be several hops away, but we must
+ * have met them before to encrypt to them).
+ */
+export function getPeerByFingerprint(fingerprintHex: string): Peer | null {
+  const rows = db.getAllSync<any>(
+    'SELECT * FROM peers WHERE device_id = ? LIMIT 1',
+    [fingerprintHex],
+  );
+  if (rows.length === 0) return null;
+  const row = rows[0];
+  return {
+    deviceId: row.device_id,
+    displayName: row.display_name,
+    lastSeen: row.last_seen,
+    rssi: row.rssi,
+    bleId: row.ble_id,
+    publicKey: row.public_key ?? null,
+    keyPinned: row.key_pinned === 1,
+  };
+}
+
 // --- Conversations ---
 
 export function getOrCreateConversation(
@@ -279,15 +317,16 @@ export function insertMessage(
   text: string,
   status: MessageStatus = 'sending',
   messageId?: string,
+  hops: number | null = null,
 ): Message {
   const id = messageId || generateMessageId();
   const now = Date.now();
   db.runSync(
-    'INSERT OR IGNORE INTO messages (id, conversation_id, sender_device_id, text, status, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-    [id, conversationId, senderDeviceId, text, status, now],
+    'INSERT OR IGNORE INTO messages (id, conversation_id, sender_device_id, text, status, created_at, hops) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [id, conversationId, senderDeviceId, text, status, now, hops],
   );
   updateConversationLastMessage(conversationId, text, now);
-  return { id, conversationId, senderDeviceId, text, status, createdAt: now, deliveredAt: null };
+  return { id, conversationId, senderDeviceId, text, status, createdAt: now, deliveredAt: null, hops };
 }
 
 export function updateMessageStatus(messageId: string, status: MessageStatus): void {
@@ -319,6 +358,7 @@ export function getMessages(conversationId: string): Message[] {
     status: row.status as MessageStatus,
     createdAt: row.created_at,
     deliveredAt: row.delivered_at ?? null,
+    hops: row.hops ?? null,
   }));
 }
 

@@ -6,6 +6,7 @@ import { AppNavigator } from './src/navigation';
 import { OnboardingScreen } from './src/screens/OnboardingScreen';
 import { getDB, getIdentity } from './src/db/database';
 import { messageRouter } from './src/services/messageRouter';
+import { mesh } from './src/services/mesh';
 import { colors } from './src/theme';
 
 const navTheme = {
@@ -39,6 +40,9 @@ export default function App() {
     // is mounted. Also started after onboarding completes (below).
     if (identity) {
       messageRouter.start();
+      // Phase 3 — start the neighbor manager: duty-cycled scan +
+      // auto-connect keeps the link pool fed for multi-hop relaying.
+      mesh.start();
     }
   }, []);
 
@@ -46,6 +50,7 @@ export default function App() {
   useEffect(() => {
     if (showOnboarding === false) {
       messageRouter.start();
+      mesh.start();
     }
   }, [showOnboarding]);
 

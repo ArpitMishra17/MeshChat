@@ -49,6 +49,13 @@ export interface Message {
   status: MessageStatus;
   createdAt: number;
   deliveredAt: number | null;
+  /**
+   * Phase 3 — number of network hops the message travelled to reach us.
+   * Computed on arrival as `DEFAULT_TTL - header.ttl`. `null` for messages we
+   * originated (we don't hop to ourselves). 1 = direct from sender, 2 = via
+   * one relay, etc. Surfaced in the UI as "via N relay(s)".
+   */
+  hops: number | null;
 }
 
 /**

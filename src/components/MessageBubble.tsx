@@ -24,6 +24,15 @@ function formatTime(ts: number): string {
 
 export function MessageBubble({ message, isMine }: Props) {
   const status = statusIndicator[message.status];
+  // Phase 3 — hop indicator on received messages. `hops` is
+  // `DEFAULT_TTL - remainingTtl` on arrival: 1 = direct, 2 = via one relay,
+  // etc. Only inbound messages carry a hop count; ours stay null.
+  const hops = message.hops;
+  const relayCount = hops != null ? hops - 1 : 0;
+  const hopLabel =
+    hops == null ? null :
+    hops <= 1 ? 'direct' :
+    `via ${relayCount} relay${relayCount === 1 ? '' : 's'}`;
   return (
     <View style={[styles.container, isMine ? styles.containerMine : styles.containerTheirs]}>
       <View style={[styles.bubble, isMine ? styles.bubbleMine : styles.bubbleTheirs]}>
@@ -34,9 +43,13 @@ export function MessageBubble({ message, isMine }: Props) {
       </View>
       <View style={styles.meta}>
         <Text style={styles.time}>{formatTime(message.createdAt)}</Text>
-        {isMine && (
+        {isMine ? (
           <Text style={[styles.status, { color: status.color }]}> {status.symbol}</Text>
-        )}
+        ) : hopLabel ? (
+          <Text style={[styles.hop, hops != null && hops > 1 ? styles.hopRelayed : styles.hopDirect]}>
+            {' '}{hopLabel}
+          </Text>
+        ) : null}
       </View>
     </View>
   );
@@ -61,4 +74,9 @@ const styles = StyleSheet.create({
   meta: { flexDirection: 'row', alignItems: 'center', marginTop: 2, paddingHorizontal: 4 },
   time: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textMuted },
   status: { fontFamily: fonts.mono, fontSize: fontSize.xs },
+  // Phase 3 — hop indicator. Direct = dim/neutral; relayed = accent so the
+  // multi-hop path is visible at a glance in the demo.
+  hop: { fontFamily: fonts.mono, fontSize: fontSize.xs },
+  hopDirect: { color: colors.textMuted },
+  hopRelayed: { color: colors.accent },
 });

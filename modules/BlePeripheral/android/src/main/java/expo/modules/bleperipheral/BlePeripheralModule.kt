@@ -244,6 +244,10 @@ class BlePeripheralModule : Module() {
       resultMsg
     }
 
+    // Phase 0 (P0.8) — legacy broadcast notify. Retained for compatibility but
+    // Phase 3 prefers the addressed `sendNotificationToDevice` overload so a
+    // GATT server with several centrals doesn't broadcast every packet to all
+    // of them (which would amplify floods and leak addressed traffic).
     AsyncFunction("sendNotification") { charUUID: String, base64Value: String ->
       val characteristic = characteristics[charUUID.lowercase()]
         ?: throw Exception("Characteristic $charUUID not found")
@@ -261,9 +265,50 @@ class BlePeripheralModule : Module() {
       "Notification sent to ${connectedDevices.size} devices"
     }
 
+    /**
+     * Phase 3 — Addressed notification. Notifies a single connected central
+     * identified by `deviceAddress` (the BLE MAC we received in
+     * `onCharacteristicWriteRequest` / `onDeviceConnected`). This is what
+     * makes per-link sending possible on the peripheral side: a relay no longer
+     * echoes a forwarded packet to every central, only to the intended next hop.
+     *
+     * Returns "sent" on success, or throws if the device is not connected /
+     * the characteristic is unknown. A per-device failure (e.g. the central
+     * has unsubscribed) is logged and counted but does not abort the call —
+     * the caller treats the whole send as best-effort.
+     */
+    AsyncFunction("sendNotificationToDevice") { deviceAddress: String, charUUID: String, base64Value: String ->
+      val characteristic = characteristics[charUUID.lowercase()]
+        ?: throw Exception("Characteristic $charUUID not found")
+
+      val value = Base64.decode(base64Value, Base64.NO_WRAP)
+      characteristic.value = value
+
+      val device = connectedDevices.find { it.address == deviceAddress }
+        ?: throw Exception("Device $deviceAddress is not connected")
+
+      try {
+        gattServer?.notifyCharacteristicChanged(device, characteristic, false)
+      } catch (e: Exception) {
+        Log.w(TAG, "Failed to notify ${device.address}: ${e.message}")
+        throw e
+      }
+      "sent"
+    }
+
     Function("isAdvertising") { advertising }
 
     Function("getConnectedDeviceCount") { connectedDevices.size }
+
+    /**
+     * Phase 3 — Addresses of every central currently connected to our GATT
+     * server. Used by the link pool to map a peripheral-side transport back to
+     * a peer fingerprint (learned at HELLO time) and to address per-device
+     * notifications.
+     */
+    Function("getConnectedDevices") {
+      connectedDevices.map { it.address }
+    }
 
     AsyncFunction("stop") {
       try { advertiser?.stopAdvertising(null) } catch (_: Exception) {}

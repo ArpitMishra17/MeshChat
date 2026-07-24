@@ -31,3 +31,24 @@ export class Emitter {
     }
   }
 }
+
+/**
+ * Typed emitter that carries a payload to its listeners. A tiny wrapper
+ * around the payload-less `Emitter` above, for cases where passing the
+ * changed value through the emitter is more convenient than re-querying
+ * (e.g. scan results, incoming packets, routing-log entries). Used by
+ * ble.ts and messageRouter.ts.
+ */
+export class PayloadEmitter<T> {
+  private listeners = new Set<(payload: T) => void>();
+  subscribe(fn: (payload: T) => void): () => void {
+    this.listeners.add(fn);
+    return () => { this.listeners.delete(fn); };
+  }
+  emit(payload: T): void {
+    const snapshot = Array.from(this.listeners);
+    for (const fn of snapshot) {
+      try { fn(payload); } catch (e) { console.warn('[PayloadEmitter] listener threw:', e); }
+    }
+  }
+}

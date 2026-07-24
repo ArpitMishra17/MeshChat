@@ -1,14 +1,24 @@
 import React, { useState } from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, ScrollView } from 'react-native';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, ScrollView, Switch } from 'react-native';
 import { colors, fonts, fontSize } from '../theme';
 import { ensureIdentity, updateDisplayName } from '../services/identity';
 import { bytesToHex } from '../services/ids';
+import { positionProvider } from '../services/position';
+import { getLocationTable } from '../services/location';
 import { TerminalHeader } from '../components/TerminalHeader';
 
 export function SettingsScreen() {
   const identity = ensureIdentity();
   const [name, setName] = useState(identity.displayName);
   const [saved, setSaved] = useState(false);
+  const [gpsEnabled, setGpsEnabled] = useState(positionProvider.isEnabled());
+  const [knownPositions, setKnownPositions] = useState(getLocationTable().size);
+
+  const handleGpsToggle = async (value: boolean) => {
+    setGpsEnabled(value);
+    await positionProvider.setEnabled(value);
+    setKnownPositions(getLocationTable().size);
+  };
 
   const handleSave = () => {
     const trimmed = name.trim();
@@ -56,6 +66,45 @@ export function SettingsScreen() {
               <Text style={styles.saveText}>{saved ? '[OK]' : '[SAVE]'}</Text>
             </TouchableOpacity>
           </View>
+        </View>
+
+        <View style={styles.separator} />
+        <Text style={styles.sectionLabel}>{'// phase 4 — geographic routing'}</Text>
+
+        <View style={styles.field}>
+          <View style={styles.toggleRow}>
+            <View style={styles.toggleLabelCol}>
+              <Text style={styles.label}>gps_routing</Text>
+              <Text style={styles.hint}>
+                {gpsEnabled ? 'on — greedy forwarding when positions known' : 'off — flooding-only relay'}
+              </Text>
+            </View>
+            <Switch
+              value={gpsEnabled}
+              onValueChange={handleGpsToggle}
+              trackColor={{ false: colors.border, true: colors.primaryDim }}
+              thumbColor={gpsEnabled ? colors.primary : colors.textMuted}
+            />
+          </View>
+        </View>
+
+        <View style={styles.field}>
+          <Text style={styles.label}>my_position</Text>
+          <Text style={styles.valueDim}>
+            {positionProvider.getCurrent()
+              ? `${positionProvider.getCurrent()!.lat.toFixed(3)}, ${positionProvider.getCurrent()!.lon.toFixed(3)} (truncated)`
+              : 'no fix'}
+          </Text>
+        </View>
+
+        <View style={styles.field}>
+          <Text style={styles.label}>known_positions</Text>
+          <Text style={styles.value}>{knownPositions} peer(s) in location table</Text>
+        </View>
+
+        <View style={styles.field}>
+          <Text style={styles.label}>privacy</Text>
+          <Text style={styles.valueDim}>coords truncated to ~110m; opt out via toggle</Text>
         </View>
 
         <View style={styles.separator} />
@@ -113,6 +162,9 @@ const styles = StyleSheet.create({
   valueMono: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textDim },
   valueAccent: { fontFamily: fonts.mono, fontSize: fontSize.sm, color: colors.success },
   valueDim: { fontFamily: fonts.mono, fontSize: fontSize.sm, color: colors.textMuted, fontStyle: 'italic' },
+  toggleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  toggleLabelCol: { flex: 1, marginRight: 16 },
+  hint: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textMuted, marginTop: 2 },
   inputRow: { flexDirection: 'row', alignItems: 'center' },
   input: {
     flex: 1, fontFamily: fonts.mono, fontSize: fontSize.sm, color: colors.primary,

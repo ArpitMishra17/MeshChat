@@ -32,6 +32,8 @@ import {
   TYPE_HELLO,
   TYPE_MESSAGE,
   TYPE_ACK,
+  TYPE_POSITION,
+  FLAG_FLOOD_MODE,
   FINGERPRINT_SIZE,
 } from './protocol';
 import type { PacketHeader } from './protocol';
@@ -136,6 +138,12 @@ export function isBroadcast(dst: Uint8Array): boolean {
  * - Else (unicast, not for us):
  *     - ttl > 0 → `relay` (caller decrements ttl and forwards).
  *     - ttl == 0 → `drop` (ttl-exhausted).
+ *
+ * Phase 4 — POSITION beacons (type 0x04) are now routable. They are always
+ * broadcast (dst = 0x00…00, TTL ~3): every node that receives one updates
+ * its location table (`deliver`) and re-floods it (`relay`) so positions
+ * propagate beyond direct neighbors. Deduped via the seen-cache like any
+ * other flooded packet, so a triangle topology doesn't echo.
  */
 export function decideRelay(
   header: PacketHeader,
@@ -147,10 +155,14 @@ export function decideRelay(
     return { action: 'ignore' };
   }
 
-  // Only MESSAGE and ACK are routable. Any other type (POSITION is Phase 4,
-  // SYNC_* is Phase 6) is dropped by the protocol layer before reaching here,
-  // but be defensive.
-  if (header.type !== TYPE_MESSAGE && header.type !== TYPE_ACK) {
+  // Only MESSAGE, ACK, and POSITION are routable. Any other type (SYNC_* is
+  // Phase 6) is dropped by the protocol layer before reaching here, but be
+  // defensive.
+  if (
+    header.type !== TYPE_MESSAGE &&
+    header.type !== TYPE_ACK &&
+    header.type !== TYPE_POSITION
+  ) {
     return { action: 'ignore' };
   }
 
@@ -195,20 +207,34 @@ export function hopCount(remainingTtl: number, initialTtl: number): number {
 }
 
 /**
- * Phase 3 — Return a copy of `packetBytes` with the TTL byte (byte[3])
- * decremented by one. The caller passes this to `fragmentPacket` for
- * forwarding. A copy is returned (not an in-place mutation) because
+ * Phase 3 / Phase 4 — Return a copy of `packetBytes` with the TTL byte
+ * (byte[3]) decremented by one. The caller passes this to `fragmentPacket`
+ * for forwarding. A copy is returned (not an in-place mutation) because
  * `packetBytes` is shared with `headerBytes` / `payload` subarray views, and
  * the relay engine may still need the original (e.g. to deliver locally on a
  * broadcast before forwarding).
  *
+ * Phase 4 — `opts.setFloodMode` additionally sets FLAG_FLOOD_MODE (bit 2 of
+ * byte[2]) so downstream relays keep flooding instead of oscillating back to
+ * greedy. This bit is excluded from the AES-GCM AAD (`headerToAAD` clears
+ * it), so mutating it does NOT invalidate the ciphertext — the destination
+ * still decrypts successfully. All other header bytes are preserved
+ * byte-for-byte, so the transport-level `msgId` dedup key is stable across
+ * hops.
+ *
  * No-op (returns a copy unchanged) if TTL is already 0 — the decision
  * function should have dropped it, but this keeps the helper total.
  */
-export function withTtlDecremented(packetBytes: Uint8Array): Uint8Array {
+export function withTtlDecremented(
+  packetBytes: Uint8Array,
+  opts?: { setFloodMode?: boolean },
+): Uint8Array {
   const out = new Uint8Array(packetBytes.length);
   out.set(packetBytes);
   if (out[3] > 0) out[3] -= 1;
+  if (opts?.setFloodMode) {
+    out[2] = out[2] | FLAG_FLOOD_MODE;
+  }
   return out;
 }
 

@@ -7,9 +7,11 @@ import { bleService } from '../services/ble';
 import type { BLEState } from '../services/ble';
 import { mesh } from '../services/mesh';
 import type { NeighborInfo } from '../services/ble';
-import { messageRouter } from '../services/messageRouter';
+import { messageRouter, type RouteLogEntry, type RouteStats } from '../services/messageRouter';
 import { getOrCreateConversation, getAllPeers } from '../db/database';
 import { ensureIdentity } from '../services/identity';
+import { positionProvider } from '../services/position';
+import { getLocationTable } from '../services/location';
 import { StatusBadge } from '../components/StatusBadge';
 import { TerminalHeader } from '../components/TerminalHeader';
 import type { Peer } from '../types';
@@ -43,6 +45,9 @@ export function NearbyScreen() {
   const [bleState, setBleState] = useState<BLEState>('idle');
   const [scanCount, setScanCount] = useState(0);
   const [log, setLog] = useState('// mesh running');
+  const [routeStats, setRouteStats] = useState<RouteStats>(messageRouter.getRouteStats());
+  const [routeLog, setRouteLog] = useState<RouteLogEntry[]>([]);
+  const [gpsOn, setGpsOn] = useState(positionProvider.isEnabled());
 
   const refreshNeighbors = useCallback(() => {
     setNeighbors(mesh.getNeighbors());
@@ -77,12 +82,23 @@ export function NearbyScreen() {
       setScanResults(prev => prev.filter(p => Date.now() - p.lastSeen < 20_000));
     }, 5000);
 
+    // Phase 4 — routing log: prepend each decision, cap at 30 entries, and
+    // refresh the greedy/flood counters. This is the demo's evidence view:
+    // "GREEDY→B (progress 220 m)" vs "FLOOD (local-minimum, 3 nbrs)".
+    const unsubRoute = messageRouter.routingLog.subscribe(entry => {
+      setRouteLog(prev => [entry, ...prev].slice(0, 30));
+      setRouteStats(messageRouter.getRouteStats());
+    });
+    const gpsTimer = setInterval(() => setGpsOn(positionProvider.isEnabled()), 2000);
+
     return () => {
       unsubNeighbors();
       unsubPeers();
       unsubState();
       unsubScan();
       clearInterval(pruneTimer);
+      unsubRoute();
+      clearInterval(gpsTimer);
     };
   }, [refreshNeighbors, refreshKnown]);
 
@@ -153,6 +169,20 @@ export function NearbyScreen() {
       <View style={styles.infoBar}>
         <Text style={[styles.infoText, { color: colors.accent }]}>{log}</Text>
       </View>
+      <View style={styles.routeBar}>
+        <Text style={styles.routeLabel}>
+          gps:{gpsOn ? 'on' : 'off'} · loc:{getLocationTable().size}
+        </Text>
+        <Text style={[styles.routeStat, { color: colors.success }]}>
+          greedy:{routeStats.greedyForwards}
+        </Text>
+        <Text style={[styles.routeStat, { color: colors.warning }]}>
+          flood:{routeStats.floodForwards}
+        </Text>
+        <Text style={[styles.routeStat, { color: colors.accent }]}>
+          recv:{routeStats.delivered}
+        </Text>
+      </View>
 
       <FlatList
         data={[
@@ -222,6 +252,28 @@ export function NearbyScreen() {
             </Text>
           </View>
         }
+        ListFooterComponent={
+          routeLog.length > 0 ? (
+            <View style={styles.routeLogSection}>
+              <Text style={styles.routeLogHeader}>{'// routing log'}</Text>
+              {routeLog.map((entry, i) => (
+                <Text key={i} style={styles.routeLogEntry}>
+                  <Text style={styles.routeLogTime}>{fmtRouteTime(entry.timestamp)} </Text>
+                  <Text style={{ color: entry.strategy === 'greedy' ? colors.success : entry.strategy === 'flood' ? colors.warning : colors.accent }}>
+                    {entry.strategy.toUpperCase()}
+                  </Text>
+                  {' '}
+                  <Text style={styles.routeLogType}>{entry.type}</Text>
+                  {' '}
+                  <Text style={styles.routeLogMsg}>{entry.msgId}</Text>
+                  {entry.target ? ` →${entry.target}` : ''}
+                  {entry.progressMeters != null ? ` (${Math.round(entry.progressMeters)}m)` : ''}
+                  {entry.reason ? ` [${entry.reason}]` : ''}
+                </Text>
+              ))}
+            </View>
+          ) : null
+        }
         contentContainerStyle={styles.list}
       />
 
@@ -260,6 +312,11 @@ function timeAgo(ts: number): string {
   return `${Math.floor(diff / 3600)}h ago`;
 }
 
+function fmtRouteTime(ts: number): string {
+  const d = new Date(ts);
+  return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`;
+}
+
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
   infoBar: {
@@ -271,6 +328,23 @@ const styles = StyleSheet.create({
     borderBottomColor: colors.border,
   },
   infoText: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textDim },
+  routeBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 6,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+    backgroundColor: colors.bgSecondary,
+  },
+  routeLabel: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textDim, marginRight: 12 },
+  routeStat: { fontFamily: fonts.mono, fontSize: fontSize.xs, marginRight: 12 },
+  routeLogSection: { padding: 16, paddingTop: 20 },
+  routeLogHeader: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textDim, marginBottom: 8 },
+  routeLogEntry: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.text, lineHeight: 18 },
+  routeLogTime: { color: colors.textMuted },
+  routeLogType: { color: colors.accentDim },
+  routeLogMsg: { color: colors.textDim },
   list: { paddingVertical: 8, flexGrow: 1 },
   card: {
     backgroundColor: colors.bgCard,

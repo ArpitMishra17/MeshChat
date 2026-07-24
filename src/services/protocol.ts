@@ -48,6 +48,7 @@ import type {
   HandshakePayload,
   MessagePayload,
   AckPayload,
+  PositionPayload,
 } from '../types';
 
 // --- Protocol constants ---
@@ -58,12 +59,20 @@ export const HEADER_SIZE = 30;
 export const TYPE_HELLO = 0x01;
 export const TYPE_MESSAGE = 0x02;
 export const TYPE_ACK = 0x03;
-export const TYPE_POSITION = 0x04;      // reserved — Phase 4
+export const TYPE_POSITION = 0x04;      // Phase 4 — geo position beacon
 export const TYPE_SYNC_OFFER = 0x05;    // reserved — Phase 6
 export const TYPE_SYNC_REQ = 0x06;      // reserved — Phase 6
 
 export const FLAG_ENCRYPTED = 0x01;     // Phase 2
-export const FLAG_HAS_POSITION = 0x02;  // Phase 4
+export const FLAG_HAS_POSITION = 0x02;  // Phase 4 — HELLO/POSITION carry geo coords
+/**
+ * Phase 4 — set by a relay that fell back to flooding for a unicast packet
+ * (local minimum / unknown destination position). Downstream relays seeing
+ * this bit skip the greedy check and keep flooding, so greedy/flood don't
+ * oscillate. Excluded from the AES-GCM AAD (see `headerToAAD`) because relays
+ * must be free to set it — only TTL and this routing bit are relay-mutable.
+ */
+export const FLAG_FLOOD_MODE = 0x04;
 
 /** Default TTL for originated packets (Phase 3 floods with this). */
 export const DEFAULT_TTL = 5;
@@ -185,16 +194,23 @@ export function encodeBody(payload: BLEPayload): Uint8Array {
       // Phase 2 — HELLO carries the 32-byte X25519 public key + display
       // name. The fingerprint (deviceId) is derived from the pubkey by the
       // receiver, so it is not sent on the wire.
+      // Phase 4 — if the sender has a GPS fix, the position is appended
+      // (16 bytes: latE6, lonE6, ts) and FLAG_HAS_POSITION is set on the
+      // packet header by the caller. The body is self-describing: a
+      // receiver parses the position iff trailing bytes remain after the
+      // name, so decodeBody needs no flags argument.
       const nameBytes = strToBytes(payload.displayName);
       const pubBytes = payload.publicKey;
       if (pubBytes.length !== 32) {
         throw new ProtocolError(`handshake public key must be 32 bytes, got ${pubBytes.length}`);
       }
-      const out = new Uint8Array(32 + 1 + nameBytes.length);
+      const posBytes = payload.position ? encodePositionBlock(payload.position) : null;
+      const out = new Uint8Array(32 + 1 + nameBytes.length + (posBytes ? posBytes.length : 0));
       let p = 0;
       out.set(pubBytes, p); p += 32;
       out[p++] = nameBytes.length;
-      out.set(nameBytes, p);
+      out.set(nameBytes, p); p += nameBytes.length;
+      if (posBytes) { out.set(posBytes, p); }
       return out;
     }
     case 'message': {
@@ -227,6 +243,10 @@ export function encodeBody(payload: BLEPayload): Uint8Array {
       out.set(idBytes, p);
       return out;
     }
+    case 'position': {
+      // Phase 4 — [latE6: 4 signed BE][lonE6: 4 signed BE][timestamp: 8 BE].
+      return encodePositionBlock(payload);
+    }
   }
 }
 
@@ -237,13 +257,21 @@ export function decodeBody(type: number, bytes: Uint8Array): BLEPayload {
       // is NOT in the wire body; it is derived from the pubkey by the caller
       // (ble.ts) via `fingerprintHexFromPubKey`. We leave deviceId empty here
       // to keep protocol.ts free of crypto dependencies.
+      // Phase 4 — [pubkey: 32][nameLen: 1][name][?latE6: 4][lonE6: 4][ts: 8].
+      // The position block is present iff >= 16 trailing bytes remain after
+      // the name (self-describing, so no flags argument is needed).
       if (bytes.length < 33) {
         throw new ProtocolError(`HELLO body too short: ${bytes.length} < 33`);
       }
       const publicKey = bytes.subarray(0, 32);
       const nameLen = bytes[32];
-      const displayName = bytesToStr(bytes.subarray(33, 33 + nameLen));
-      return { type: 'handshake', deviceId: '', displayName, publicKey };
+      const nameEnd = 33 + nameLen;
+      const displayName = bytesToStr(bytes.subarray(33, nameEnd));
+      let position: PositionPayload | null = null;
+      if (bytes.length - nameEnd >= POSITION_BLOCK_SIZE) {
+        position = decodePositionBlock(bytes.subarray(nameEnd));
+      }
+      return { type: 'handshake', deviceId: '', displayName, publicKey, position };
     }
     case TYPE_MESSAGE: {
       let offset = 0;
@@ -272,6 +300,13 @@ export function decodeBody(type: number, bytes: Uint8Array): BLEPayload {
       const messageId = bytesToStr(bytes.subarray(offset, offset + idLen));
       return { type: 'ack', messageId };
     }
+    case TYPE_POSITION: {
+      // Phase 4 — [latE6: 4][lonE6: 4][timestamp: 8].
+      if (bytes.length < POSITION_BLOCK_SIZE) {
+        throw new ProtocolError(`POSITION body too short: ${bytes.length} < ${POSITION_BLOCK_SIZE}`);
+      }
+      return decodePositionBlock(bytes);
+    }
     default:
       throw new ProtocolError(
         `Unsupported/reserved packet type: 0x${type.toString(16)}`,
@@ -284,7 +319,65 @@ function bodyType(payload: BLEPayload): number {
     case 'handshake': return TYPE_HELLO;
     case 'message': return TYPE_MESSAGE;
     case 'ack': return TYPE_ACK;
+    case 'position': return TYPE_POSITION;
   }
+}
+
+// --- Phase 4: position block (shared by HELLO and POSITION) ---
+//
+// Layout (16 bytes, big-endian):
+//   [0..3]   latE6  — signed 32-bit, latitude × 1e6 (microdegrees)
+//   [4..7]   lonE6  — signed 32-bit, longitude × 1e6
+//   [8..15]  timestamp — unsigned 64-bit, ms since epoch (sender's clock)
+//
+// latE6 range: ±180_000_000, fits in int32. The position provider truncates
+// to ~3 decimal places (millidegrees, ~110 m) before encoding for privacy,
+// so the low 3 digits of latE6 are always zero on the wire. Decoding
+// reconstructs the float by dividing by 1e6.
+
+export const POSITION_BLOCK_SIZE = 16;
+
+function encodePositionBlock(pos: { lat: number; lon: number; timestamp: number }): Uint8Array {
+  const out = new Uint8Array(POSITION_BLOCK_SIZE);
+  const latE6 = Math.round(pos.lat * 1e6);
+  const lonE6 = Math.round(pos.lon * 1e6);
+  // Signed 32-bit big-endian via unsigned shift (two's complement).
+  out[0] = (latE6 >>> 24) & 0xff;
+  out[1] = (latE6 >>> 16) & 0xff;
+  out[2] = (latE6 >>> 8) & 0xff;
+  out[3] = latE6 & 0xff;
+  out[4] = (lonE6 >>> 24) & 0xff;
+  out[5] = (lonE6 >>> 16) & 0xff;
+  out[6] = (lonE6 >>> 8) & 0xff;
+  out[7] = lonE6 & 0xff;
+  // 64-bit timestamp (ms). JS bitwise is 32-bit, so write hi/lo as numbers.
+  const ts = Math.floor(pos.timestamp);
+  const hi = Math.floor(ts / 0x100000000);
+  const lo = ts >>> 0;
+  out[8] = (hi >>> 24) & 0xff;
+  out[9] = (hi >>> 16) & 0xff;
+  out[10] = (hi >>> 8) & 0xff;
+  out[11] = hi & 0xff;
+  out[12] = (lo >>> 24) & 0xff;
+  out[13] = (lo >>> 16) & 0xff;
+  out[14] = (lo >>> 8) & 0xff;
+  out[15] = lo & 0xff;
+  return out;
+}
+
+function decodePositionBlock(bytes: Uint8Array): PositionPayload {
+  // Signed 32-bit reconstruction: << 24 sign-extends in JS's 32-bit math.
+  const latE6 = (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
+  const lonE6 = (bytes[4] << 24) | (bytes[5] << 16) | (bytes[6] << 8) | bytes[7];
+  const hi = (bytes[8] * 0x1000000) + (bytes[9] << 16) + (bytes[10] << 8) + bytes[11];
+  const lo = (bytes[12] * 0x1000000) + (bytes[13] << 16) + (bytes[14] << 8) + bytes[15];
+  const timestamp = hi * 0x100000000 + lo;
+  return {
+    type: 'position',
+    lat: latE6 / 1e6,
+    lon: lonE6 / 1e6,
+    timestamp,
+  };
 }
 
 // --- Pure packet encode / decode (the unit-testable core) ---
@@ -392,10 +485,20 @@ export function buildHeaderBytes(input: {
 }
 
 /**
- * Copy raw header bytes and zero the TTL byte (byte[3]) to produce the AAD
- * for AES-GCM. The copy ensures the original packet bytes are not modified.
- * TTL must be excluded from AAD because relays decrement it at each hop;
- * every other header field is immutable and is authenticated.
+ * Copy raw header bytes and produce the AAD for AES-GCM by zeroing the
+ * relay-mutable fields. The copy ensures the original packet bytes are not
+ * modified.
+ *
+ * Two header fields are relay-mutable and therefore excluded from the AAD:
+ *   - **TTL** (byte[3]) — relays decrement it at each hop.
+ *   - **FLAG_FLOOD_MODE** (bit 2 of byte[2], the flags byte) — Phase 4: a
+ *     relay that falls back to flooding sets this bit so downstream nodes
+ *     keep flooding instead of oscillating back to greedy.
+ *
+ * Every other header field (version, type, FLAG_ENCRYPTED, FLAG_HAS_POSITION,
+ * msgId, src, dst, payloadLen) is immutable and authenticated — a relay
+ * cannot alter src/dst/msgId or flip the encrypted flag without the
+ * ciphertext failing to authenticate at the destination.
  */
 export function headerToAAD(headerBytes: Uint8Array): Uint8Array {
   if (headerBytes.length < HEADER_SIZE) {
@@ -404,6 +507,7 @@ export function headerToAAD(headerBytes: Uint8Array): Uint8Array {
   const aad = new Uint8Array(HEADER_SIZE);
   aad.set(headerBytes.subarray(0, HEADER_SIZE));
   aad[3] = 0; // zero TTL
+  aad[2] = aad[2] & ~FLAG_FLOOD_MODE; // clear flood-mode (routing metadata)
   return aad;
 }
 

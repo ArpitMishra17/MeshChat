@@ -7,6 +7,7 @@ import { OnboardingScreen } from './src/screens/OnboardingScreen';
 import { getDB, getIdentity } from './src/db/database';
 import { messageRouter } from './src/services/messageRouter';
 import { mesh } from './src/services/mesh';
+import { positionProvider } from './src/services/position';
 import { colors } from './src/theme';
 
 const navTheme = {
@@ -43,6 +44,10 @@ export default function App() {
       // Phase 3 — start the neighbor manager: duty-cycled scan +
       // auto-connect keeps the link pool fed for multi-hop relaying.
       mesh.start();
+      // Phase 4 — start the GPS watch if the user has enabled it. No-op
+      // (returns false) when the toggle is off; the node then participates
+      // as a flooding-only relay.
+      void positionProvider.start();
     }
   }, []);
 
@@ -51,6 +56,7 @@ export default function App() {
     if (showOnboarding === false) {
       messageRouter.start();
       mesh.start();
+      void positionProvider.start();
     }
   }, [showOnboarding]);
 

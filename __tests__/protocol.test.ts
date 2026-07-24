@@ -15,11 +15,14 @@ import {
   TYPE_MESSAGE,
   TYPE_ACK,
   TYPE_POSITION,
+  TYPE_SYNC_OFFER,
   FLAG_ENCRYPTED,
   FLAG_HAS_POSITION,
+  FLAG_FLOOD_MODE,
   BROADCAST_DST,
   FINGERPRINT_SIZE,
   MSGID_SIZE,
+  POSITION_BLOCK_SIZE,
   ProtocolError,
   ProtocolVersionError,
   encodePacket,
@@ -36,7 +39,7 @@ import {
   _clearReassemblyBuffers,
   _resetMsgSeq,
 } from '../src/services/protocol';
-import type { HandshakePayload, MessagePayload, AckPayload } from '../src/types';
+import type { HandshakePayload, MessagePayload, AckPayload, PositionPayload } from '../src/types';
 
 // --- pure hex helpers (avoid importing ids.ts, which pulls expo-crypto) ---
 
@@ -79,6 +82,7 @@ const handshake: HandshakePayload = {
   deviceId: '', // not on the wire — derived from publicKey by the receiver
   displayName: 'alice',
   publicKey: PEER_PUBKEY,
+  position: null, // Phase 4 — no GPS fix in this fixture
 };
 
 const message: MessagePayload = {
@@ -186,6 +190,162 @@ describe('encodePacket / decodePacket round-trip', () => {
     const { header, payload } = decodePacket(packet);
     const decoded = decodeBody(header.type, payload) as MessagePayload;
     expect(decoded.text).toBe(unicode.text);
+  });
+});
+
+// =====================================================================
+// Phase 4: POSITION body codec
+// =====================================================================
+
+describe('POSITION body codec (Phase 4)', () => {
+  it('round-trips a POSITION beacon (positive coords)', () => {
+    const pos: PositionPayload = {
+      type: 'position',
+      lat: 37.7749,
+      lon: -122.4194,
+      timestamp: 1_700_000_000_000,
+    };
+    const body = encodeBody(pos);
+    // [latE6: 4][lonE6: 4][timestamp: 8] = 16 bytes
+    expect(body.length).toBe(POSITION_BLOCK_SIZE);
+    const decoded = decodeBody(TYPE_POSITION, body) as PositionPayload;
+    expect(decoded.type).toBe('position');
+    // lat 37.7749 × 1e6 = 37774900, divided back = 37.7749
+    expect(decoded.lat).toBeCloseTo(37.7749, 6);
+    expect(decoded.lon).toBeCloseTo(-122.4194, 6);
+    expect(decoded.timestamp).toBe(1_700_000_000_000);
+  });
+
+  it('round-trips a POSITION beacon (negative coords — southern/western hemisphere)', () => {
+    const pos: PositionPayload = {
+      type: 'position',
+      lat: -33.8688,
+      lon: 151.2093,
+      timestamp: 0,
+    };
+    const body = encodeBody(pos);
+    const decoded = decodeBody(TYPE_POSITION, body) as PositionPayload;
+    expect(decoded.lat).toBeCloseTo(-33.8688, 6);
+    expect(decoded.lon).toBeCloseTo(151.2093, 6);
+    expect(decoded.timestamp).toBe(0);
+  });
+
+  it('round-trips a POSITION beacon at the extreme (±180°)', () => {
+    const pos: PositionPayload = {
+      type: 'position',
+      lat: -90,
+      lon: 180,
+      // A large-but-safe timestamp (within Number.MAX_SAFE_INTEGER, ~year 2286).
+      timestamp: 9_999_999_999_999_999,
+    };
+    const body = encodeBody(pos);
+    const decoded = decodeBody(TYPE_POSITION, body) as PositionPayload;
+    expect(decoded.lat).toBeCloseTo(-90, 6);
+    expect(decoded.lon).toBeCloseTo(180, 6);
+    expect(decoded.timestamp).toBe(9_999_999_999_999_999);
+  });
+
+  it('throws on a POSITION body shorter than POSITION_BLOCK_SIZE', () => {
+    expect(() => decodeBody(TYPE_POSITION, new Uint8Array(15))).toThrow(ProtocolError);
+  });
+
+  it('round-trips a POSITION beacon through full packet framing + fragmentation', () => {
+    const pos: PositionPayload = {
+      type: 'position',
+      lat: 40.7128,
+      lon: -74.006,
+      timestamp: 1_234_567_890,
+    };
+    const frags = encodeBLEPayload(pos, { src: SRC, msgId: MSGID, mtu: 512, ttl: 3 });
+    expect(frags.length).toBe(1);
+    const decoded = decodeBLEChunkFull(frags[0], 'pos');
+    expect(decoded).not.toBeNull();
+    expect(decoded!.header.type).toBe(TYPE_POSITION);
+    expect(decoded!.header.ttl).toBe(3);
+    expect((decoded!.payload as PositionPayload).lat).toBeCloseTo(40.7128, 6);
+  });
+});
+
+// =====================================================================
+// Phase 4: HELLO with position
+// =====================================================================
+
+describe('HELLO with position (Phase 4)', () => {
+  it('round-trips a HELLO carrying a GPS fix', () => {
+    const helloWithPos: HandshakePayload = {
+      ...handshake,
+      position: { lat: 48.8566, lon: 2.3522, timestamp: 1_700_000_000_000 },
+    };
+    const body = encodeBody(helloWithPos);
+    // 32 (pubkey) + 1 (nameLen) + 5 (name "alice") + 16 (position block)
+    expect(body.length).toBe(32 + 1 + 5 + POSITION_BLOCK_SIZE);
+    const decoded = decodeBody(TYPE_HELLO, body) as HandshakePayload;
+    expect(decoded.displayName).toBe('alice');
+    expect(bytesToHex(decoded.publicKey)).toBe(bytesToHex(PEER_PUBKEY));
+    expect(decoded.position).not.toBeNull();
+    expect(decoded.position!.lat).toBeCloseTo(48.8566, 6);
+    expect(decoded.position!.lon).toBeCloseTo(2.3522, 6);
+    expect(decoded.position!.timestamp).toBe(1_700_000_000_000);
+  });
+
+  it('round-trips a HELLO with position=null (GPS off / no fix)', () => {
+    const body = encodeBody(handshake); // position: null
+    expect(body.length).toBe(32 + 1 + 5); // no position block
+    const decoded = decodeBody(TYPE_HELLO, body) as HandshakePayload;
+    expect(decoded.position).toBeNull();
+  });
+
+  it('is self-describing: position parsed from trailing bytes without a flags arg', () => {
+    // A HELLO with position encoded, then decoded by decodeBody(type, bytes)
+    // alone (no flags) — confirms the body is self-describing.
+    const helloWithPos: HandshakePayload = {
+      ...handshake,
+      position: { lat: -10.5, lon: 20.25, timestamp: 99 },
+    };
+    const body = encodeBody(helloWithPos);
+    const decoded = decodeBody(TYPE_HELLO, body) as HandshakePayload;
+    expect(decoded.position).not.toBeNull();
+    expect(decoded.position!.lat).toBeCloseTo(-10.5, 6);
+  });
+});
+
+// =====================================================================
+// Phase 4: headerToAAD excludes FLAG_FLOOD_MODE (relay-mutable)
+// =====================================================================
+
+describe('headerToAAD — FLAG_FLOOD_MODE excluded (Phase 4)', () => {
+  it('clears the flood-mode bit so a relay setting it does not break AAD', () => {
+    const header = buildHeaderBytes({
+      type: TYPE_MESSAGE,
+      flags: FLAG_ENCRYPTED | FLAG_FLOOD_MODE,
+      ttl: 5,
+      msgId: MSGID,
+      src: SRC,
+      dst: DST,
+      payloadLen: 10,
+    });
+    const aad = headerToAAD(header);
+    expect(aad[3]).toBe(0); // TTL zeroed
+    expect(aad[2] & FLAG_FLOOD_MODE).toBe(0); // flood-mode cleared
+    expect(aad[2] & FLAG_ENCRYPTED).toBe(FLAG_ENCRYPTED); // encrypted preserved
+  });
+
+  it('produces identical AAD whether or not flood-mode is set on the header', () => {
+    // A relay sets FLAG_FLOOD_MODE mid-path. The sender built AAD without it.
+    // Both must hash to the same AAD bytes for decryption to succeed.
+    const base = buildHeaderBytes({
+      type: TYPE_MESSAGE, flags: FLAG_ENCRYPTED, ttl: 5,
+      msgId: MSGID, src: SRC, dst: DST, payloadLen: 10,
+    });
+    const withFlood = buildHeaderBytes({
+      type: TYPE_MESSAGE, flags: FLAG_ENCRYPTED | FLAG_FLOOD_MODE, ttl: 4,
+      msgId: MSGID, src: SRC, dst: DST, payloadLen: 10,
+    });
+    const aadBase = headerToAAD(base);
+    const aadFlood = headerToAAD(withFlood);
+    // TTL differs (5 vs 4) but both are zeroed; flood-mode differs but both
+    // are cleared → identical AAD.
+    expect(bytesToHex(aadBase)).toBe(bytesToHex(aadFlood));
   });
 });
 
@@ -299,8 +459,8 @@ describe('truncation and malformed input', () => {
     expect(() => decodePacket(truncated)).toThrow(ProtocolError);
   });
 
-  it('decodeBody throws on a reserved type', () => {
-    expect(() => decodeBody(TYPE_POSITION, new Uint8Array(0))).toThrow(ProtocolError);
+  it('decodeBody throws on a reserved type (SYNC_OFFER, Phase 6)', () => {
+    expect(() => decodeBody(TYPE_SYNC_OFFER, new Uint8Array(0))).toThrow(ProtocolError);
   });
 
   it('decodeBLEChunkFull drops a v1-style packet (first byte 0x01) without throwing', () => {

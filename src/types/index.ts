@@ -63,12 +63,19 @@ export interface Message {
  * receiver can derive the shared secret and fingerprint. `deviceId` is
  * the fingerprint (derived from `publicKey` by the receiver, not sent
  * on the wire).
+ *
+ * Phase 4 — when the sender has a GPS fix, the position is appended to
+ * the HELLO body (signalled by FLAG_HAS_POSITION in the header). The
+ * receiver updates its location table immediately on connect, so a
+ * neighbor's position is known without waiting for the first POSITION
+ * beacon. `null` when GPS is disabled or no fix yet.
  */
 export interface HandshakePayload {
   type: 'handshake';
   deviceId: string;
   displayName: string;
   publicKey: Uint8Array;
+  position: GeoPosition | null;
 }
 
 export interface MessagePayload {
@@ -85,4 +92,34 @@ export interface AckPayload {
   messageId: string;
 }
 
-export type BLEPayload = HandshakePayload | MessagePayload | AckPayload;
+/**
+ * Phase 4 — A geographic coordinate (WGS-84). Latitude/longitude in degrees,
+ * truncated to ~3 decimal places (~110 m) before going on the wire for
+ * privacy (see position.ts / protocol.ts POSITION body). `timestamp` is the
+ * sender's claim of when the fix was taken; the location table uses arrival
+ * time for staleness eviction to stay robust against clock skew.
+ */
+export interface GeoPosition {
+  lat: number;
+  lon: number;
+  timestamp: number;
+}
+
+/**
+ * Phase 4 — POSITION beacon body. Broadcast (dst = 0x00…00), TTL ~3, sent on
+ * HELLO and periodically while moving. Every node that receives it updates
+ * its location table with the sender's position keyed by `header.src`.
+ *
+ * Positions are visible to the mesh — relays must route on them. This is a
+ * documented privacy trade-off (PLAN.md Phase 4); users can opt out entirely
+ * via the Settings GPS toggle, in which case the node participates as a
+ * flooding-only relay and originates no POSITION beacons.
+ */
+export interface PositionPayload {
+  type: 'position';
+  lat: number;
+  lon: number;
+  timestamp: number;
+}
+
+export type BLEPayload = HandshakePayload | MessagePayload | AckPayload | PositionPayload;

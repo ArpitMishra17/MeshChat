@@ -39,6 +39,7 @@
         "BLUETOOTH_ADVERTISE",
         "ACCESS_FINE_LOCATION",
         "ACCESS_COARSE_LOCATION",
+        "FOREGROUND_SERVICE",
         "android.permission.BLUETOOTH",
         "android.permission.BLUETOOTH_ADMIN",
         "android.permission.BLUETOOTH_CONNECT"
@@ -60,7 +61,14 @@
         }
       ],
       "expo-sqlite",
-      "expo-secure-store"
+      "expo-secure-store",
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "MeshChat uses your location to route messages toward nearby devices over the mesh.",
+          "locationWhenInUsePermission": "MeshChat uses your location to route messages toward nearby devices over the mesh."
+        }
+      ]
     ],
     "extra": {
       "eas": {

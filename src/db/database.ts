@@ -69,6 +69,13 @@ function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_messages_conversation
     ON messages(conversation_id, created_at);
   `);
+
+  db.execSync(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+  `);
 }
 
 /**
@@ -86,6 +93,9 @@ function initSchema() {
  * v3 (Phase 3) adds the `hops` column to messages — the hop count a message
  * travelled to reach us (`DEFAULT_TTL - header.ttl` on arrival). Additive
  * ALTER for existing v2 installs; baked into CREATE TABLE for fresh installs.
+ *
+ * v4 (Phase 4) adds the `settings` table (key-value) for the GPS toggle and
+ * future app preferences. Additive CREATE TABLE; no data migration needed.
  */
 function runMigrations() {
   const versionRow = db.getAllSync<{ user_version: number }>('PRAGMA user_version');
@@ -105,6 +115,13 @@ function runMigrations() {
     // the value computed by the relay engine on arrival.
     db.execSync('ALTER TABLE messages ADD COLUMN hops INTEGER');
     version = 3;
+  }
+
+  if (version < 4) {
+    // Phase 4 — key-value settings store (GPS toggle, future preferences).
+    // CREATE TABLE IF NOT EXISTS in initSchema also covers fresh installs.
+    db.execSync('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+    version = 4;
   }
 
   db.runSync(`PRAGMA user_version = ${version}`);
@@ -365,4 +382,37 @@ export function getMessages(conversationId: string): Message[] {
 export function messageExists(messageId: string): boolean {
   const rows = db.getAllSync('SELECT 1 FROM messages WHERE id = ? LIMIT 1', [messageId]);
   return rows.length > 0;
+}
+
+// --- Settings (Phase 4) ---
+//
+// Simple key-value store for app preferences. Currently used for the GPS
+// toggle (`gps_enabled`); future settings can reuse the same table. Values
+// are stored as TEXT — callers (de)serialize booleans/numbers as strings.
+
+export function getSetting(key: string): string | null {
+  const rows = db.getAllSync<{ value: string }>(
+    'SELECT value FROM settings WHERE key = ? LIMIT 1',
+    [key],
+  );
+  return rows.length > 0 ? rows[0].value : null;
+}
+
+export function setSetting(key: string, value: string): void {
+  db.runSync(
+    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+    [key, value],
+  );
+}
+
+/** Convenience: read a boolean setting with a default. */
+export function getBoolSetting(key: string, defaultValue: boolean): boolean {
+  const v = getSetting(key);
+  if (v === null) return defaultValue;
+  return v === '1';
+}
+
+/** Convenience: write a boolean setting as '1'/'0'. */
+export function setBoolSetting(key: string, value: boolean): void {
+  setSetting(key, value ? '1' : '0');
 }

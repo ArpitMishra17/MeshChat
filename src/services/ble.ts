@@ -16,16 +16,22 @@ import {
   TYPE_HELLO,
   TYPE_MESSAGE,
   TYPE_ACK,
+  TYPE_POSITION,
   FLAG_ENCRYPTED,
+  FLAG_HAS_POSITION,
   type PacketHeader,
 } from './protocol';
 import { fingerprintHexFromPubKey, NONCE_SIZE, GCM_TAG_SIZE } from './crypto';
 import { generatePacketId, bytesToHex, hexToBytes } from './ids';
+import { positionProvider } from './position';
+import { getLocationTable } from './location';
+import { PayloadEmitter } from './events';
 import type {
   Peer,
   HandshakePayload,
   MessagePayload,
   AckPayload,
+  PositionPayload,
 } from '../types';
 
 const SERVICE_UUID = '12345678-1234-5678-1234-56789abcdef0';
@@ -35,6 +41,10 @@ const ACK_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef3';
 
 /** P0.3 — How long the central waits for the peripheral's HELLO notification. */
 const HANDSHAKE_TIMEOUT_MS = 8000;
+/** Phase 4 — POSITION beacon interval (PLAN.md: ~60 s while moving). */
+const POSITION_BEACON_MS = 60_000;
+/** Phase 4 — TTL for POSITION beacons (broadcast, a few hops). */
+const POSITION_TTL = 3;
 
 export type BLEState = 'idle' | 'scanning' | 'connecting' | 'connected' | 'error';
 
@@ -134,21 +144,8 @@ export interface ConnectResult {
 
 /**
  * Typed emitter that carries a payload to its listeners.
- * Tiny wrapper around the payload-less `Emitter` in events.ts.
+ * (Moved to events.ts so messageRouter can share it for routing logs.)
  */
-class PayloadEmitter<T> {
-  private listeners = new Set<(payload: T) => void>();
-  subscribe(fn: (payload: T) => void): () => void {
-    this.listeners.add(fn);
-    return () => { this.listeners.delete(fn); };
-  }
-  emit(payload: T): void {
-    const snapshot = Array.from(this.listeners);
-    for (const fn of snapshot) {
-      try { fn(payload); } catch (e) { console.warn('[BLE emitter] listener threw:', e); }
-    }
-  }
-}
 
 class BLEService {
   private manager: BleManager;
@@ -170,6 +167,10 @@ class BLEService {
 
   private state: BLEState = 'idle';
   private peripheralStarted = false;
+  /** Phase 4 — periodic POSITION beacon timer (sends our GPS fix to neighbors). */
+  private beaconTimer: ReturnType<typeof setInterval> | null = null;
+  /** Phase 4 — unsubscribers for position-provider + linkUp beacon triggers. */
+  private positionUnsubs: Array<() => void> = [];
 
   // P0.1 — multi-subscriber emitters so the MessageRouter (always-on) and a
   // mounted screen (ephemeral) can both listen without one clobbering the
@@ -177,7 +178,7 @@ class BLEService {
   readonly peerDiscovered = new PayloadEmitter<Peer>();
   /** Raw scan hits (BLE MAC, RSSI, advertising name) — not yet handshake'd. */
   readonly scanResult = new PayloadEmitter<Peer>();
-  /** Phase 3 — fully-decoded incoming MESSAGE/ACK packets for the relay engine. */
+  /** Phase 3 — fully-decoded incoming MESSAGE/ACK/POSITION packets for the relay engine. */
   readonly packetReceived = new PayloadEmitter<IncomingPacket>();
   /** Phase 3 — link established (HELLO completed). */
   readonly linkUp = new PayloadEmitter<LinkEvent>();
@@ -241,6 +242,14 @@ class BLEService {
     console.log('[BLE] Advertising result:', result);
     this.peripheralStarted = true;
     console.log('[BLE] Peripheral fully started');
+
+    // Phase 4 — start the POSITION beacon loop. Sends our truncated GPS fix
+    // to all neighbors every POSITION_BEACON_MS while we have a fix, so the
+    // mesh can route geographically toward us. Also fires immediately when
+    // our position changes (movement) and when a new link comes up (so a
+    // fresh neighbor learns our position without waiting for the timer).
+    this.startPositionBeacons();
+
     return result;
   }
 
@@ -612,8 +621,8 @@ class BLEService {
       return;
     }
 
-    // MESSAGE / ACK — hand to the relay engine with the raw packet bytes so
-    // it can forward (decrement TTL + re-fragment) without re-encoding.
+    // MESSAGE / ACK / POSITION — hand to the relay engine with the raw packet
+    // bytes so it can forward (decrement TTL + re-fragment) without re-encoding.
     const arrivalFingerprintHex = this.transportToFingerprint.get(transportKey) ?? null;
     this.packetReceived.emit({
       header,
@@ -727,6 +736,14 @@ class BLEService {
     this.peerDiscovered.emit(peer);
     this.handshakeReceived.emit({ payload: hp, bleId: transportKey });
 
+    // Phase 4 — if the HELLO carried a position, populate the location table
+    // immediately so we can route geographically toward this peer without
+    // waiting for the first POSITION beacon. Arrival time is used for
+    // staleness (robust against clock skew).
+    if (hp.position) {
+      getLocationTable().set(peerFpHex, hp.position.lat, hp.position.lon);
+    }
+
     // Peripheral side: reply with our HELLO so the central learns our identity.
     if (isPeripheralSide) {
       void this.sendHelloToPeripheral(transportKey);
@@ -799,6 +816,33 @@ class BLEService {
     await Promise.all(sends);
   }
 
+  /**
+   * Phase 4 — Send `packetBytes` to ONE specific neighbor (greedy forwarding).
+   *
+   * This is the targeted counterpart to `broadcastPacket`: instead of flooding
+   * to every neighbor, it sends only to the neighbor geographically closest
+   * to the destination (chosen by `greedyForwardDecision` in messageRouter).
+   * One targeted transmission vs N-neighbor flood is the headline efficiency
+   * win of geographic routing.
+   *
+   * Returns true on success, false if the link is gone (dropped between the
+   * decision and the send). The caller falls back to flooding on false so a
+   * packet is never lost just because a link vanished mid-forward.
+   */
+  async sendToNeighbor(fingerprintHex: string, packetBytes: Uint8Array): Promise<boolean> {
+    const link = this.links.get(fingerprintHex);
+    if (!link || !link.established) return false;
+    const transport = this.preferredTransport(link);
+    if (!transport) return false;
+    const type = packetBytes[1];
+    const charUUID = this.charForType(type);
+    if (!charUUID) return false;
+    const mtu = transport.kind === 'central' ? transport.mtu : null;
+    const frags = fragmentPacket(packetBytes, mtu ?? undefined);
+    await this.sendFragments(transport, charUUID, frags);
+    return true;
+  }
+
   private async sendFragments(
     transport: TransportRef,
     charUUID: string,
@@ -824,6 +868,11 @@ class BLEService {
       case TYPE_HELLO: return HANDSHAKE_CHAR_UUID;
       case TYPE_MESSAGE: return MESSAGE_CHAR_UUID;
       case TYPE_ACK: return ACK_CHAR_UUID;
+      // Phase 4 — POSITION reuses the MESSAGE characteristic. The packet type
+      // lives in the header, so the receiver dispatches by type after defrag,
+      // not by which characteristic it arrived on. This avoids a 4th GATT
+      // characteristic (and native-module changes).
+      case TYPE_POSITION: return MESSAGE_CHAR_UUID;
       default: return null;
     }
   }
@@ -849,18 +898,23 @@ class BLEService {
 
   private buildHelloPacket(): Uint8Array {
     const identity = ensureIdentity();
+    // Phase 4 — include our truncated GPS fix in the HELLO if we have one,
+    // so the peer's location table is populated immediately on connect
+    // (FLAG_HAS_POSITION). null when GPS is disabled or no fix yet.
+    const pos = positionProvider.getCurrent();
     const payload: HandshakePayload = {
       type: 'handshake',
       deviceId: identity.deviceId,
       displayName: identity.displayName,
       publicKey: identity.publicKey,
+      position: pos,
     };
     const body = encodeBody(payload);
     // ttl = 1: HELLO is link-local. The relay engine ignores HELLO anyway,
     // but a TTL of 1 documents intent — never relay a handshake.
     return encodePacket({
       type: TYPE_HELLO,
-      flags: 0,
+      flags: pos ? FLAG_HAS_POSITION : 0,
       ttl: 1,
       msgId: generatePacketId(),
       src: this.getMyFingerprint(),
@@ -922,6 +976,80 @@ class BLEService {
       dst: dstFp,
       payload: body,
     });
+  }
+
+  /**
+   * Phase 4 — Build a POSITION beacon packet. Broadcast (dst = 0x00…00),
+   * TTL = POSITION_TTL (~3 hops), carrying our truncated GPS fix. Every node
+   * that receives it updates its location table with our position keyed by
+   * our fingerprint (`header.src`), so the mesh can route geographically
+   * toward us.
+   */
+  private buildPositionPacket(pos: PositionPayload): Uint8Array {
+    const body = encodeBody(pos);
+    return encodePacket({
+      type: TYPE_POSITION,
+      flags: FLAG_HAS_POSITION,
+      ttl: POSITION_TTL,
+      msgId: generatePacketId(),
+      src: this.getMyFingerprint(),
+      dst: BROADCAST_DST,
+      payload: body,
+    });
+  }
+
+  /**
+   * Phase 4 — Send a POSITION beacon to all current neighbors (flooded by the
+   * mesh via the relay engine, TTL-limited). No-op if we have no GPS fix or no
+   * established links. Called by the periodic timer, on position change, and
+   * on linkUp so a fresh neighbor learns our position immediately.
+   */
+  async sendPositionBeacon(): Promise<void> {
+    const pos = positionProvider.getCurrent();
+    if (!pos) return;
+    if (this.links.size === 0) return;
+    const packet = this.buildPositionPacket({
+      type: 'position',
+      lat: pos.lat,
+      lon: pos.lon,
+      timestamp: pos.timestamp,
+    });
+    await this.broadcastPacket(packet);
+  }
+
+  /**
+   * Phase 4 — Start the periodic POSITION beacon loop + event-driven beacons.
+   *
+   * - A POSITION_BEACON_MS interval sends our fix to all neighbors while we
+   *   have one (refreshes their location table's freshness timestamp).
+   * - positionProvider.changed fires when our truncated position changes
+   *   (movement) → immediate beacon so neighbors re-route promptly.
+   * - linkUp fires when a new neighbor connects → immediate beacon so they
+   *   learn our position without waiting up to POSITION_BEACON_MS.
+   *
+   * Idempotent. Stopped in `destroy` / when the peripheral stops.
+   */
+  private startPositionBeacons(): void {
+    if (this.beaconTimer !== null) return;
+    this.beaconTimer = setInterval(() => {
+      void this.sendPositionBeacon();
+    }, POSITION_BEACON_MS);
+
+    this.positionUnsubs.push(
+      positionProvider.changed.subscribe(() => void this.sendPositionBeacon()),
+    );
+    this.positionUnsubs.push(
+      this.linkUp.subscribe(() => void this.sendPositionBeacon()),
+    );
+  }
+
+  private stopPositionBeacons(): void {
+    if (this.beaconTimer !== null) {
+      clearInterval(this.beaconTimer);
+      this.beaconTimer = null;
+    }
+    this.positionUnsubs.forEach(u => u());
+    this.positionUnsubs = [];
   }
 
   private getMyFingerprint(): Uint8Array {
@@ -999,6 +1127,7 @@ class BLEService {
 
   async destroy() {
     this.stopScan();
+    this.stopPositionBeacons();
     for (const central of this.centralConnections.values()) {
       central.subs.forEach(s => s.remove());
       try { await central.device.cancelConnection(); } catch {}

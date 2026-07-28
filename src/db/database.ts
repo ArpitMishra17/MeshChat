@@ -1,5 +1,5 @@
 import * as SQLite from 'expo-sqlite';
-import type { Identity, Peer, Conversation, Message, MessageStatus } from '../types';
+import type { Identity, Peer, Conversation, Message, MessageStatus, OutboxEntry } from '../types';
 import { generateMessageId, generateConversationId } from '../services/ids';
 
 let db: SQLite.SQLiteDatabase;
@@ -76,6 +76,17 @@ function initSchema() {
       value TEXT NOT NULL
     );
   `);
+
+  db.execSync(`
+    CREATE TABLE IF NOT EXISTS outbox (
+      message_id TEXT PRIMARY KEY,
+      dst_fingerprint TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_retry_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (message_id) REFERENCES messages(id)
+    );
+  `);
 }
 
 /**
@@ -96,6 +107,10 @@ function initSchema() {
  *
  * v4 (Phase 4) adds the `settings` table (key-value) for the GPS toggle and
  * future app preferences. Additive CREATE TABLE; no data migration needed.
+ *
+ * v5 (Phase 5) adds the `outbox` table for store-and-forward retries. Additive
+ * CREATE TABLE; no data migration needed (existing `sending`/`failed` rows
+ * simply have no outbox entry until the router queues them).
  */
 function runMigrations() {
   const versionRow = db.getAllSync<{ user_version: number }>('PRAGMA user_version');
@@ -122,6 +137,22 @@ function runMigrations() {
     // CREATE TABLE IF NOT EXISTS in initSchema also covers fresh installs.
     db.execSync('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
     version = 4;
+  }
+
+  if (version < 5) {
+    // Phase 5 — store-and-forward outbox. CREATE TABLE IF NOT EXISTS in
+    // initSchema also covers fresh installs.
+    db.execSync(`
+      CREATE TABLE IF NOT EXISTS outbox (
+        message_id TEXT PRIMARY KEY,
+        dst_fingerprint TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_retry_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY (message_id) REFERENCES messages(id)
+      )
+    `);
+    version = 5;
   }
 
   db.runSync(`PRAGMA user_version = ${version}`);
@@ -415,4 +446,129 @@ export function getBoolSetting(key: string, defaultValue: boolean): boolean {
 /** Convenience: write a boolean setting as '1'/'0'. */
 export function setBoolSetting(key: string, value: boolean): void {
   setSetting(key, value ? '1' : '0');
+}
+
+// --- Outbox (Phase 5) ---
+//
+// Store-and-forward: the *originator* of a message queues it here when no
+// route exists yet or a send attempt fails. `messageRouter.ts` owns the
+// retry scheduling (backoff, give-up); this module is just the persistence
+// layer so the queue survives an app restart (PLAN.md: "outbox lives in
+// SQLite, drained on next launch").
+
+function mapOutboxRow(row: any): OutboxEntry {
+  return {
+    messageId: row.message_id,
+    dstFingerprintHex: row.dst_fingerprint,
+    attempts: row.attempts,
+    nextRetryAt: row.next_retry_at,
+    createdAt: row.created_at,
+    text: row.text,
+    senderDeviceId: row.sender_device_id,
+    conversationId: row.conversation_id,
+  };
+}
+
+/**
+ * Queue (or re-queue, on manual retry) a message for background delivery.
+ * `attempts`/`nextRetryAt` are supplied by the caller (messageRouter) so the
+ * backoff schedule lives in one place (outbox.ts), not split across the DB
+ * layer and the router.
+ */
+export function enqueueOutbox(
+  messageId: string,
+  dstFingerprintHex: string,
+  attempts: number,
+  nextRetryAt: number,
+): void {
+  db.runSync(
+    `INSERT INTO outbox (message_id, dst_fingerprint, attempts, next_retry_at, created_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(message_id) DO UPDATE SET
+       dst_fingerprint = excluded.dst_fingerprint,
+       attempts = excluded.attempts,
+       next_retry_at = excluded.next_retry_at`,
+    [messageId, dstFingerprintHex, attempts, nextRetryAt, Date.now()],
+  );
+}
+
+/** Record a failed retry: bump the attempt count and reschedule. */
+export function setOutboxAttempt(messageId: string, attempts: number, nextRetryAt: number): void {
+  db.runSync(
+    'UPDATE outbox SET attempts = ?, next_retry_at = ? WHERE message_id = ?',
+    [attempts, nextRetryAt, messageId],
+  );
+}
+
+/** Remove an entry — on successful send, delivery, or give-up. */
+export function removeFromOutbox(messageId: string): void {
+  db.runSync('DELETE FROM outbox WHERE message_id = ?', [messageId]);
+}
+
+/** Outbox entries whose backoff has elapsed, joined with their message text. */
+export function getDueOutboxEntries(now: number): OutboxEntry[] {
+  const rows = db.getAllSync<any>(
+    `SELECT o.message_id, o.dst_fingerprint, o.attempts, o.next_retry_at, o.created_at,
+            m.text, m.sender_device_id, m.conversation_id
+     FROM outbox o JOIN messages m ON m.id = o.message_id
+     WHERE o.next_retry_at <= ?
+     ORDER BY o.created_at ASC`,
+    [now],
+  );
+  return rows.map(mapOutboxRow);
+}
+
+/**
+ * Every outbox entry regardless of backoff — used when a new link just came
+ * up (HELLO), since a fresh route may unblock delivery ahead of schedule.
+ */
+export function getAllOutboxEntries(): OutboxEntry[] {
+  const rows = db.getAllSync<any>(
+    `SELECT o.message_id, o.dst_fingerprint, o.attempts, o.next_retry_at, o.created_at,
+            m.text, m.sender_device_id, m.conversation_id
+     FROM outbox o JOIN messages m ON m.id = o.message_id
+     ORDER BY o.created_at ASC`,
+  );
+  return rows.map(mapOutboxRow);
+}
+
+/** Pending-message count per conversation, for the conversation-list badge. */
+export function getOutboxCountsByConversation(): Record<string, number> {
+  const rows = db.getAllSync<{ conversation_id: string; count: number }>(
+    `SELECT m.conversation_id as conversation_id, COUNT(*) as count
+     FROM outbox o JOIN messages m ON m.id = o.message_id
+     GROUP BY m.conversation_id`,
+  );
+  const out: Record<string, number> = {};
+  for (const row of rows) out[row.conversation_id] = row.count;
+  return out;
+}
+
+/**
+ * Messages we originated that reached `sent` but never got ACKed within
+ * `olderThanMs`, and aren't already in the outbox. This is the watchdog that
+ * catches PLAN.md's "kill the relay mid-conversation" case: the send
+ * succeeded (radio accepted it) but the destination is now unreachable, so no
+ * ACK will ever arrive — the message needs to be requeued for retry.
+ */
+export function getStuckSentMessages(
+  myFingerprintHex: string,
+  olderThanMs: number,
+): Array<{ id: string; text: string; conversationId: string; dstFingerprintHex: string; createdAt: number }> {
+  const cutoff = Date.now() - olderThanMs;
+  const rows = db.getAllSync<any>(
+    `SELECT m.id, m.text, m.conversation_id, c.peer_device_id as dst_fingerprint, m.created_at
+     FROM messages m
+     JOIN conversations c ON c.id = m.conversation_id
+     WHERE m.sender_device_id = ? AND m.status = 'sent' AND m.created_at < ?
+       AND m.id NOT IN (SELECT message_id FROM outbox)`,
+    [myFingerprintHex, cutoff],
+  );
+  return rows.map((row: any) => ({
+    id: row.id,
+    text: row.text,
+    conversationId: row.conversation_id,
+    dstFingerprintHex: row.dst_fingerprint,
+    createdAt: row.created_at,
+  }));
 }

@@ -9,6 +9,9 @@ interface Props {
 }
 
 const statusIndicator: Record<MessageStatus, { symbol: string; color: string }> = {
+  // Phase 5 — waiting in the outbox for a route/retry (no neighbors, or a
+  // send attempt failed). Distinct glyph from 'sending' (in-flight now).
+  queued: { symbol: '~', color: colors.queued },
   sending: { symbol: '...', color: colors.sending },
   // P0.5 — 'sent' = radio accepted the write; 'delivered' = ACK received.
   // Distinct glyphs so the user can see the difference at a glance.

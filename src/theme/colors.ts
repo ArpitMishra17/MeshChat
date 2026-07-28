@@ -23,6 +23,8 @@ export const colors = {
   errorDim: '#cc3636',
   warning: '#ffaa00',
   sending: '#555e68',
+  // Phase 5 — outbox-pending message/conversation indicator.
+  queued: '#ffaa00',
 
   border: '#1c2333',
   borderFocus: '#00ff41',

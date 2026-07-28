@@ -37,9 +37,12 @@ export interface Conversation {
   createdAt: number;
 }
 
-// P0.5 — Status ladder: sending -> sent (radio accepted) -> delivered (ACK received).
-// Phase 5 will add `queued` in front and `failed` is terminal.
-export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'failed';
+// P0.5 / Phase 5 — Status ladder: queued -> sending -> sent (radio accepted)
+// -> delivered (ACK received). `failed` is terminal (manual retry only). A
+// message enters `queued` from `sending` whenever no route exists yet or a
+// send attempt fails — the outbox (outbox.ts / messageRouter.ts) retries it
+// with exponential backoff until it succeeds or gives up (7 days / 50 tries).
+export type MessageStatus = 'queued' | 'sending' | 'sent' | 'delivered' | 'failed';
 
 export interface Message {
   id: string;
@@ -123,3 +126,19 @@ export interface PositionPayload {
 }
 
 export type BLEPayload = HandshakePayload | MessagePayload | AckPayload | PositionPayload;
+
+/**
+ * Phase 5 — an outbox row joined with its message, ready for (re)transmission.
+ * `attempts` counts failed send attempts so far (0 before the first failure);
+ * `nextRetryAt` is when the backoff schedule allows the next try.
+ */
+export interface OutboxEntry {
+  messageId: string;
+  dstFingerprintHex: string;
+  attempts: number;
+  nextRetryAt: number;
+  createdAt: number;
+  text: string;
+  senderDeviceId: string;
+  conversationId: string;
+}

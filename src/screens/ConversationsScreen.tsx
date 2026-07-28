@@ -3,7 +3,7 @@ import { View, Text, FlatList, TouchableOpacity, StyleSheet } from 'react-native
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { colors, fonts, fontSize } from '../theme';
-import { getAllConversations } from '../db/database';
+import { getAllConversations, getOutboxCountsByConversation } from '../db/database';
 import { messageRouter } from '../services/messageRouter';
 import { TerminalHeader } from '../components/TerminalHeader';
 import type { Conversation } from '../types';
@@ -24,19 +24,28 @@ function formatTime(ts: number | null): string {
 export function ConversationsScreen() {
   const navigation = useNavigation<NavProp>();
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  // Phase 5 — pending (queued) outbox count per conversation, for the badge.
+  const [outboxCounts, setOutboxCounts] = useState<Record<string, number>>({});
+
+  const refresh = useCallback(() => {
+    setConversations(getAllConversations());
+    setOutboxCounts(getOutboxCountsByConversation());
+  }, []);
 
   // P0.1 — refresh on focus (covers the case where we just came back from
-  // ChatScreen) AND on MessageRouter emits (covers new messages arriving
-  // while this screen is mounted but not focused).
-  useFocusEffect(useCallback(() => {
-    setConversations(getAllConversations());
-  }, []));
+  // ChatScreen) AND on MessageRouter emits (covers new messages arriving,
+  // or an outbox status change, while this screen is mounted but not
+  // focused).
+  useFocusEffect(useCallback(() => { refresh(); }, [refresh]));
 
   useEffect(() => {
-    return messageRouter.conversationsChanged.subscribe(() => {
-      setConversations(getAllConversations());
-    });
-  }, []);
+    const unsubConversations = messageRouter.conversationsChanged.subscribe(refresh);
+    const unsubMessages = messageRouter.messagesChanged.subscribe(refresh);
+    return () => {
+      unsubConversations();
+      unsubMessages();
+    };
+  }, [refresh]);
 
   const handlePress = (conv: Conversation) => {
     navigation.navigate('Chat', {
@@ -52,17 +61,27 @@ export function ConversationsScreen() {
       <FlatList
         data={conversations}
         keyExtractor={item => item.id}
-        renderItem={({ item }) => (
-          <TouchableOpacity style={styles.card} onPress={() => handlePress(item)} activeOpacity={0.7}>
-            <View style={styles.row}>
-              <Text style={styles.name}>{item.peerDisplayName}</Text>
-              <Text style={styles.time}>{formatTime(item.lastMessageAt)}</Text>
-            </View>
-            <Text style={styles.preview} numberOfLines={1}>
-              {item.lastMessage ? `> ${item.lastMessage}` : '// no messages yet'}
-            </Text>
-          </TouchableOpacity>
-        )}
+        renderItem={({ item }) => {
+          const pending = outboxCounts[item.id] ?? 0;
+          return (
+            <TouchableOpacity style={styles.card} onPress={() => handlePress(item)} activeOpacity={0.7}>
+              <View style={styles.row}>
+                <Text style={styles.name}>{item.peerDisplayName}</Text>
+                <View style={styles.rowRight}>
+                  {pending > 0 && (
+                    <View style={styles.badge}>
+                      <Text style={styles.badgeText}>{'~'}{pending}</Text>
+                    </View>
+                  )}
+                  <Text style={styles.time}>{formatTime(item.lastMessageAt)}</Text>
+                </View>
+              </View>
+              <Text style={styles.preview} numberOfLines={1}>
+                {item.lastMessage ? `> ${item.lastMessage}` : '// no messages yet'}
+              </Text>
+            </TouchableOpacity>
+          );
+        }}
         ListEmptyComponent={
           <View style={styles.empty}>
             <Text style={styles.emptyText}>{'// no conversations'}</Text>
@@ -88,8 +107,15 @@ const styles = StyleSheet.create({
     marginVertical: 4,
   },
   row: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  rowRight: { flexDirection: 'row', alignItems: 'center' },
   name: { fontFamily: fonts.mono, fontSize: fontSize.md, color: colors.primary, fontWeight: '600' },
   time: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textDim },
+  // Phase 5 — pending-outbox badge (e.g. "~2").
+  badge: {
+    borderWidth: 1, borderColor: colors.queued, borderRadius: 4,
+    paddingHorizontal: 6, paddingVertical: 1, marginRight: 8,
+  },
+  badgeText: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.queued, fontWeight: '600' },
   preview: { fontFamily: fonts.mono, fontSize: fontSize.sm, color: colors.textDim, marginTop: 6 },
   empty: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingTop: 100 },
   emptyText: { fontFamily: fonts.mono, fontSize: fontSize.sm, color: colors.textDim },

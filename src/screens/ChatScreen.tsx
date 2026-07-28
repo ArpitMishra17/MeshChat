@@ -9,13 +9,11 @@ import { colors, fonts, fontSize } from '../theme';
 import { bleService } from '../services/ble';
 import type { BLEState } from '../services/ble';
 import { messageRouter } from '../services/messageRouter';
-import {
-  getMessages, insertMessage, updateMessageStatus,
-} from '../db/database';
+import { getMessages } from '../db/database';
 import { ensureIdentity } from '../services/identity';
 import { MessageBubble } from '../components/MessageBubble';
 import { StatusBadge } from '../components/StatusBadge';
-import type { Message, MessagePayload } from '../types';
+import type { Message } from '../types';
 import type { RootStackParamList } from '../navigation';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Chat'>;
@@ -45,62 +43,22 @@ export function ChatScreen({ route }: Props) {
     };
   }, [refresh]);
 
-  const handleSend = useCallback(async () => {
+  // P0.5 / Phase 5 — the router owns the whole send lifecycle: it inserts as
+  // 'sending', attempts the BLE send, and falls back to the outbox ('queued')
+  // on failure or no route. All status transitions after that (sent, queued,
+  // delivered, failed) arrive asynchronously via `messagesChanged`, so we
+  // only need the optimistic prepend here — `refresh()` picks up the rest.
+  const handleSend = useCallback(() => {
     const text = input.trim();
     if (!text) return;
     setInput('');
-
-    // P0.5 — insert as 'sending'. The BLE write resolving flips us to
-    // 'sent' (radio accepted); the receiver's ACK flips us to 'delivered'.
-    const msg = insertMessage(conversationId, myDeviceId, text, 'sending');
+    const msg = messageRouter.sendMessage(conversationId, peerDeviceId, text);
     setMessages(prev => [...prev, msg]);
+  }, [input, conversationId, peerDeviceId]);
 
-    const payload: MessagePayload = {
-      type: 'message',
-      id: msg.id,
-      senderDeviceId: myDeviceId,
-      senderDisplayName: ensureIdentity().displayName,
-      text,
-      timestamp: msg.createdAt,
-    };
-
-    try {
-      // Phase 3 — sendMessage floods the (end-to-end-encrypted) packet to all
-      // neighbors; relays forward by `dst` until it reaches `peerDeviceId`.
-      // If the peer is a direct neighbor it's delivered on the first hop; if
-      // not, the mesh carries it. We pass the destination fingerprint so ble.ts
-      // can encrypt to the right pubkey (possibly a multi-hop peer).
-      await bleService.sendMessage(payload, peerDeviceId);
-      updateMessageStatus(msg.id, 'sent');
-      setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, status: 'sent' } : m));
-    } catch {
-      updateMessageStatus(msg.id, 'failed');
-      setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, status: 'failed' } : m));
-    }
-  }, [input, conversationId, myDeviceId, peerDeviceId]);
-
-  const handleRetry = useCallback(async (message: Message) => {
-    updateMessageStatus(message.id, 'sending');
-    setMessages(prev => prev.map(m => m.id === message.id ? { ...m, status: 'sending' as const } : m));
-
-    const payload: MessagePayload = {
-      type: 'message',
-      id: message.id,
-      senderDeviceId: myDeviceId,
-      senderDisplayName: ensureIdentity().displayName,
-      text: message.text,
-      timestamp: message.createdAt,
-    };
-
-    try {
-      await bleService.sendMessage(payload, peerDeviceId);
-      updateMessageStatus(message.id, 'sent');
-      setMessages(prev => prev.map(m => m.id === message.id ? { ...m, status: 'sent' as const } : m));
-    } catch {
-      updateMessageStatus(message.id, 'failed');
-      setMessages(prev => prev.map(m => m.id === message.id ? { ...m, status: 'failed' as const } : m));
-    }
-  }, [myDeviceId, peerDeviceId]);
+  const handleRetry = useCallback((message: Message) => {
+    messageRouter.retryMessage(message, peerDeviceId);
+  }, [peerDeviceId]);
 
   // P0.8 — compute the keyboard offset from the actual header height
   // (insets.top + header padding) instead of a hard-coded 90.

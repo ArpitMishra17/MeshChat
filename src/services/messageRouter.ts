@@ -1,3 +1,4 @@
+import { AppState } from 'react-native';
 import { bleService, type IncomingPacket } from './ble';
 import { ensureIdentity, getCrypto } from './identity';
 import { SeenCache, decideRelay, withTtlDecremented, hopCount, isBroadcast } from './relay';
@@ -18,13 +19,21 @@ import {
   type ForwardDecision,
 } from './location';
 import { positionProvider } from './position';
-import type { AckPayload, MessagePayload, PositionPayload } from '../types';
+import { backoffDelayMs, shouldGiveUp, SENT_ACK_TIMEOUT_MS } from './outbox';
+import type { AckPayload, MessagePayload, PositionPayload, Message, OutboxEntry } from '../types';
 import {
   getOrCreateConversation,
   insertMessage,
+  updateMessageStatus,
   markMessageDelivered,
   messageExists,
   getPeerByFingerprint,
+  enqueueOutbox,
+  setOutboxAttempt,
+  removeFromOutbox,
+  getDueOutboxEntries,
+  getAllOutboxEntries,
+  getStuckSentMessages,
 } from '../db/database';
 import { Emitter, PayloadEmitter } from './events';
 
@@ -80,6 +89,9 @@ export interface RouteStats {
   positionBeaconsRouted: number;
 }
 
+/** Phase 5 — how often the outbox watchdog/drain tick runs. */
+const OUTBOX_TICK_MS = 15_000;
+
 class MessageRouter {
   /** Fires when any message is inserted or its status changes. */
   readonly messagesChanged = new Emitter();
@@ -97,6 +109,8 @@ class MessageRouter {
   private unsubscribers: Array<() => void> = [];
   /** Phase 4 — routing counters for the report. */
   private stats: RouteStats = { greedyForwards: 0, floodForwards: 0, delivered: 0, positionBeaconsRouted: 0 };
+  /** Phase 5 — periodic outbox drain/watchdog tick. */
+  private outboxTimer: ReturnType<typeof setInterval> | null = null;
 
   start(): void {
     if (this.started) return;
@@ -107,12 +121,166 @@ class MessageRouter {
       bleService.packetReceived.subscribe(p => this.handlePacket(p)),
       bleService.peerDiscovered.subscribe(() => this.peersChanged.emit()),
       bleService.handshakeReceived.subscribe(() => this.peersChanged.emit()),
+      // Phase 5 — a new link may unblock delivery for queued messages
+      // addressed to someone reachable through it, even if it isn't the
+      // destination itself (the mesh may relay further).
+      bleService.linkUp.subscribe(() => void this.drainOutbox({ onlyDue: false })),
     );
+
+    // Phase 5 — periodic backoff tick (drains due entries + escalates
+    // messages stuck in `sent` with no ACK) and an immediate tick to drain
+    // whatever persisted from a previous app run.
+    this.outboxTimer = setInterval(() => void this.tickOutbox(), OUTBOX_TICK_MS);
+    void this.tickOutbox();
+
+    // Phase 5 — app foreground is a trigger of its own: RN suspends JS
+    // timers in the background, so resuming needs its own nudge to catch up
+    // on backoff windows that elapsed while backgrounded.
+    const appStateSub = AppState.addEventListener('change', state => {
+      if (state === 'active') void this.tickOutbox();
+    });
+    this.unsubscribers.push(() => appStateSub.remove());
   }
 
   /** Phase 4 — cumulative routing counters (for the Nearby screen / report). */
   getRouteStats(): RouteStats {
     return { ...this.stats };
+  }
+
+  /**
+   * Phase 5 — Originate a chat message. Inserts it as `sending` (instant
+   * optimistic UI) and kicks off the send attempt in the background; the
+   * caller learns the outcome (sent/queued/delivered) via `messagesChanged`.
+   */
+  sendMessage(conversationId: string, dstFingerprintHex: string, text: string): Message {
+    const msg = insertMessage(conversationId, this.myFingerprintHex, text, 'sending');
+    void this.attemptSend(msg, dstFingerprintHex);
+    return msg;
+  }
+
+  /**
+   * Phase 5 — Manual tap-to-retry for a `failed` message. Resets any prior
+   * backoff state (a manual retry should try immediately, not wait out the
+   * schedule that led to the give-up) and re-attempts the send.
+   */
+  retryMessage(message: Message, dstFingerprintHex: string): void {
+    removeFromOutbox(message.id);
+    updateMessageStatus(message.id, 'sending');
+    this.messagesChanged.emit();
+    void this.attemptSend(message, dstFingerprintHex);
+  }
+
+  /**
+   * Phase 5 — Attempt to send a message right now. `sent` on success (the
+   * radio accepted it — `delivered` still waits on the ACK); `queued` and
+   * handed to the outbox on failure or when there is no route at all yet
+   * (PLAN.md: "no route exists" → queued, not failed).
+   */
+  private async attemptSend(msg: Message, dstFingerprintHex: string): Promise<void> {
+    if (bleService.getNeighbors().length === 0) {
+      this.enqueueForRetry(msg.id, dstFingerprintHex);
+      return;
+    }
+    const payload: MessagePayload = {
+      type: 'message',
+      id: msg.id,
+      senderDeviceId: msg.senderDeviceId,
+      senderDisplayName: ensureIdentity().displayName,
+      text: msg.text,
+      timestamp: msg.createdAt,
+    };
+    try {
+      await bleService.sendMessage(payload, dstFingerprintHex);
+      updateMessageStatus(msg.id, 'sent');
+      this.messagesChanged.emit();
+    } catch (e: any) {
+      console.warn('[router] send failed, queueing for retry:', e?.message ?? e);
+      this.enqueueForRetry(msg.id, dstFingerprintHex);
+    }
+  }
+
+  private enqueueForRetry(messageId: string, dstFingerprintHex: string): void {
+    updateMessageStatus(messageId, 'queued');
+    enqueueOutbox(messageId, dstFingerprintHex, 1, Date.now() + backoffDelayMs(1));
+    this.messagesChanged.emit();
+    this.conversationsChanged.emit();
+  }
+
+  /**
+   * Phase 5 — One outbox tick: first escalate anything stuck in `sent` with
+   * no ACK (the "relay died mid-conversation" case), then drain whatever is
+   * now due. Both are no-ops when we have no neighbors at all — there is
+   * nowhere to send to yet.
+   */
+  private async tickOutbox(): Promise<void> {
+    this.escalateStuckSent();
+    await this.drainOutbox({ onlyDue: true });
+  }
+
+  /**
+   * Phase 5 — A message can reach `sent` (radio accepted it) and then never
+   * get ACKed if the path dies afterward (PLAN.md testing note: kill the
+   * relay mid-conversation). Requeue anything that's been silently
+   * undelivered for too long so the backoff loop picks it up.
+   */
+  private escalateStuckSent(): void {
+    const stuck = getStuckSentMessages(this.myFingerprintHex, SENT_ACK_TIMEOUT_MS);
+    if (stuck.length === 0) return;
+    for (const m of stuck) {
+      updateMessageStatus(m.id, 'queued');
+      enqueueOutbox(m.id, m.dstFingerprintHex, 0, Date.now());
+    }
+    this.messagesChanged.emit();
+    this.conversationsChanged.emit();
+  }
+
+  /**
+   * Phase 5 — Retry outbox entries. `onlyDue: true` respects each entry's
+   * backoff schedule (the periodic tick); `onlyDue: false` retries everything
+   * regardless of schedule (a new link just came up — worth trying early).
+   */
+  private async drainOutbox(opts: { onlyDue: boolean }): Promise<void> {
+    if (bleService.getNeighbors().length === 0) return;
+    const now = Date.now();
+    const entries = opts.onlyDue ? getDueOutboxEntries(now) : getAllOutboxEntries();
+    for (const entry of entries) {
+      await this.retryOutboxEntry(entry, now);
+    }
+  }
+
+  /**
+   * Phase 5 — Retry a single outbox entry. On success, flips the message to
+   * `sent` and removes the outbox row (delivery still awaits the ACK). On
+   * failure, reschedules with exponential backoff, or gives up (`failed`,
+   * terminal — the existing tap-to-retry UI affordance takes over) once the
+   * attempt/age budget is exhausted.
+   */
+  private async retryOutboxEntry(entry: OutboxEntry, now: number): Promise<void> {
+    const payload: MessagePayload = {
+      type: 'message',
+      id: entry.messageId,
+      senderDeviceId: entry.senderDeviceId,
+      senderDisplayName: ensureIdentity().displayName,
+      text: entry.text,
+      timestamp: entry.createdAt,
+    };
+    try {
+      await bleService.sendMessage(payload, entry.dstFingerprintHex);
+      updateMessageStatus(entry.messageId, 'sent');
+      removeFromOutbox(entry.messageId);
+      this.messagesChanged.emit();
+      this.conversationsChanged.emit();
+    } catch (e: any) {
+      const attempts = entry.attempts + 1;
+      if (shouldGiveUp(attempts, entry.createdAt, now)) {
+        updateMessageStatus(entry.messageId, 'failed');
+        removeFromOutbox(entry.messageId);
+      } else {
+        setOutboxAttempt(entry.messageId, attempts, now + backoffDelayMs(attempts));
+      }
+      this.messagesChanged.emit();
+      this.conversationsChanged.emit();
+    }
   }
 
   /**
@@ -225,7 +393,12 @@ class MessageRouter {
     // P0.2 — ids are fixed-width and match what we stored, so this flips the
     // row's status (previously a no-op on a truncated id).
     markMessageDelivered(ack.messageId);
+    // Phase 5 — defensive: the outbox row is normally already gone by the
+    // time an ACK arrives (removed on successful send), but a stale entry
+    // here would otherwise retry a message that's already been delivered.
+    removeFromOutbox(ack.messageId);
     this.messagesChanged.emit();
+    this.conversationsChanged.emit();
   }
 
   /**

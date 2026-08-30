@@ -28,13 +28,13 @@ function formatTime(ts: number): string {
 export function MessageBubble({ message, isMine }: Props) {
   const status = statusIndicator[message.status];
   // Phase 3 — hop indicator on received messages. `hops` is
-  // `DEFAULT_TTL - remainingTtl` on arrival: 1 = direct, 2 = via one relay,
-  // etc. Only inbound messages carry a hop count; ours stay null.
+  // Receive-side hop count: 1 = direct, 2 = via one relay, etc. Only inbound
+  // messages carry a hop count; ours stay null.
   const hops = message.hops;
   const relayCount = hops != null ? hops - 1 : 0;
   const hopLabel =
     hops == null ? null :
-    hops <= 1 ? 'direct' :
+    hops === 1 ? 'direct' :
     `via ${relayCount} relay${relayCount === 1 ? '' : 's'}`;
   return (
     <View style={[styles.container, isMine ? styles.containerMine : styles.containerTheirs]}>

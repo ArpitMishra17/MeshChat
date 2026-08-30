@@ -196,14 +196,26 @@ export function decideRelay(
 /**
  * Phase 3 — Compute the hop count a packet travelled to reach us.
  *
- * `hops = initialTtl - remainingTtl`. The sender sets `initialTtl` (default
- * DEFAULT_TTL = 5); each relay decrements the TTL byte once. So a direct
- * message arrives with TTL 4 → 1 hop; via one relay with TTL 3 → 2 hops;
- * "via N relays" = hops - 1. Returns 0 for self-originated packets (no hops).
+ * `hopCount` is the number of relay forwards only:
+ * `initialTtl - remainingTtl`. The originator does not decrement TTL before
+ * sending, so a direct message arrives with the full TTL and has 0 relay
+ * forwards; a message via one relay has 1 relay forward.
  */
 export function hopCount(remainingTtl: number, initialTtl: number): number {
   const h = initialTtl - remainingTtl;
   return h < 0 ? 0 : h;
+}
+
+/**
+ * Number of radio transmissions used to reach the local device.
+ *
+ * Every received packet has at least the originator → receiver transmission;
+ * each additional transmission corresponds to one relay forward. This is the
+ * value stored on received messages and shown by the chat UI: 1 = direct,
+ * 2 = via one relay, etc.
+ */
+export function receivedHopCount(remainingTtl: number, initialTtl: number): number {
+  return hopCount(remainingTtl, initialTtl) + 1;
 }
 
 /**

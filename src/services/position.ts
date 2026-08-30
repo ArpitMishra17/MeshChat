@@ -25,7 +25,7 @@
 
 import * as Location from 'expo-location';
 import { Emitter } from './events';
-import { getBoolSetting, setBoolSetting } from '../db/database';
+import { getDB, getBoolSetting, setBoolSetting } from '../db/database';
 import type { GeoPosition } from '../types';
 
 const SETTING_GPS_ENABLED = 'gps_enabled';
@@ -48,6 +48,7 @@ class PositionProvider {
 
   constructor() {
     // Default OFF: GPS is opt-in (PLAN.md: "GPS optional per user").
+    getDB();
     this.enabled = getBoolSetting(SETTING_GPS_ENABLED, false);
   }
 

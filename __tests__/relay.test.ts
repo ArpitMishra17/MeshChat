@@ -22,6 +22,7 @@ import {
   decideRelay,
   withTtlDecremented,
   hopCount,
+  receivedHopCount,
   isBroadcast,
   SEEN_CACHE_MAX_ENTRIES,
   SEEN_CACHE_TTL_MS,
@@ -341,6 +342,16 @@ describe('hopCount', () => {
 
   it('clamps negative results to 0 (defensive against bad input)', () => {
     expect(hopCount(DEFAULT_TTL + 1, DEFAULT_TTL)).toBe(0);
+  });
+});
+
+describe('receivedHopCount', () => {
+  it('returns 1 for a direct message', () => {
+    expect(receivedHopCount(DEFAULT_TTL, DEFAULT_TTL)).toBe(1);
+  });
+
+  it('returns 2 for a message via one relay', () => {
+    expect(receivedHopCount(DEFAULT_TTL - 1, DEFAULT_TTL)).toBe(2);
   });
 });
 

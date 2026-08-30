@@ -1,7 +1,7 @@
 import { AppState } from 'react-native';
 import { bleService, type IncomingPacket } from './ble';
 import { ensureIdentity, getCrypto } from './identity';
-import { SeenCache, decideRelay, withTtlDecremented, hopCount, isBroadcast } from './relay';
+import { SeenCache, decideRelay, withTtlDecremented, receivedHopCount, isBroadcast } from './relay';
 import {
   decodeBody,
   headerToAAD,
@@ -333,7 +333,7 @@ class MessageRouter {
    * be a peer we met before but aren't currently linked to). The header (TTL
    * zeroed) is the AAD — a relay that altered src/dst/msgId would fail auth.
    *
-   * The hop count (`DEFAULT_TTL - header.ttl`) is recorded so the UI can show
+   * The receive-side hop count is recorded so the UI can show "direct" or
    * "via N relay(s)" — the headline evidence that multi-hop routing worked.
    */
   private deliverMessage(p: IncomingPacket): void {
@@ -368,14 +368,14 @@ class MessageRouter {
     );
 
     if (!alreadySeen) {
-      const hops = hopCount(p.header.ttl, DEFAULT_TTL);
+      const hops = receivedHopCount(p.header.ttl, DEFAULT_TTL);
       insertMessage(conversation.id, msg.senderDeviceId, msg.text, 'delivered', msg.id, hops);
       this.messagesChanged.emit();
       this.conversationsChanged.emit();
     }
 
     this.stats.delivered += 1;
-    this.logRoute(p, 'deliver', { hops: hopCount(p.header.ttl, DEFAULT_TTL) });
+    this.logRoute(p, 'deliver', { hops: receivedHopCount(p.header.ttl, DEFAULT_TTL) });
 
     // Always ACK — even for duplicates — so the sender's status flips to
     // `delivered`. The ACK is a flooded packet addressed to `header.src`.

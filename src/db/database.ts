@@ -111,6 +111,11 @@ function initSchema() {
  * v5 (Phase 5) adds the `outbox` table for store-and-forward retries. Additive
  * CREATE TABLE; no data migration needed (existing `sending`/`failed` rows
  * simply have no outbox entry until the router queues them).
+ *
+ * v6 fixes the receive-side hop convention: old rows stored relay forwards
+ * (`0` for direct), while the UI contract is transmissions (`1` for direct).
+ * Originated messages remain NULL, so only received-message hop values are
+ * incremented.
  */
 function runMigrations() {
   const versionRow = db.getAllSync<{ user_version: number }>('PRAGMA user_version');
@@ -121,7 +126,9 @@ function runMigrations() {
     db.execSync('DROP TABLE IF EXISTS conversations');
     db.execSync('DROP TABLE IF EXISTS peers');
     db.execSync('DROP TABLE IF EXISTS identity');
-    version = 2;
+    // A fresh database has no tables yet; initSchema() creates the current
+    // schema immediately after migrations run, so skip ALTER TABLE steps.
+    version = 6;
   }
 
   if (version < 3) {
@@ -153,6 +160,14 @@ function runMigrations() {
       )
     `);
     version = 5;
+  }
+
+  if (version < 6) {
+    // Phase 3/6 — convert persisted received-message hop counts from relay
+    // forwards (direct = 0) to radio transmissions (direct = 1). NULL values
+    // identify messages originated on this device and are left untouched.
+    db.execSync('UPDATE messages SET hops = hops + 1 WHERE hops IS NOT NULL');
+    version = 6;
   }
 
   db.runSync(`PRAGMA user_version = ${version}`);

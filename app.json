@@ -9,7 +9,7 @@
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
-      "backgroundColor": "#0a0e14"
+      "backgroundColor": "#08090a"
     },
     "ios": {
       "supportsTablet": false,
@@ -26,7 +26,7 @@
     "android": {
       "package": "com.meshchat.app",
       "adaptiveIcon": {
-        "backgroundColor": "#0a0e14",
+        "backgroundColor": "#08090a",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"

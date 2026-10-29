@@ -1,11 +1,19 @@
-import React, { useState } from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, ScrollView, Switch } from 'react-native';
-import { colors, fonts, fontSize } from '../theme';
+import React, { useCallback, useEffect, useState } from 'react';
+import { useFocusEffect } from '@react-navigation/native';
+import { View, Text, TextInput, StyleSheet, Alert, ScrollView } from 'react-native';
+import { colors, fonts } from '../theme';
 import { ensureIdentity, updateDisplayName } from '../services/identity';
 import { bytesToHex } from '../services/ids';
-import { positionProvider } from '../services/position';
+import { positionProvider, PUBLISH_DECIMALS, MIN_TIME_MS, MIN_DISTANCE_M } from '../services/position';
+import { mesh, SCAN_MS, PAUSE_MS, MAX_CENTRAL_CONNECTIONS } from '../services/mesh';
+import { HANDSHAKE_TIMEOUT_MS, POSITION_BEACON_MS, POSITION_TTL, REQUESTED_MTU } from '../services/ble';
+import { DEFAULT_TTL } from '../services/protocol';
+import { LOCATION_TTL_MS } from '../services/location';
+import { getTableCounts } from '../db/database';
 import { getLocationTable } from '../services/location';
 import { TerminalHeader } from '../components/TerminalHeader';
+import { BlockBar, Btn, Chip, Fingerprint, KV, Label, Panel, Rule, Toggle } from '../components/ui';
+import { PrecisionDial, Stagger } from '../components/viz';
 
 export function SettingsScreen() {
   const identity = ensureIdentity();
@@ -13,6 +21,15 @@ export function SettingsScreen() {
   const [saved, setSaved] = useState(false);
   const [gpsEnabled, setGpsEnabled] = useState(positionProvider.isEnabled());
   const [knownPositions, setKnownPositions] = useState(getLocationTable().size);
+  const [, bump] = useState(0);
+
+  // Table counts, link MTUs and the position table are read at render time, so
+  // re-render whenever this tab gains focus or the link set changes.
+  useFocusEffect(useCallback(() => {
+    bump(n => n + 1);
+    setKnownPositions(getLocationTable().size);
+  }, []));
+  useEffect(() => mesh.neighborsChanged.subscribe(() => bump(n => n + 1)), []);
 
   const handleGpsToggle = async (value: boolean) => {
     setGpsEnabled(value);
@@ -29,124 +46,139 @@ export function SettingsScreen() {
   };
 
   const pubKeyHex = bytesToHex(identity.publicKey);
+  const pos = positionProvider.getCurrent();
+  // Size of the coordinate-truncation cell: one unit of the last kept decimal
+  // is 1/10^dp degrees; ~111.32 km per degree of latitude.
+  const cellMeters = Math.round(111_320 / Math.pow(10, PUBLISH_DECIMALS));
+  const tableCounts = getTableCounts();
+  const maxRows = Math.max(...tableCounts.map(r => r.count), 1);
+  const links = mesh.getNeighbors();
+  const mtus = links.filter(l => l.mtu).map(l => l.mtu as number);
+  const secs = (ms: number) => `${ms / 1000} s`;
 
   return (
     <View style={styles.container}>
-      <TerminalHeader title="settings" />
-      <ScrollView contentContainerStyle={styles.content}>
-        <Text style={styles.sectionLabel}>{'// identity'}</Text>
-
-        <View style={styles.field}>
-          <Text style={styles.label}>fingerprint</Text>
-          <Text style={styles.value}>{identity.deviceId}</Text>
-        </View>
-
-        <View style={styles.field}>
-          <Text style={styles.label}>public_key</Text>
-          <Text style={styles.valueMono}>{pubKeyHex.slice(0, 32)}...</Text>
-        </View>
-
-        <View style={styles.field}>
-          <Text style={styles.label}>created_at</Text>
-          <Text style={styles.value}>{new Date(identity.createdAt).toISOString()}</Text>
-        </View>
-
-        <View style={styles.field}>
-          <Text style={styles.label}>display_name</Text>
-          <View style={styles.inputRow}>
-            <TextInput
-              style={styles.input}
-              value={name}
-              onChangeText={setName}
-              autoCapitalize="none"
-              autoCorrect={false}
-              maxLength={24}
-            />
-            <TouchableOpacity style={styles.saveButton} onPress={handleSave} activeOpacity={0.7}>
-              <Text style={styles.saveText}>{saved ? '[OK]' : '[SAVE]'}</Text>
-            </TouchableOpacity>
+      <TerminalHeader
+        title="config"
+        subtitle="local only"
+        right={<Chip label="encrypted" tone="lime" dot pulse />}
+      />
+      <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+        <Stagger>
+        <Panel title="identity" right={<Chip label="tofu" tone="amber" />}>
+          <KV k="fingerprint" v={identity.deviceId} color={colors.primary} />
+          <View style={styles.fp}>
+            <Fingerprint hex={identity.deviceId} />
           </View>
-        </View>
+          <KV k="public key" v={`${pubKeyHex.slice(0, 24)}…`} dim />
+          <KV k="created" v={new Date(identity.createdAt).toISOString()} dim last />
+          <View style={styles.nameBlock}>
+            <Label style={{ marginBottom: 8 }}>display name</Label>
+            <View style={styles.nameRow}>
+              <TextInput
+                style={styles.input}
+                value={name}
+                onChangeText={setName}
+                autoCapitalize="none"
+                autoCorrect={false}
+                maxLength={24}
+                cursorColor={colors.primary}
+                selectionColor={colors.primary}
+              />
+              <Btn label={saved ? 'ok' : 'save'} onPress={handleSave} tone={saved ? 'on' : 'default'} style={styles.save} />
+            </View>
+          </View>
+        </Panel>
 
-        <View style={styles.separator} />
-        <Text style={styles.sectionLabel}>{'// phase 4 — geographic routing'}</Text>
+        <Rule title="geographic routing" />
 
-        <View style={styles.field}>
+        <Panel title="gps routing" right={gpsEnabled ? '[ on ]' : '[ off ]'} variant={gpsEnabled ? 'hot' : 'default'}>
           <View style={styles.toggleRow}>
-            <View style={styles.toggleLabelCol}>
-              <Text style={styles.label}>gps_routing</Text>
-              <Text style={styles.hint}>
-                {gpsEnabled ? 'on — greedy forwarding when positions known' : 'off — flooding-only relay'}
+            <View style={{ flex: 1 }}>
+              <Label>greedy forwarding</Label>
+              <Text style={styles.tip}>
+                {gpsEnabled
+                  ? 'Position known — packets take the shortest forward hop.'
+                  : 'Flooding only. Every relay rebroadcasts.'}
               </Text>
             </View>
-            <Switch
-              value={gpsEnabled}
-              onValueChange={handleGpsToggle}
-              trackColor={{ false: colors.border, true: colors.primaryDim }}
-              thumbColor={gpsEnabled ? colors.primary : colors.textMuted}
-            />
+            <Toggle value={gpsEnabled} onValueChange={handleGpsToggle} />
           </View>
-        </View>
-
-        <View style={styles.field}>
-          <Text style={styles.label}>my_position</Text>
-          <Text style={styles.valueDim}>
-            {positionProvider.getCurrent()
-              ? `${positionProvider.getCurrent()!.lat.toFixed(3)}, ${positionProvider.getCurrent()!.lon.toFixed(3)} (truncated)`
-              : 'no fix'}
+          <View style={styles.dialRow}>
+            <PrecisionDial cellMeters={cellMeters} decimals={PUBLISH_DECIMALS} />
+            <View style={{ flex: 1 }}>
+              <KV k="my position" v={pos ? `${pos.lat.toFixed(3)}, ${pos.lon.toFixed(3)}` : 'no fix'} dim={!pos} />
+              <KV k="precision" v={`${PUBLISH_DECIMALS} dp · ~${cellMeters} m`} dim />
+              <KV k="known peers" v={knownPositions} />
+              <KV k="table ttl" v={`${LOCATION_TTL_MS / 60_000} min`} dim last />
+            </View>
+          </View>
+          <Text style={[styles.tip, { marginTop: 12 }]}>
+            Peers only learn which ~{cellMeters} m cell you are in. Opt out here for flooding-only relay.
           </Text>
-        </View>
+        </Panel>
 
-        <View style={styles.field}>
-          <Text style={styles.label}>known_positions</Text>
-          <Text style={styles.value}>{knownPositions} peer(s) in location table</Text>
-        </View>
+        <Rule title="link" />
 
-        <View style={styles.field}>
-          <Text style={styles.label}>privacy</Text>
-          <Text style={styles.valueDim}>coords truncated to ~110m; opt out via toggle</Text>
-        </View>
+        <Panel title="radio" right="read-only" variant="flat">
+          <KV k="role" v="dual · central + peripheral" />
+          <KV k="negotiated mtu" v={mtus.length ? mtus.join(' / ') : 'no central link'} dim={!mtus.length} />
+          <KV k="mtu requested" v={REQUESTED_MTU} dim />
+          <KV k="default ttl" v={DEFAULT_TTL} />
+          <KV k="beacon ttl" v={POSITION_TTL} dim />
+          <KV k="beacon interval" v={secs(POSITION_BEACON_MS)} dim />
+          <KV k="gps fix" v={`≥${secs(MIN_TIME_MS)} / ${MIN_DISTANCE_M} m`} dim />
+          <KV k="scan / pause" v={`${secs(SCAN_MS)} / ${secs(PAUSE_MS)}`} />
+          <KV k="max central links" v={MAX_CENTRAL_CONNECTIONS} />
+          <KV k="handshake timeout" v={`${HANDSHAKE_TIMEOUT_MS} ms`} dim last />
+          <Text style={[styles.tip, { marginTop: 12 }]}>
+            Fixed by the protocol: ttl is assumed network-wide (hop counts are derived from it) and the mtu is
+            negotiated with each peer, so neither is user-adjustable.
+          </Text>
+        </Panel>
 
-        <View style={styles.separator} />
-        <Text style={styles.sectionLabel}>{'// about'}</Text>
+        <Rule title="storage" />
 
-        <View style={styles.field}>
-          <Text style={styles.label}>version</Text>
-          <Text style={styles.value}>0.2.0-alpha</Text>
-        </View>
-        <View style={styles.field}>
-          <Text style={styles.label}>protocol</Text>
-          <Text style={styles.value}>BLE v2 (versioned, addressed)</Text>
-        </View>
-        <View style={styles.field}>
-          <Text style={styles.label}>storage</Text>
-          <Text style={styles.value}>local only (SQLite)</Text>
-        </View>
-        <View style={styles.field}>
-          <Text style={styles.label}>encryption</Text>
-          <Text style={styles.valueAccent}>X25519 + AES-256-GCM</Text>
-        </View>
-        <View style={styles.field}>
-          <Text style={styles.label}>identity</Text>
-          <Text style={styles.value}>cryptographic (TOFU)</Text>
-        </View>
+        <Panel title="local db" right="sqlite" variant="flat">
+          {tableCounts.map(r => (
+            <View key={r.table} style={styles.slab}>
+              <Text style={styles.slabLabel}>{r.table}</Text>
+              <View style={{ flex: 1 }}>
+                <BlockBar value={r.count} max={maxRows} count={10} />
+              </View>
+              <Text style={styles.slabVal}>{r.count}</Text>
+            </View>
+          ))}
+        </Panel>
 
-        <View style={styles.separator} />
-        <Text style={styles.sectionLabel}>{'// danger zone'}</Text>
+        <Rule title="about" />
 
-        <TouchableOpacity
-          style={styles.dangerButton}
-          onPress={() => Alert.alert('Reset Identity', 'Restart the app to generate a new identity.')}
-          activeOpacity={0.7}>
-          <Text style={styles.dangerText}>{'[ RESET IDENTITY ]'}</Text>
-        </TouchableOpacity>
+        <Panel title="build" variant="flat">
+          <KV k="version" v="0.2.0-alpha" />
+          <KV k="protocol" v="BLE v2 · versioned, addressed" />
+          <KV k="storage" v="local only (SQLite)" />
+          <KV k="crypto" v="X25519 + AES-256-GCM" color={colors.success} />
+          <KV k="identity" v="cryptographic (TOFU)" dim last />
+        </Panel>
 
-        <View style={styles.footer}>
-          <Text style={styles.footerText}>{'> MeshChat works entirely offline.'}</Text>
-          <Text style={styles.footerText}>{'> No data leaves your device.'}</Text>
-          <Text style={styles.footerText}>{'> No accounts. No servers. No tracking.'}</Text>
-          <Text style={styles.footerText}>{'> End-to-end encrypted by default.'}</Text>
-        </View>
+        <Panel title="on-device only" variant="flat">
+          <Text style={styles.diag}>
+            Nothing leaves this phone. No analytics, no crash upload, no account. Wiping the app destroys the
+            identity permanently.
+          </Text>
+        </Panel>
+
+        <Panel title="danger zone" variant="bad">
+          <Text style={[styles.tip, { marginTop: 0, marginBottom: 14 }]}>
+            Regenerates your fingerprint. Peers will see a new device and old conversations become unreachable.
+          </Text>
+          <Btn
+            label="reset identity"
+            tone="danger"
+            onPress={() => Alert.alert('Reset Identity', 'Restart the app to generate a new identity.')}
+          />
+        </Panel>
+        </Stagger>
       </ScrollView>
     </View>
   );
@@ -154,31 +186,23 @@ export function SettingsScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
-  content: { padding: 16 },
-  sectionLabel: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textDim, marginBottom: 12, marginTop: 8 },
-  field: { marginBottom: 16 },
-  label: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textDim, marginBottom: 4 },
-  value: { fontFamily: fonts.mono, fontSize: fontSize.sm, color: colors.text },
-  valueMono: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textDim },
-  valueAccent: { fontFamily: fonts.mono, fontSize: fontSize.sm, color: colors.success },
-  valueDim: { fontFamily: fonts.mono, fontSize: fontSize.sm, color: colors.textMuted, fontStyle: 'italic' },
-  toggleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  toggleLabelCol: { flex: 1, marginRight: 16 },
-  hint: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textMuted, marginTop: 2 },
-  inputRow: { flexDirection: 'row', alignItems: 'center' },
+  content: { padding: 16, paddingBottom: 32, gap: 16 },
+  fp: { paddingVertical: 14 },
+  nameBlock: { marginTop: 16 },
+  nameRow: { flexDirection: 'row', gap: 8 },
   input: {
-    flex: 1, fontFamily: fonts.mono, fontSize: fontSize.sm, color: colors.primary,
-    borderWidth: 1, borderColor: colors.border, borderRadius: 4,
-    paddingHorizontal: 10, paddingVertical: 8, backgroundColor: colors.bgInput,
+    flex: 1, minWidth: 0, paddingHorizontal: 13, paddingVertical: 11,
+    borderWidth: 1, borderColor: colors.border, backgroundColor: colors.bgInput,
+    fontFamily: fonts.mono, fontSize: 13, color: colors.primary,
   },
-  saveButton: { marginLeft: 8, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: colors.primary, borderRadius: 4 },
-  saveText: { fontFamily: fonts.mono, fontSize: fontSize.sm, color: colors.primary, fontWeight: '600' },
-  separator: { height: 1, backgroundColor: colors.border, marginVertical: 16 },
-  dangerButton: {
-    borderWidth: 1, borderColor: colors.error, borderRadius: 4, paddingVertical: 12,
-    alignItems: 'center', backgroundColor: 'rgba(255, 68, 68, 0.06)',
+  save: { paddingVertical: 11 },
+  dialRow: { flexDirection: 'row', alignItems: 'center', gap: 16 },
+  slab: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 10 },
+  slabLabel: {
+    width: 96, fontFamily: fonts.disp, fontSize: 9.5, letterSpacing: 0.8, textTransform: 'uppercase', color: colors.textMuted,
   },
-  dangerText: { fontFamily: fonts.mono, fontSize: fontSize.sm, color: colors.error, fontWeight: '600', letterSpacing: 1 },
-  footer: { marginTop: 32, paddingTop: 16, borderTopWidth: 1, borderTopColor: colors.border },
-  footerText: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.accent, lineHeight: 20 },
+  slabVal: { width: 30, textAlign: 'right', fontFamily: fonts.mono, fontSize: 11, color: colors.textDim },
+  toggleRow: { flexDirection: 'row', alignItems: 'center', gap: 16, marginBottom: 10 },
+  tip: { marginTop: 6, fontFamily: fonts.mono, fontSize: 11, lineHeight: 19, color: colors.textMuted },
+  diag: { fontFamily: fonts.mono, fontSize: 11, lineHeight: 19, color: colors.textDim },
 });

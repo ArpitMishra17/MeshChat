@@ -1,8 +1,8 @@
 import React, { useState, useCallback, useEffect } from 'react';
-import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator } from 'react-native';
+import { View, Text, ScrollView, StyleSheet } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { colors, fonts, fontSize } from '../theme';
+import { colors, fonts } from '../theme';
 import { bleService } from '../services/ble';
 import type { BLEState } from '../services/ble';
 import { mesh } from '../services/mesh';
@@ -11,8 +11,10 @@ import { messageRouter, type RouteLogEntry, type RouteStats } from '../services/
 import { getOrCreateConversation, getAllPeers } from '../db/database';
 import { ensureIdentity } from '../services/identity';
 import { positionProvider } from '../services/position';
-import { getLocationTable } from '../services/location';
+import { getLocationTable, haversineMeters, bearingDegrees } from '../services/location';
 import { StatusBadge } from '../components/StatusBadge';
+import { Btn, Cells, Chip, KV, Label, Meter, Panel, Row } from '../components/ui';
+import { Radar, Stagger, type RadarPeer } from '../components/viz';
 import { TerminalHeader } from '../components/TerminalHeader';
 import type { Peer } from '../types';
 import type { RootStackParamList } from '../navigation';
@@ -48,6 +50,7 @@ export function NearbyScreen() {
   const [routeStats, setRouteStats] = useState<RouteStats>(messageRouter.getRouteStats());
   const [routeLog, setRouteLog] = useState<RouteLogEntry[]>([]);
   const [gpsOn, setGpsOn] = useState(positionProvider.isEnabled());
+  const [, setPosTick] = useState(0);
 
   const refreshNeighbors = useCallback(() => {
     setNeighbors(mesh.getNeighbors());
@@ -90,6 +93,8 @@ export function NearbyScreen() {
       setRouteStats(messageRouter.getRouteStats());
     });
     const gpsTimer = setInterval(() => setGpsOn(positionProvider.isEnabled()), 2000);
+    // Our own fix moved — the radar re-plots every peer relative to it.
+    const unsubPos = positionProvider.changed.subscribe(() => setPosTick(n => n + 1));
 
     return () => {
       unsubNeighbors();
@@ -99,6 +104,7 @@ export function NearbyScreen() {
       clearInterval(pruneTimer);
       unsubRoute();
       clearInterval(gpsTimer);
+      unsubPos();
     };
   }, [refreshNeighbors, refreshKnown]);
 
@@ -154,162 +160,225 @@ export function NearbyScreen() {
   const knownNotLinked = knownPeers.filter(
     p => p.publicKey && !neighbors.some(n => n.fingerprintHex === p.deviceId),
   );
+  const peerCount = neighbors.length + scanResults.length + knownNotLinked.length;
+
+  // Radar: real bearing + haversine distance from our (truncated) fix to each
+  // peer's last known position. Needs our own fix, so it is GPS-gated.
+  const me = positionProvider.getCurrent();
+  const table = getLocationTable();
+  const radarCandidates = [
+    ...neighbors.map(n => ({ id: n.fingerprintHex, label: n.displayName, linked: true })),
+    ...knownNotLinked.map(p => ({ id: p.deviceId, label: p.displayName, linked: false })),
+  ];
+  const radarPeers: RadarPeer[] = [];
+  const unplaced: string[] = [];
+  for (const c of radarCandidates) {
+    const pos = me ? table.get(c.id) : null;
+    if (me && pos) {
+      radarPeers.push({ ...c, distanceM: haversineMeters(me, pos), bearing: bearingDegrees(me, pos) });
+    } else {
+      unplaced.push(c.label);
+    }
+  }
+  const distanceTo = (fp: string): string => {
+    const pos = me ? table.get(fp) : null;
+    return me && pos ? ` · ${Math.round(haversineMeters(me, pos))}m` : '';
+  };
+  const pinned = new Set(knownPeers.filter(p => p.keyPinned).map(p => p.deviceId));
 
   return (
     <View style={styles.container}>
       <TerminalHeader
         title="nearby"
-        subtitle={`mesh${mesh.isRunning() ? '' : ' off'} · scan#${scanCount}`}
+        subtitle={`scan#${scanCount}`}
         right={<StatusBadge state={bleState} />}
       />
-      <View style={styles.infoBar}>
-        <Text style={styles.infoText}>your_id: {myId.slice(0, 12)}...</Text>
-        <Text style={styles.infoText}>links: {neighbors.length}</Text>
-      </View>
-      <View style={styles.infoBar}>
-        <Text style={[styles.infoText, { color: colors.accent }]}>{log}</Text>
-      </View>
-      <View style={styles.routeBar}>
-        <Text style={styles.routeLabel}>
-          gps:{gpsOn ? 'on' : 'off'} · loc:{getLocationTable().size}
-        </Text>
-        <Text style={[styles.routeStat, { color: colors.success }]}>
-          greedy:{routeStats.greedyForwards}
-        </Text>
-        <Text style={[styles.routeStat, { color: colors.warning }]}>
-          flood:{routeStats.floodForwards}
-        </Text>
-        <Text style={[styles.routeStat, { color: colors.accent }]}>
-          recv:{routeStats.delivered}
-        </Text>
-      </View>
 
-      <FlatList
-        data={[
-          ...neighbors.map(n => ({ kind: 'neighbor' as const, n })),
-          ...scanResults.map(p => ({ kind: 'scan' as const, p })),
-          ...knownNotLinked.map(p => ({ kind: 'known' as const, p })),
-        ]}
-        keyExtractor={(item) =>
-          item.kind === 'neighbor' ? `n_${item.n.fingerprintHex}` :
-          item.kind === 'scan' ? `s_${item.p.bleId}` :
-          `k_${item.p.deviceId}`
-        }
-        renderItem={({ item }) => {
-          if (item.kind === 'neighbor') {
-            const n = item.n;
-            const transport = n.hasCentral ? 'central' : 'peripheral';
-            return (
-              <TouchableOpacity style={[styles.card, styles.cardLinked]} onPress={() => handleNeighborPress(n)} activeOpacity={0.7}>
-                <View style={styles.row}>
-                  <Text style={styles.name}>{n.displayName}</Text>
-                  <Text style={styles.linked}>[LINKED · {transport}]</Text>
-                </View>
-                <View style={styles.row}>
-                  <Text style={styles.id}>fp:{n.fingerprintHex.slice(0, 12)}...</Text>
-                  <Text style={styles.time}>seen {timeAgo(n.lastSeen)}</Text>
-                </View>
-              </TouchableOpacity>
-            );
-          }
-          if (item.kind === 'scan') {
-            const p = item.p;
-            const signal = signalStrength(p.rssi);
-            return (
-              <TouchableOpacity style={styles.card} onPress={() => handleScanResultPress(p)} activeOpacity={0.7}>
-                <View style={styles.row}>
-                  <Text style={styles.nameDim}>{p.displayName}</Text>
-                  <Text style={[styles.signal, { color: signal.color }]}>{signal.bars}</Text>
-                </View>
-                <View style={styles.row}>
-                  <Text style={styles.id}>mac:{p.deviceId.slice(-8)}</Text>
-                  <Text style={styles.time}>seen {timeAgo(p.lastSeen)}</Text>
-                </View>
-              </TouchableOpacity>
-            );
-          }
-          const p = item.p;
-          return (
-            <TouchableOpacity style={styles.card} onPress={() => handleKnownPress(p)} activeOpacity={0.7}>
-              <View style={styles.row}>
-                <Text style={styles.nameDim}>{p.displayName}</Text>
-                <Text style={styles.offline}>[OFFLINE]</Text>
+      <ScrollView contentContainerStyle={styles.content}>
+        <Stagger>
+        <Cells
+          items={[
+            { k: 'links', v: neighbors.length },
+            { k: 'greedy', v: routeStats.greedyForwards },
+            { k: 'flood', v: routeStats.floodForwards },
+            { k: 'recv', v: routeStats.delivered },
+          ]}
+        />
+
+        <Panel title="neighbour field" right={me ? 'live gps' : 'no gps fix'}>
+          {me ? (
+            <>
+              <Radar peers={radarPeers} active={isScanning} />
+              <View style={styles.legend}>
+                <LegendDot color={colors.success} filled label="linked" />
+                <LegendDot color={colors.warning} label="known · no link" />
+                <LegendDot color={colors.primary} filled square label="you" />
               </View>
-              <View style={styles.row}>
-                <Text style={styles.id}>fp:{p.deviceId.slice(0, 12)}...</Text>
-                <Text style={styles.time}>seen {timeAgo(p.lastSeen)}</Text>
-              </View>
-            </TouchableOpacity>
-          );
-        }}
-        ListEmptyComponent={
-          <View style={styles.empty}>
-            <Text style={styles.emptyText}>
-              {isScanning ? '// scanning for peers...' : '// no peers nearby'}
-            </Text>
-            <Text style={styles.emptyHint}>
-              {isScanning ? '// ensure other devices are running MeshChat' : '// mesh scans every 15s — tap SCAN to scan now'}
-            </Text>
-          </View>
-        }
-        ListFooterComponent={
-          routeLog.length > 0 ? (
-            <View style={styles.routeLogSection}>
-              <Text style={styles.routeLogHeader}>{'// routing log'}</Text>
-              {routeLog.map((entry, i) => (
-                <Text key={i} style={styles.routeLogEntry}>
-                  <Text style={styles.routeLogTime}>{fmtRouteTime(entry.timestamp)} </Text>
-                  <Text style={{ color: entry.strategy === 'greedy' ? colors.success : entry.strategy === 'flood' ? colors.warning : colors.accent }}>
-                    {entry.strategy.toUpperCase()}
-                  </Text>
-                  {' '}
-                  <Text style={styles.routeLogType}>{entry.type}</Text>
-                  {' '}
-                  <Text style={styles.routeLogMsg}>{entry.msgId}</Text>
-                  {entry.target ? ` →${entry.target}` : ''}
-                  {entry.progressMeters != null ? ` (${Math.round(entry.progressMeters)}m)` : ''}
-                  {entry.reason ? ` [${entry.reason}]` : ''}
+              {unplaced.length > 0 ? (
+                <Text style={styles.unplaced}>
+                  no position yet: {unplaced.join(', ')}
                 </Text>
-              ))}
+              ) : null}
+              <Text style={styles.unplaced}>
+                Positions are truncated to ~110 m on the wire, so close peers cluster near the centre.
+              </Text>
+            </>
+          ) : (
+            <View style={styles.empty}>
+              <Label>no gps fix</Label>
+              <Text style={styles.emptyHint}>
+                {gpsOn
+                  ? 'waiting for a location fix…'
+                  : 'turn on gps routing in config to plot peers by bearing and distance'}
+              </Text>
             </View>
-          ) : null
-        }
-        contentContainerStyle={styles.list}
-      />
+          )}
+        </Panel>
+
+        <Panel title="node" right={`mesh ${mesh.isRunning() ? 'on' : 'off'}`} variant="flat">
+          <KV k="your id" v={`${myId.slice(0, 12)}…`} color={colors.primary} />
+          <KV k="gps" v={gpsOn ? 'on' : 'off'} color={gpsOn ? colors.success : colors.textMuted} />
+          <KV k="positions" v={getLocationTable().size} />
+          <KV k="central links" v={bleService.getCentralConnectionCount()} last />
+          <Text style={styles.status}>{log}</Text>
+        </Panel>
+
+        <Panel title="neighbours" right={`${peerCount} known`} variant="flat" style={styles.listPanel}>
+          {peerCount === 0 ? (
+            <View style={styles.empty}>
+              <Text style={styles.emptyTitle}>{isScanning ? 'scanning for peers' : 'no peers nearby'}</Text>
+              <Text style={styles.emptyHint}>
+                {isScanning
+                  ? 'make sure other devices are running meshchat'
+                  : 'mesh scans every 15s — tap scan to sweep now'}
+              </Text>
+            </View>
+          ) : null}
+
+          {neighbors.map((n, i) => (
+            <Row
+              key={`n_${n.fingerprintHex}`}
+              active
+              title={n.displayName}
+              meta={
+                <Text style={styles.meta}>
+                  {pinned.has(n.fingerprintHex) ? <Text style={{ color: colors.primary }}>key pinned · </Text> : null}
+                  fp {n.fingerprintHex.slice(0, 8)} · seen {timeAgo(n.lastSeen)}
+                  {distanceTo(n.fingerprintHex)}
+                </Text>
+              }
+              right={
+                <>
+                  <Chip label={n.hasCentral ? 'central' : 'peripheral'} tone="green" />
+                  <Meter rssi={n.rssi} />
+                </>
+              }
+              onPress={() => handleNeighborPress(n)}
+              last={i === peerCount - 1}
+            />
+          ))}
+
+          {scanResults.map((p, i) => (
+            <Row
+              key={`s_${p.bleId}`}
+              title={p.displayName}
+              meta={
+                <Text style={styles.meta}>
+                  mac {p.deviceId.slice(-8)} · seen {timeAgo(p.lastSeen)}
+                </Text>
+              }
+              right={
+                <>
+                  <Chip label="advert" tone="amber" />
+                  <Meter rssi={p.rssi} />
+                </>
+              }
+              onPress={() => handleScanResultPress(p)}
+              last={neighbors.length + i === peerCount - 1}
+            />
+          ))}
+
+          {knownNotLinked.map((p, i) => (
+            <Row
+              key={`k_${p.deviceId}`}
+              title={p.displayName}
+              meta={
+                <Text style={styles.meta}>
+                  {p.keyPinned ? <Text style={{ color: colors.primary }}>key pinned · </Text> : null}
+                  fp {p.deviceId.slice(0, 8)} · seen {timeAgo(p.lastSeen)}
+                  {distanceTo(p.deviceId)}
+                </Text>
+              }
+              right={<Chip label="offline" />}
+              onPress={() => handleKnownPress(p)}
+              last={neighbors.length + scanResults.length + i === peerCount - 1}
+            />
+          ))}
+        </Panel>
+
+        {routeLog.length > 0 ? (
+          <Panel title="routing log" right={`${routeLog.length} shown`} variant="flat">
+            <View style={styles.logList}>
+              {routeLog.map((entry, i) => {
+                const c =
+                  entry.strategy === 'greedy' ? colors.primary :
+                  entry.strategy === 'flood' ? colors.warning :
+                  entry.strategy === 'drop' ? colors.error : colors.accent;
+                return (
+                  <Text key={i} style={styles.logLine}>
+                    <Text style={{ color: colors.textDim }}>{fmtRouteTime(entry.timestamp)} </Text>
+                    <Text style={{ color: c }}>{entry.strategy.toUpperCase().padEnd(6, ' ')} </Text>
+                    {entry.type} {entry.msgId}
+                    <Text style={{ color: colors.textDim }}>
+                      {entry.target ? ` →${entry.target}` : ''}
+                      {entry.reason ? ` [${entry.reason}]` : ''}
+                    </Text>
+                    <Text style={{ color: colors.textMuted }}> n{entry.neighborCount}</Text>
+                    {entry.progressMeters != null ? (
+                      <Text style={{ color: colors.success }}> +{Math.round(entry.progressMeters)}m</Text>
+                    ) : null}
+                  </Text>
+                );
+              })}
+            </View>
+          </Panel>
+        ) : null}
+        </Stagger>
+      </ScrollView>
 
       <View style={styles.footer}>
         {isScanning ? (
-          <TouchableOpacity
-            style={[styles.scanButton, styles.scanButtonActive]}
-            onPress={() => bleService.stopScan()}
-            activeOpacity={0.7}>
-            <ActivityIndicator size="small" color={colors.bg} />
-            <Text style={[styles.scanButtonText, styles.scanButtonTextActive]}> STOP SCAN </Text>
-          </TouchableOpacity>
+          <Btn label="◌ stop scan" tone="warn" onPress={() => bleService.stopScan()} />
         ) : (
-          <TouchableOpacity style={styles.scanButton} onPress={handleScan} activeOpacity={0.7}>
-            <Text style={styles.scanButtonText}>{'[ SCAN ]'}</Text>
-          </TouchableOpacity>
+          <Btn label="▶ start ble scan" tone="go" onPress={handleScan} />
         )}
       </View>
     </View>
   );
 }
 
-function signalStrength(rssi: number | null): { bars: string; color: string } {
-  if (rssi === null) return { bars: '[----]', color: colors.textMuted };
-  if (rssi > -50) return { bars: '[||||]', color: colors.success };
-  if (rssi > -70) return { bars: '[||| ]', color: colors.primaryDim };
-  if (rssi > -85) return { bars: '[||  ]', color: colors.warning };
-  return { bars: '[|   ]', color: colors.error };
+function LegendDot({
+  color, label, filled, square,
+}: { color: string; label: string; filled?: boolean; square?: boolean }) {
+  return (
+    <View style={styles.legendItem}>
+      <View
+        style={{
+          width: 8, height: 8, borderWidth: 1, borderColor: color,
+          borderRadius: square ? 0 : 4, backgroundColor: filled ? color : 'transparent',
+        }}
+      />
+      <Text style={styles.legendText}>{label}</Text>
+    </View>
+  );
 }
 
 function timeAgo(ts: number): string {
   const diff = Math.floor((Date.now() - ts) / 1000);
   if (diff < 5) return 'now';
-  if (diff < 60) return `${diff}s ago`;
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  return `${Math.floor(diff / 3600)}h ago`;
+  if (diff < 60) return `${diff}s`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m`;
+  return `${Math.floor(diff / 3600)}h`;
 }
 
 function fmtRouteTime(ts: number): string {
@@ -319,75 +388,25 @@ function fmtRouteTime(ts: number): string {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
-  infoBar: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
+  content: { padding: 16, paddingBottom: 24, gap: 16 },
+  listPanel: { paddingHorizontal: 4 },
+  status: { marginTop: 12, fontFamily: fonts.mono, fontSize: 11, color: colors.accent },
+  meta: { fontFamily: fonts.mono, fontSize: 11, color: colors.textMuted },
+  empty: { alignItems: 'center', paddingVertical: 28, paddingHorizontal: 12 },
+  emptyTitle: {
+    fontFamily: fonts.disp, fontSize: 10, letterSpacing: 1, textTransform: 'uppercase', color: colors.textMuted,
   },
-  infoText: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textDim },
-  routeBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 6,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
+  emptyHint: { marginTop: 8, fontFamily: fonts.mono, fontSize: 11, color: colors.textMuted, textAlign: 'center' },
+  legend: { flexDirection: 'row', flexWrap: 'wrap', gap: 16, paddingTop: 14 },
+  legendItem: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  legendText: { fontFamily: fonts.mono, fontSize: 10, color: colors.textMuted },
+  unplaced: { marginTop: 10, fontFamily: fonts.mono, fontSize: 10, lineHeight: 16, color: colors.textMuted },
+  logList: { gap: 8 },
+  logLine: { fontFamily: fonts.mono, fontSize: 11, lineHeight: 17, color: colors.text },
+  footer: {
+    padding: 16,
     backgroundColor: colors.bgSecondary,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
   },
-  routeLabel: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textDim, marginRight: 12 },
-  routeStat: { fontFamily: fonts.mono, fontSize: fontSize.xs, marginRight: 12 },
-  routeLogSection: { padding: 16, paddingTop: 20 },
-  routeLogHeader: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textDim, marginBottom: 8 },
-  routeLogEntry: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.text, lineHeight: 18 },
-  routeLogTime: { color: colors.textMuted },
-  routeLogType: { color: colors.accentDim },
-  routeLogMsg: { color: colors.textDim },
-  list: { paddingVertical: 8, flexGrow: 1 },
-  card: {
-    backgroundColor: colors.bgCard,
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: 4,
-    padding: 12,
-    marginHorizontal: 16,
-    marginVertical: 4,
-  },
-  cardLinked: {
-    borderColor: colors.primaryBorder,
-    backgroundColor: 'rgba(0, 255, 65, 0.05)',
-  },
-  row: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  name: { fontFamily: fonts.mono, fontSize: fontSize.md, color: colors.primary, fontWeight: '600' },
-  nameDim: { fontFamily: fonts.mono, fontSize: fontSize.md, color: colors.text, fontWeight: '600' },
-  linked: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.success, letterSpacing: 1 },
-  offline: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textMuted, letterSpacing: 1 },
-  signal: { fontFamily: fonts.mono, fontSize: fontSize.sm },
-  id: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textDim, marginTop: 4 },
-  time: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textDim, marginTop: 4 },
-  empty: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingTop: 100 },
-  emptyText: { fontFamily: fonts.mono, fontSize: fontSize.sm, color: colors.textDim },
-  emptyHint: { fontFamily: fonts.mono, fontSize: fontSize.xs, color: colors.textMuted, marginTop: 8 },
-  footer: { padding: 16, borderTopWidth: 1, borderTopColor: colors.border },
-  scanButton: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: colors.primary,
-    borderRadius: 4,
-    paddingVertical: 14,
-    backgroundColor: colors.primaryFaint,
-  },
-  scanButtonActive: { backgroundColor: colors.primary },
-  scanButtonText: {
-    fontFamily: fonts.mono,
-    fontSize: fontSize.md,
-    color: colors.primary,
-    fontWeight: '700',
-    letterSpacing: 2,
-  },
-  scanButtonTextActive: { color: colors.bg },
 });

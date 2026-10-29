@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { StatusBar } from 'react-native';
+import { useFonts } from 'expo-font';
 import { NavigationContainer } from '@react-navigation/native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { AppNavigator } from './src/navigation';
@@ -8,7 +9,8 @@ import { getDB, getIdentity } from './src/db/database';
 import { messageRouter } from './src/services/messageRouter';
 import { mesh } from './src/services/mesh';
 import { positionProvider } from './src/services/position';
-import { colors } from './src/theme';
+import { telemetry } from './src/services/telemetry';
+import { colors, fonts, fontAssets } from './src/theme';
 
 const navTheme = {
   dark: true,
@@ -21,15 +23,18 @@ const navTheme = {
     notification: colors.accent,
   },
   fonts: {
-    regular: { fontFamily: 'System', fontWeight: '400' as const },
-    medium: { fontFamily: 'System', fontWeight: '500' as const },
-    bold: { fontFamily: 'System', fontWeight: '700' as const },
-    heavy: { fontFamily: 'System', fontWeight: '900' as const },
+    regular: { fontFamily: fonts.mono, fontWeight: '400' as const },
+    medium: { fontFamily: fonts.disp, fontWeight: '500' as const },
+    bold: { fontFamily: fonts.dispBold, fontWeight: '700' as const },
+    heavy: { fontFamily: fonts.dispBold, fontWeight: '900' as const },
   },
 };
 
 export default function App() {
   const [showOnboarding, setShowOnboarding] = useState<boolean | null>(null);
+  // If the fonts fail to load we still render (system fallback) rather than
+  // leaving the user on a blank screen.
+  const [fontsLoaded, fontError] = useFonts(fontAssets);
 
   useEffect(() => {
     getDB();
@@ -41,6 +46,7 @@ export default function App() {
     // is mounted. Also started after onboarding completes (below).
     if (identity) {
       messageRouter.start();
+      telemetry.start();
       // Phase 3 — start the neighbor manager: duty-cycled scan +
       // auto-connect keeps the link pool fed for multi-hop relaying.
       mesh.start();
@@ -55,19 +61,20 @@ export default function App() {
   useEffect(() => {
     if (showOnboarding === false) {
       messageRouter.start();
+      telemetry.start();
       mesh.start();
       void positionProvider.start();
     }
   }, [showOnboarding]);
 
-  if (showOnboarding === null) return null;
+  if (showOnboarding === null || (!fontsLoaded && !fontError)) return null;
 
   if (showOnboarding) {
     return (
-      <>
+      <SafeAreaProvider>
         <StatusBar barStyle="light-content" backgroundColor={colors.bg} />
         <OnboardingScreen onComplete={() => setShowOnboarding(false)} />
-      </>
+      </SafeAreaProvider>
     );
   }
 

@@ -91,7 +91,9 @@ const TYPE_FRAG_END = 0xf2;
 // Conservative fallback when no MTU is known (peripheral-notify path).
 const DEFAULT_CHUNK_SIZE = 18;
 // P0.6 — reassembly buffers older than this are assumed orphaned (lost END).
-const REASSEMBLY_TTL_MS = 10_000;
+export const REASSEMBLY_TTL_MS = 10_000;
+/** Fragment markers, exported for the wire inspector's legend. */
+export const FRAGMENT_MARKERS = [0xf0, 0xf1, 0xf2] as const;
 
 // --- Errors ---
 
@@ -644,6 +646,29 @@ interface ReassemblyBuffer {
 }
 
 const reassemblyBuffers = new Map<string, ReassemblyBuffer>();
+let reassemblyCompleted = 0;
+let reassemblyDiscarded = 0;
+
+/**
+ * Live view of fragment reassembly for the wire inspector: buffers currently
+ * waiting on fragments, plus cumulative completed / discarded counts.
+ */
+export function getReassemblyStats(): {
+  inFlight: { received: number; total: number; ageMs: number }[];
+  completed: number;
+  discarded: number;
+} {
+  const now = Date.now();
+  return {
+    inFlight: Array.from(reassemblyBuffers.values()).map(b => ({
+      received: b.chunks.size,
+      total: b.seqTotal,
+      ageMs: now - b.createdAt,
+    })),
+    completed: reassemblyCompleted,
+    discarded: reassemblyDiscarded,
+  };
+}
 
 function sweepStaleBuffers(): void {
   const now = Date.now();
@@ -654,6 +679,7 @@ function sweepStaleBuffers(): void {
           `(${now - buf.createdAt}ms old)`,
       );
       reassemblyBuffers.delete(key);
+      reassemblyDiscarded += 1;
     }
   }
 }
@@ -829,7 +855,11 @@ export function decodeBLEChunkRaw(
   if (firstByte === TYPE_FRAG_END) {
     const assembled = reassemble(buffer);
     reassemblyBuffers.delete(sourceKey);
-    if (!assembled) return null;
+    if (!assembled) {
+      reassemblyDiscarded += 1;
+      return null;
+    }
+    reassemblyCompleted += 1;
     return decodePacketToRaw(assembled);
   }
 
@@ -867,6 +897,8 @@ function decodePacketToRaw(
 
 export function _clearReassemblyBuffers(): void {
   reassemblyBuffers.clear();
+  reassemblyCompleted = 0;
+  reassemblyDiscarded = 0;
 }
 
 export function _resetMsgSeq(): void {

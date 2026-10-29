@@ -60,6 +60,7 @@ export class SeenCache {
   private entries = new Map<string, number>();
   private readonly maxEntries: number;
   private readonly ttlMs: number;
+  private evicted = 0;
   /** Monotonic clock injection point so tests can advance time deterministically. */
   private now: () => number;
 
@@ -93,7 +94,18 @@ export class SeenCache {
       const oldest = this.entries.keys().next().value;
       if (oldest === undefined) break;
       this.entries.delete(oldest);
+      this.evicted += 1;
     }
+  }
+
+  /** Entries dropped because the cache hit its size cap (LRU evictions). */
+  get evictions(): number {
+    return this.evicted;
+  }
+
+  /** Configured size cap. */
+  get capacity(): number {
+    return this.maxEntries;
   }
 
   /** Number of entries currently cached (including any not yet swept). */

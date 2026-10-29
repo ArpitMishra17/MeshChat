@@ -31,11 +31,11 @@ import type { GeoPosition } from '../types';
 const SETTING_GPS_ENABLED = 'gps_enabled';
 
 /** Minimum interval between GPS fixes (PLAN.md: 30 s). */
-const MIN_TIME_MS = 30_000;
+export const MIN_TIME_MS = 30_000;
 /** Minimum distance change to trigger a fix (PLAN.md: 50 m). */
-const MIN_DISTANCE_M = 50;
+export const MIN_DISTANCE_M = 50;
 /** Decimal places to retain when publishing (~110 m precision). */
-const PUBLISH_DECIMALS = 3;
+export const PUBLISH_DECIMALS = 3;
 
 class PositionProvider {
   /** Fires with the new truncated position whenever a fresh fix arrives. */

@@ -87,6 +87,10 @@ export interface RouteStats {
   floodForwards: number;
   delivered: number;
   positionBeaconsRouted: number;
+  /** Packets dropped by the seen-cache (transport-level duplicates). */
+  duplicates: number;
+  /** Unicast packets dropped because their hop budget ran out. */
+  ttlDrops: number;
 }
 
 /** Phase 5 — how often the outbox watchdog/drain tick runs. */
@@ -108,7 +112,9 @@ class MessageRouter {
   private myFingerprintHex = '';
   private unsubscribers: Array<() => void> = [];
   /** Phase 4 — routing counters for the report. */
-  private stats: RouteStats = { greedyForwards: 0, floodForwards: 0, delivered: 0, positionBeaconsRouted: 0 };
+  private stats: RouteStats = {
+    greedyForwards: 0, floodForwards: 0, delivered: 0, positionBeaconsRouted: 0, duplicates: 0, ttlDrops: 0,
+  };
   /** Phase 5 — periodic outbox drain/watchdog tick. */
   private outboxTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -145,6 +151,11 @@ class MessageRouter {
   /** Phase 4 — cumulative routing counters (for the Nearby screen / report). */
   getRouteStats(): RouteStats {
     return { ...this.stats };
+  }
+
+  /** Seen-cache occupancy + LRU evictions, for the wire inspector. */
+  getSeenStats(): { size: number; capacity: number; evictions: number } {
+    return { size: this.seen.size, capacity: this.seen.capacity, evictions: this.seen.evictions };
   }
 
   /**
@@ -298,7 +309,15 @@ class MessageRouter {
       case 'ignore':
         return;
       case 'drop':
-        // Duplicate (seen-cache hit) or TTL exhausted. Either way, no work.
+        // Duplicate (seen-cache hit) or TTL exhausted. No work either way, but
+        // count them; only TTL exhaustion is logged (duplicates are routine in
+        // a flooded mesh and would drown the routing log).
+        if (decision.reason === 'duplicate') {
+          this.stats.duplicates += 1;
+        } else {
+          this.stats.ttlDrops += 1;
+          this.logRoute(p, 'drop', { reason: decision.reason });
+        }
         return;
       case 'deliver':
         this.deliverLocally(p);
@@ -560,6 +579,8 @@ class MessageRouter {
       console.log(
         `[route] ${typeName} ${msgId} FLOOD (${extra.reason ?? 'broadcast'}, ${neighborCount} nbrs)`,
       );
+    } else if (strategy === 'drop') {
+      console.log(`[route] ${typeName} ${msgId} DROP (${extra.reason ?? 'unknown'})`);
     } else if (strategy === 'deliver') {
       console.log(
         `[route] ${typeName} ${msgId} DELIVER${entry.hops != null ? ` (via ${entry.hops} hop${entry.hops === 1 ? '' : 's'})` : ''}`,

@@ -139,6 +139,20 @@ export function haversineMeters(a: GeoCoord, b: GeoCoord): number {
   return EARTH_RADIUS_M * c;
 }
 
+/**
+ * Initial great-circle bearing from `a` to `b`, in degrees clockwise from
+ * true north (0–360). Used to place peers on the radar view.
+ */
+export function bearingDegrees(a: GeoCoord, b: GeoCoord): number {
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+  const dLon = toRad(b.lon - a.lon);
+  const y = Math.sin(dLon) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
 /** Why a unicast packet fell back to flooding. */
 export type FloodReason =
   | 'no-destination-position' // dst not in the location table (or stale)

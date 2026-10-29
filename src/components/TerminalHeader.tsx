@@ -1,24 +1,27 @@
 import React from 'react';
 import { View, Text, StyleSheet } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { colors, fonts, fontSize } from '../theme';
+import { colors, fonts } from '../theme';
 
 interface Props {
   title: string;
   subtitle?: string;
   right?: React.ReactNode;
+  /** Rendered before the title (e.g. a back button). */
+  left?: React.ReactNode;
 }
 
-export function TerminalHeader({ title, subtitle, right }: Props) {
+/** Console-style screen header: uppercase display title, mono subtitle, status on the right. */
+export function TerminalHeader({ title, subtitle, right, left }: Props) {
   const insets = useSafeAreaInsets();
   return (
-    <View style={[styles.container, { paddingTop: insets.top + 12 }]}>
-      <View style={styles.left}>
-        <Text style={styles.prompt}>{'>'}</Text>
-        <Text style={styles.title}>{title}</Text>
-        {subtitle && <Text style={styles.subtitle}>{subtitle}</Text>}
+    <View style={[styles.container, { paddingTop: insets.top + 16 }]}>
+      {left}
+      <View style={styles.titles}>
+        <Text style={styles.title} numberOfLines={1}>{title}</Text>
+        {subtitle ? <Text style={styles.subtitle} numberOfLines={1}>{subtitle}</Text> : null}
       </View>
-      {right && <View style={styles.right}>{right}</View>}
+      {right ? <View style={styles.right}>{right}</View> : null}
     </View>
   );
 }
@@ -27,37 +30,23 @@ const styles = StyleSheet.create({
   container: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
+    gap: 10,
     paddingHorizontal: 16,
-    paddingVertical: 12,
-    backgroundColor: colors.bg,
+    paddingBottom: 15,
+    backgroundColor: colors.bgSecondary,
     borderBottomWidth: 1,
     borderBottomColor: colors.border,
   },
-  left: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    flex: 1,
-  },
-  prompt: {
-    fontFamily: fonts.mono,
-    fontSize: fontSize.lg,
-    color: colors.primary,
-    marginRight: 8,
-  },
+  titles: { flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'baseline', gap: 10 },
   title: {
-    fontFamily: fonts.mono,
-    fontSize: fontSize.lg,
+    flexShrink: 1,
+    fontFamily: fonts.dispBold,
+    fontSize: 15,
+    lineHeight: 18,
+    letterSpacing: 1.2,
+    textTransform: 'uppercase',
     color: colors.textBright,
-    fontWeight: '600',
   },
-  subtitle: {
-    fontFamily: fonts.mono,
-    fontSize: fontSize.xs,
-    color: colors.textDim,
-    marginLeft: 8,
-  },
-  right: {
-    marginLeft: 12,
-  },
+  subtitle: { flexShrink: 1, fontFamily: fonts.mono, fontSize: 10, color: colors.textMuted },
+  right: { flexDirection: 'row', alignItems: 'center', gap: 6 },
 });

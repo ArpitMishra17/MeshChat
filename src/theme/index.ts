@@ -1,2 +1,2 @@
 export { colors } from './colors';
-export { fonts, fontSize } from './fonts';
+export { fonts, fontSize, fontAssets } from './fonts';

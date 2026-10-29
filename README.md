@@ -4,6 +4,8 @@
 
 An offline messenger for Android. Phones talk to each other over Bluetooth Low Energy, and messages hop through nearby devices to reach people who are out of direct range. There are no servers, no accounts and no internet.
 
+> Inspired by [bitchat](https://github.com/permissionlesstech/bitchat), the Bluetooth mesh chat app from Jack Dorsey.
+
 > Inspired by [bitchat](https://github.com/permissionlesstech/bitchat) by Jack Dorsey.
 
 ## Features

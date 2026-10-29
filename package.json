@@ -23,6 +23,8 @@
     ]
   },
   "dependencies": {
+    "@expo-google-fonts/chakra-petch": "^0.4.1",
+    "@expo-google-fonts/share-tech-mono": "^0.4.1",
     "@noble/ciphers": "^2.2.0",
     "@noble/curves": "^2.2.0",
     "@noble/hashes": "^2.2.0",
@@ -32,6 +34,7 @@
     "expo": "~55.0.8",
     "expo-crypto": "~55.0.10",
     "expo-dev-client": "~55.0.18",
+    "expo-font": "~55.0.8",
     "expo-location": "~55.1.12",
     "expo-secure-store": "~55.0.16",
     "expo-sqlite": "~55.0.11",
@@ -45,9 +48,11 @@
   "devDependencies": {
     "@types/jest": "^29.5.14",
     "@types/react": "~19.2.2",
+    "@types/react-test-renderer": "^19.3.0",
     "babel-preset-expo": "~55.0.12",
     "jest": "^29.7.0",
     "jest-expo": "~55.0.20",
+    "react-test-renderer": "^19.2.0",
     "typescript": "~5.9.2"
   },
   "private": true

@@ -68,7 +68,8 @@
           "locationAlwaysAndWhenInUsePermission": "MeshChat uses your location to route messages toward nearby devices over the mesh.",
           "locationWhenInUsePermission": "MeshChat uses your location to route messages toward nearby devices over the mesh."
         }
-      ]
+      ],
+      "expo-font"
     ],
     "extra": {
       "eas": {

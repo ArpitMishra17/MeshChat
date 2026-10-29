@@ -47,7 +47,8 @@ function initSchema() {
       peer_display_name TEXT NOT NULL,
       last_message TEXT,
       last_message_at INTEGER,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      last_read_at INTEGER
     );
   `);
 
@@ -116,6 +117,10 @@ function initSchema() {
  * (`0` for direct), while the UI contract is transmissions (`1` for direct).
  * Originated messages remain NULL, so only received-message hop values are
  * incremented.
+ *
+ * v7 adds `conversations.last_read_at`, the per-thread read marker behind the
+ * unread badges. Existing threads are stamped "read now" so upgrading does not
+ * flag the whole history as unread.
  */
 function runMigrations() {
   const versionRow = db.getAllSync<{ user_version: number }>('PRAGMA user_version');
@@ -168,6 +173,17 @@ function runMigrations() {
     // identify messages originated on this device and are left untouched.
     db.execSync('UPDATE messages SET hops = hops + 1 WHERE hops IS NOT NULL');
     version = 6;
+  }
+
+  if (version < 7) {
+    // A fresh DB has no `conversations` table yet (initSchema creates it with
+    // the column already included), so only ALTER when the table exists.
+    const cols = db.getAllSync<{ name: string }>('PRAGMA table_info(conversations)');
+    if (cols.length > 0 && !cols.some(c => c.name === 'last_read_at')) {
+      db.execSync('ALTER TABLE conversations ADD COLUMN last_read_at INTEGER');
+      db.runSync('UPDATE conversations SET last_read_at = ?', [Date.now()]);
+    }
+    version = 7;
   }
 
   db.runSync(`PRAGMA user_version = ${version}`);
@@ -585,5 +601,69 @@ export function getStuckSentMessages(
     conversationId: row.conversation_id,
     dstFingerprintHex: row.dst_fingerprint,
     createdAt: row.created_at,
+  }));
+}
+
+// --- Conversation read state / summaries ---
+
+/** Stamp a thread as read up to now (clears its unread badge). */
+export function markConversationRead(conversationId: string): void {
+  db.runSync('UPDATE conversations SET last_read_at = ? WHERE id = ?', [Date.now(), conversationId]);
+}
+
+export interface ConversationSummary {
+  /** Messages from the peer newer than the thread's read marker. */
+  unread: number;
+  /** Status of the newest message in the thread, or null if empty. */
+  lastStatus: MessageStatus | null;
+  /** True if the newest message was sent by us. */
+  lastMine: boolean;
+  /** Hop count (radio transmissions) of the newest received message, if any. */
+  lastHops: number | null;
+}
+
+/** Per-conversation unread count, last-message status and last received hop count. */
+export function getConversationSummaries(myFingerprintHex: string): Record<string, ConversationSummary> {
+  const rows = db.getAllSync<any>(
+    `SELECT c.id AS id,
+       (SELECT COUNT(*) FROM messages m
+          WHERE m.conversation_id = c.id AND m.sender_device_id != ?
+            AND m.created_at > COALESCE(c.last_read_at, 0)) AS unread,
+       (SELECT m.status FROM messages m WHERE m.conversation_id = c.id
+          ORDER BY m.created_at DESC LIMIT 1) AS last_status,
+       (SELECT m.sender_device_id FROM messages m WHERE m.conversation_id = c.id
+          ORDER BY m.created_at DESC LIMIT 1) AS last_sender,
+       (SELECT m.hops FROM messages m WHERE m.conversation_id = c.id AND m.hops IS NOT NULL
+          ORDER BY m.created_at DESC LIMIT 1) AS last_hops
+     FROM conversations c`,
+    [myFingerprintHex],
+  );
+  const out: Record<string, ConversationSummary> = {};
+  for (const r of rows) {
+    out[r.id] = {
+      unread: r.unread ?? 0,
+      lastStatus: (r.last_status as MessageStatus | null) ?? null,
+      lastMine: r.last_sender === myFingerprintHex,
+      lastHops: r.last_hops ?? null,
+    };
+  }
+  return out;
+}
+
+// --- Telemetry helpers ---
+
+/** Number of messages currently waiting in the outbox. */
+export function getOutboxCount(): number {
+  const rows = db.getAllSync<{ n: number }>('SELECT COUNT(*) AS n FROM outbox');
+  return rows[0]?.n ?? 0;
+}
+
+/** Row count per local table, for the settings storage panel. */
+export function getTableCounts(): { table: string; count: number }[] {
+  const tables = ['identity', 'peers', 'conversations', 'messages', 'outbox', 'settings'];
+  return tables.map(table => ({
+    table,
+    // Table names come from the fixed list above, never user input.
+    count: db.getAllSync<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`)[0]?.n ?? 0,
   }));
 }

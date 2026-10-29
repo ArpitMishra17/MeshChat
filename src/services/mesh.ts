@@ -30,10 +30,12 @@ import type { Peer } from '../types';
  * concurrent-connection cap keeps the cost bounded.
  */
 
-const SCAN_MS = 15_000;
-const PAUSE_MS = 15_000;
+export const SCAN_MS = 15_000;
+export const PAUSE_MS = 15_000;
 /** Android's practical concurrent central GATT connection cap. */
-const MAX_CENTRAL_CONNECTIONS = 4;
+export const MAX_CENTRAL_CONNECTIONS = 4;
+/** How often central-side link RSSI is re-read for the signal meters. */
+const RSSI_REFRESH_MS = 10_000;
 /** Don't re-attempt an auto-connect to a MAC we just tried for this long. */
 const RECENT_ATTEMPT_COOLDOWN_MS = 20_000;
 
@@ -56,6 +58,7 @@ class MeshManager {
   private discoveredThisCycle = new Map<string, Peer>();
 
   private unsubs: Array<() => void> = [];
+  private rssiTimer: ReturnType<typeof setInterval> | null = null;
 
   /**
    * Begin the mesh: start advertising + the duty-cycled scan loop, and subscribe
@@ -78,6 +81,14 @@ class MeshManager {
       }),
     );
 
+    // Keep signal meters live: links are created with no RSSI, so poll it.
+    this.rssiTimer = setInterval(() => {
+      if (bleService.getNeighbors().length === 0) return;
+      void bleService.refreshLinkRssi().then(changed => {
+        if (changed) this.neighborsChanged.emit();
+      });
+    }, RSSI_REFRESH_MS);
+
     // Start the first scan cycle immediately (also starts the peripheral).
     void this.dutyCycle();
   }
@@ -87,6 +98,10 @@ class MeshManager {
     if (this.cycleTimer !== null) {
       clearTimeout(this.cycleTimer);
       this.cycleTimer = null;
+    }
+    if (this.rssiTimer !== null) {
+      clearInterval(this.rssiTimer);
+      this.rssiTimer = null;
     }
     bleService.stopScan();
     this.unsubs.forEach(u => u());

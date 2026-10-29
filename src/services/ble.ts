@@ -40,11 +40,13 @@ const MESSAGE_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef2';
 const ACK_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef3';
 
 /** P0.3 — How long the central waits for the peripheral's HELLO notification. */
-const HANDSHAKE_TIMEOUT_MS = 8000;
+export const HANDSHAKE_TIMEOUT_MS = 8000;
+/** MTU we ask the OS to negotiate on every central connection. */
+export const REQUESTED_MTU = 512;
 /** Phase 4 — POSITION beacon interval (PLAN.md: ~60 s while moving). */
-const POSITION_BEACON_MS = 60_000;
+export const POSITION_BEACON_MS = 60_000;
 /** Phase 4 — TTL for POSITION beacons (broadcast, a few hops). */
-const POSITION_TTL = 3;
+export const POSITION_TTL = 3;
 
 export type BLEState = 'idle' | 'scanning' | 'connecting' | 'connected' | 'error';
 
@@ -130,6 +132,8 @@ export interface NeighborInfo {
   lastSeen: number;
   hasCentral: boolean;
   hasPeripheral: boolean;
+  /** Negotiated ATT MTU of our central-side connection; null if we are not the central. */
+  mtu: number | null;
 }
 
 /**
@@ -422,7 +426,7 @@ class BLEService {
 
     try {
       const device = await this.manager.connectToDevice(bleId, { timeout: 10000 });
-      const mtuDevice = await device.requestMTU(512);
+      const mtuDevice = await device.requestMTU(REQUESTED_MTU);
       const mtu = mtuDevice.mtu ?? 23;
       console.log(`[BLE] Negotiated MTU: ${mtu} with ${bleId.slice(-8)}`);
       await device.discoverAllServicesAndCharacteristics();
@@ -495,7 +499,32 @@ class BLEService {
         lastSeen: l.lastSeen,
         hasCentral: !!l.central,
         hasPeripheral: !!l.peripheralAddress,
+        mtu: l.central ? l.central.mtu : null,
       }));
+  }
+
+  /**
+   * Re-read RSSI for every link where we are the GATT client. Links are
+   * created at HELLO time with `rssi: null`, so without this the signal meter
+   * never has data. Peer-initiated (peripheral-side) links stay null: Android's
+   * GATT *server* API exposes no remote RSSI, and the BlePeripheral native
+   * module has no such call. Returns true if any value changed.
+   */
+  async refreshLinkRssi(): Promise<boolean> {
+    let changed = false;
+    for (const link of Array.from(this.links.values())) {
+      if (!link.established || !link.central) continue;
+      try {
+        const d = await link.central.device.readRSSI();
+        if (d.rssi != null && d.rssi !== link.rssi) {
+          link.rssi = d.rssi;
+          changed = true;
+        }
+      } catch {
+        // Link dropped mid-read — linkDown handling owns cleanup.
+      }
+    }
+    return changed;
   }
 
   /** Phase 3 — True if we have an established link to this fingerprint. */

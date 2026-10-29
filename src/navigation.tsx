@@ -1,12 +1,14 @@
 import React from 'react';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
-import { Text, StyleSheet } from 'react-native';
-import { colors, fonts, fontSize } from './theme';
+import { colors } from './theme';
+import { TabBar } from './components/TabBar';
 import { NearbyScreen } from './screens/NearbyScreen';
 import { ConversationsScreen } from './screens/ConversationsScreen';
 import { ChatScreen } from './screens/ChatScreen';
 import { SettingsScreen } from './screens/SettingsScreen';
+import { MeshScreen } from './screens/MeshScreen';
+import { WireScreen } from './screens/WireScreen';
 
 export type RootStackParamList = {
   Main: undefined;
@@ -20,50 +22,24 @@ export type RootStackParamList = {
 export type TabParamList = {
   Nearby: undefined;
   Conversations: undefined;
+  Mesh: undefined;
+  Wire: undefined;
   Settings: undefined;
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 const Tab = createBottomTabNavigator<TabParamList>();
 
-function TabIcon({ label, focused }: { label: string; focused: boolean }) {
-  return <Text style={[styles.tabIcon, focused && styles.tabIconFocused]}>{label}</Text>;
-}
-
 function MainTabs() {
   return (
     <Tab.Navigator
-      screenOptions={{
-        headerShown: false,
-        tabBarStyle: styles.tabBar,
-        tabBarActiveTintColor: colors.primary,
-        tabBarInactiveTintColor: colors.textDim,
-        tabBarLabelStyle: styles.tabLabel,
-      }}>
-      <Tab.Screen
-        name="Nearby"
-        component={NearbyScreen}
-        options={{
-          tabBarLabel: 'scan',
-          tabBarIcon: ({ focused }) => <TabIcon label="[~]" focused={focused} />,
-        }}
-      />
-      <Tab.Screen
-        name="Conversations"
-        component={ConversationsScreen}
-        options={{
-          tabBarLabel: 'chats',
-          tabBarIcon: ({ focused }) => <TabIcon label="[>]" focused={focused} />,
-        }}
-      />
-      <Tab.Screen
-        name="Settings"
-        component={SettingsScreen}
-        options={{
-          tabBarLabel: 'config',
-          tabBarIcon: ({ focused }) => <TabIcon label="[*]" focused={focused} />,
-        }}
-      />
+      tabBar={props => <TabBar {...props} />}
+      screenOptions={{ headerShown: false }}>
+      <Tab.Screen name="Nearby" component={NearbyScreen} />
+      <Tab.Screen name="Conversations" component={ConversationsScreen} />
+      <Tab.Screen name="Mesh" component={MeshScreen} />
+      <Tab.Screen name="Wire" component={WireScreen} />
+      <Tab.Screen name="Settings" component={SettingsScreen} />
     </Tab.Navigator>
   );
 }
@@ -81,15 +57,3 @@ export function AppNavigator() {
     </Stack.Navigator>
   );
 }
-
-const styles = StyleSheet.create({
-  tabBar: {
-    backgroundColor: colors.bgSecondary,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
-    paddingTop: 6,
-  },
-  tabLabel: { fontFamily: fonts.mono, fontSize: fontSize.xs, letterSpacing: 1 },
-  tabIcon: { fontFamily: fonts.mono, fontSize: fontSize.md, color: colors.textDim },
-  tabIconFocused: { color: colors.primary },
-});

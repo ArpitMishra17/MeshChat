@@ -1,5 +1,15 @@
 import * as SQLite from 'expo-sqlite';
-import type { Identity, Peer, Conversation, Message, MessageStatus, OutboxEntry } from '../types';
+import type {
+  Identity,
+  Peer,
+  Conversation,
+  Message,
+  MessageKind,
+  MessageStatus,
+  MediaMeta,
+  OutboxEntry,
+  Reaction,
+} from '../types';
 import { generateMessageId, generateConversationId } from '../services/ids';
 
 let db: SQLite.SQLiteDatabase;
@@ -62,6 +72,11 @@ function initSchema() {
       created_at INTEGER NOT NULL,
       delivered_at INTEGER,
       hops INTEGER,
+      reply_to TEXT,
+      read_at INTEGER,
+      kind TEXT NOT NULL DEFAULT 'text',
+      attachment_uri TEXT,
+      attachment_meta TEXT,
       FOREIGN KEY (conversation_id) REFERENCES conversations(id)
     );
   `);
@@ -86,6 +101,16 @@ function initSchema() {
       next_retry_at INTEGER NOT NULL,
       created_at INTEGER NOT NULL,
       FOREIGN KEY (message_id) REFERENCES messages(id)
+    );
+  `);
+
+  db.execSync(`
+    CREATE TABLE IF NOT EXISTS reactions (
+      message_id TEXT NOT NULL,
+      reactor_device_id TEXT NOT NULL,
+      emoji TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (message_id, reactor_device_id)
     );
   `);
 }
@@ -121,6 +146,13 @@ function initSchema() {
  * v7 adds `conversations.last_read_at`, the per-thread read marker behind the
  * unread badges. Existing threads are stamped "read now" so upgrading does not
  * flag the whole history as unread.
+ *
+ * v8 (features batch) adds reply-to, read receipts, media attachments and
+ * reactions. `messages` gains `reply_to`, `read_at`, `kind`, `attachment_uri`
+ * and `attachment_meta` (JSON of MediaMeta); `kind` is NOT NULL DEFAULT 'text'
+ * so existing rows read as plain text and everything else stays NULL. The new
+ * `reactions` table is additive. Each ALTER is guarded by PRAGMA table_info so
+ * a partially-applied or already-current table is not altered twice.
  */
 function runMigrations() {
   const versionRow = db.getAllSync<{ user_version: number }>('PRAGMA user_version');
@@ -184,6 +216,30 @@ function runMigrations() {
       db.runSync('UPDATE conversations SET last_read_at = ?', [Date.now()]);
     }
     version = 7;
+  }
+
+  if (version < 8) {
+    // Like v7, only ALTER when the table exists; on a fresh DB initSchema
+    // creates `messages` with these columns already in place.
+    const cols = db.getAllSync<{ name: string }>('PRAGMA table_info(messages)');
+    if (cols.length > 0) {
+      const has = (name: string) => cols.some(c => c.name === name);
+      if (!has('reply_to')) db.execSync('ALTER TABLE messages ADD COLUMN reply_to TEXT');
+      if (!has('read_at')) db.execSync('ALTER TABLE messages ADD COLUMN read_at INTEGER');
+      if (!has('kind')) db.execSync("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'");
+      if (!has('attachment_uri')) db.execSync('ALTER TABLE messages ADD COLUMN attachment_uri TEXT');
+      if (!has('attachment_meta')) db.execSync('ALTER TABLE messages ADD COLUMN attachment_meta TEXT');
+    }
+    db.execSync(`
+      CREATE TABLE IF NOT EXISTS reactions (
+        message_id TEXT NOT NULL,
+        reactor_device_id TEXT NOT NULL,
+        emoji TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (message_id, reactor_device_id)
+      )
+    `);
+    version = 8;
   }
 
   db.runSync(`PRAGMA user_version = ${version}`);
@@ -390,6 +446,113 @@ function updateConversationLastMessage(
 
 // --- Messages ---
 
+/** Chat-list preview. Captionless media gets a label so the thread row is not blank. */
+function previewFor(text: string, kind: MessageKind): string {
+  if (text.length > 0) return text;
+  if (kind === 'image') return '📷 Photo';
+  if (kind === 'audio') return '🎤 Voice message';
+  return text;
+}
+
+/**
+ * `attachment_meta` is JSON written by us, but a corrupt or hand-edited value
+ * must not crash the thread view, so anything that isn't a recognisable
+ * MediaMeta collapses to null.
+ */
+function parseMediaMeta(raw: unknown): MediaMeta | null {
+  if (typeof raw !== 'string' || raw.length === 0) return null;
+  try {
+    const v = JSON.parse(raw);
+    if (
+      v && typeof v === 'object' &&
+      (v.kind === 'image' || v.kind === 'audio') &&
+      typeof v.size === 'number' &&
+      typeof v.chunks === 'number' &&
+      typeof v.mime === 'string'
+    ) {
+      return v as MediaMeta;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function mapMessageRow(row: any): Message {
+  return {
+    id: row.id,
+    conversationId: row.conversation_id,
+    senderDeviceId: row.sender_device_id,
+    text: row.text,
+    status: row.status as MessageStatus,
+    createdAt: row.created_at,
+    deliveredAt: row.delivered_at ?? null,
+    hops: row.hops ?? null,
+    replyTo: row.reply_to ?? null,
+    readAt: row.read_at ?? null,
+    kind: (row.kind ?? 'text') as MessageKind,
+    attachmentUri: row.attachment_uri ?? null,
+    attachmentMeta: parseMediaMeta(row.attachment_meta),
+  };
+}
+
+export function insertMessageEx(o: {
+  conversationId: string;
+  senderDeviceId: string;
+  text: string;
+  status: MessageStatus;
+  id?: string;
+  hops?: number | null;
+  replyTo?: string | null;
+  kind?: MessageKind;
+  attachmentUri?: string | null;
+  attachmentMeta?: MediaMeta | null;
+  createdAt?: number;
+}): Message {
+  const id = o.id || generateMessageId();
+  const now = o.createdAt ?? Date.now();
+  const hops = o.hops ?? null;
+  const replyTo = o.replyTo ?? null;
+  const kind: MessageKind = o.kind ?? 'text';
+  const attachmentUri = o.attachmentUri ?? null;
+  const attachmentMeta = o.attachmentMeta ?? null;
+  db.runSync(
+    `INSERT OR IGNORE INTO messages
+       (id, conversation_id, sender_device_id, text, status, created_at, hops,
+        reply_to, kind, attachment_uri, attachment_meta)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      id,
+      o.conversationId,
+      o.senderDeviceId,
+      o.text,
+      o.status,
+      now,
+      hops,
+      replyTo,
+      kind,
+      attachmentUri,
+      attachmentMeta ? JSON.stringify(attachmentMeta) : null,
+    ],
+  );
+  updateConversationLastMessage(o.conversationId, previewFor(o.text, kind), now);
+  return {
+    id,
+    conversationId: o.conversationId,
+    senderDeviceId: o.senderDeviceId,
+    text: o.text,
+    status: o.status,
+    createdAt: now,
+    deliveredAt: null,
+    hops,
+    replyTo,
+    readAt: null,
+    kind,
+    attachmentUri,
+    attachmentMeta,
+  };
+}
+
 export function insertMessage(
   conversationId: string,
   senderDeviceId: string,
@@ -398,14 +561,38 @@ export function insertMessage(
   messageId?: string,
   hops: number | null = null,
 ): Message {
-  const id = messageId || generateMessageId();
-  const now = Date.now();
-  db.runSync(
-    'INSERT OR IGNORE INTO messages (id, conversation_id, sender_device_id, text, status, created_at, hops) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    [id, conversationId, senderDeviceId, text, status, now, hops],
+  return insertMessageEx({ conversationId, senderDeviceId, text, status, id: messageId, hops });
+}
+
+export function getMessageById(id: string): Message | null {
+  const rows = db.getAllSync<any>('SELECT * FROM messages WHERE id = ? LIMIT 1', [id]);
+  return rows.length > 0 ? mapMessageRow(rows[0]) : null;
+}
+
+/**
+ * Remove a message everywhere it lives in the DB. The conversation preview is
+ * deliberately not recomputed: callers only delete locally and the thread list
+ * is refreshed on the next load.
+ */
+export function deleteMessage(id: string): { attachmentUri: string | null } | null {
+  const rows = db.getAllSync<{ attachment_uri: string | null }>(
+    'SELECT attachment_uri FROM messages WHERE id = ? LIMIT 1',
+    [id],
   );
-  updateConversationLastMessage(conversationId, text, now);
-  return { id, conversationId, senderDeviceId, text, status, createdAt: now, deliveredAt: null, hops };
+  if (rows.length === 0) return null;
+  db.withTransactionSync(() => {
+    db.runSync('DELETE FROM reactions WHERE message_id = ?', [id]);
+    db.runSync('DELETE FROM outbox WHERE message_id = ?', [id]);
+    db.runSync('DELETE FROM messages WHERE id = ?', [id]);
+  });
+  return { attachmentUri: rows[0].attachment_uri ?? null };
+}
+
+export function setMessageAttachment(id: string, uri: string, meta: MediaMeta): void {
+  db.runSync(
+    'UPDATE messages SET attachment_uri = ?, attachment_meta = ? WHERE id = ?',
+    [uri, JSON.stringify(meta), id],
+  );
 }
 
 export function updateMessageStatus(messageId: string, status: MessageStatus): void {
@@ -429,16 +616,7 @@ export function getMessages(conversationId: string): Message[] {
     'SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC',
     [conversationId],
   );
-  return rows.map(row => ({
-    id: row.id,
-    conversationId: row.conversation_id,
-    senderDeviceId: row.sender_device_id,
-    text: row.text,
-    status: row.status as MessageStatus,
-    createdAt: row.created_at,
-    deliveredAt: row.delivered_at ?? null,
-    hops: row.hops ?? null,
-  }));
+  return rows.map(mapMessageRow);
 }
 
 export function messageExists(messageId: string): boolean {
@@ -497,6 +675,10 @@ function mapOutboxRow(row: any): OutboxEntry {
     text: row.text,
     senderDeviceId: row.sender_device_id,
     conversationId: row.conversation_id,
+    replyTo: row.reply_to ?? null,
+    kind: (row.kind ?? 'text') as MessageKind,
+    attachmentUri: row.attachment_uri ?? null,
+    attachmentMeta: parseMediaMeta(row.attachment_meta),
   };
 }
 
@@ -540,7 +722,8 @@ export function removeFromOutbox(messageId: string): void {
 export function getDueOutboxEntries(now: number): OutboxEntry[] {
   const rows = db.getAllSync<any>(
     `SELECT o.message_id, o.dst_fingerprint, o.attempts, o.next_retry_at, o.created_at,
-            m.text, m.sender_device_id, m.conversation_id
+            m.text, m.sender_device_id, m.conversation_id,
+            m.reply_to, m.kind, m.attachment_uri, m.attachment_meta
      FROM outbox o JOIN messages m ON m.id = o.message_id
      WHERE o.next_retry_at <= ?
      ORDER BY o.created_at ASC`,
@@ -556,7 +739,8 @@ export function getDueOutboxEntries(now: number): OutboxEntry[] {
 export function getAllOutboxEntries(): OutboxEntry[] {
   const rows = db.getAllSync<any>(
     `SELECT o.message_id, o.dst_fingerprint, o.attempts, o.next_retry_at, o.created_at,
-            m.text, m.sender_device_id, m.conversation_id
+            m.text, m.sender_device_id, m.conversation_id,
+            m.reply_to, m.kind, m.attachment_uri, m.attachment_meta
      FROM outbox o JOIN messages m ON m.id = o.message_id
      ORDER BY o.created_at ASC`,
   );
@@ -611,6 +795,106 @@ export function markConversationRead(conversationId: string): void {
   db.runSync('UPDATE conversations SET last_read_at = ? WHERE id = ?', [Date.now(), conversationId]);
 }
 
+// --- Read receipts (features batch) ---
+//
+// `read_at` on an incoming row = when we viewed it; on an outgoing row = when
+// the peer reported reading it. Distinct from `conversations.last_read_at`,
+// which only drives the unread badge.
+
+/**
+ * Mark every unread incoming message in the thread as read now. Returns their
+ * ids (oldest first) so the caller can send a READ control packet back.
+ */
+export function markIncomingRead(conversationId: string, myFingerprintHex: string): string[] {
+  const rows = db.getAllSync<{ id: string }>(
+    `SELECT id FROM messages
+     WHERE conversation_id = ? AND sender_device_id != ? AND read_at IS NULL
+     ORDER BY created_at ASC`,
+    [conversationId, myFingerprintHex],
+  );
+  if (rows.length === 0) return [];
+  db.withTransactionSync(() => {
+    db.runSync(
+      `UPDATE messages SET read_at = ?
+       WHERE conversation_id = ? AND sender_device_id != ? AND read_at IS NULL`,
+      [Date.now(), conversationId, myFingerprintHex],
+    );
+  });
+  return rows.map(r => r.id);
+}
+
+/**
+ * The peer read these messages. Only rows NOT sent by the peer are touched, so
+ * a forged or misdirected READ cannot alter incoming rows. A message that
+ * reached `sent`/`queued`/`sending` is promoted to `delivered`, since reading
+ * implies the bytes arrived; its outbox row (if any) is dropped so the router
+ * does not resend it.
+ */
+export function markOutgoingRead(ids: string[]): void {
+  if (ids.length === 0) return;
+  const now = Date.now();
+  db.withTransactionSync(() => {
+    for (const id of ids) {
+      const rows = db.getAllSync<{ id: string }>(
+        `SELECT m.id FROM messages m JOIN conversations c ON c.id = m.conversation_id
+         WHERE m.id = ? AND m.sender_device_id != c.peer_device_id`,
+        [id],
+      );
+      if (rows.length === 0) continue;
+      db.runSync('UPDATE messages SET read_at = ? WHERE id = ? AND read_at IS NULL', [now, id]);
+      db.runSync(
+        `UPDATE messages SET status = 'delivered', delivered_at = ?
+         WHERE id = ? AND status IN ('sending', 'sent', 'queued')`,
+        [now, id],
+      );
+      db.runSync('DELETE FROM outbox WHERE message_id = ?', [id]);
+    }
+  });
+}
+
+// --- Reactions (features batch) ---
+
+/** One reaction per (message, reactor): a new emoji replaces the previous one. */
+export function upsertReaction(messageId: string, reactorDeviceId: string, emoji: string): void {
+  db.runSync(
+    `INSERT INTO reactions (message_id, reactor_device_id, emoji, created_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(message_id, reactor_device_id) DO UPDATE SET
+       emoji = excluded.emoji,
+       created_at = excluded.created_at`,
+    [messageId, reactorDeviceId, emoji, Date.now()],
+  );
+}
+
+export function removeReaction(messageId: string, reactorDeviceId: string): void {
+  db.runSync(
+    'DELETE FROM reactions WHERE message_id = ? AND reactor_device_id = ?',
+    [messageId, reactorDeviceId],
+  );
+}
+
+/** All reactions on messages in a thread, keyed by message id. */
+export function getReactionsForConversation(conversationId: string): Record<string, Reaction[]> {
+  const rows = db.getAllSync<any>(
+    `SELECT r.message_id, r.reactor_device_id, r.emoji, r.created_at
+     FROM reactions r JOIN messages m ON m.id = r.message_id
+     WHERE m.conversation_id = ?
+     ORDER BY r.created_at ASC`,
+    [conversationId],
+  );
+  const out: Record<string, Reaction[]> = {};
+  for (const r of rows) {
+    const reaction: Reaction = {
+      messageId: r.message_id,
+      reactorDeviceId: r.reactor_device_id,
+      emoji: r.emoji,
+      createdAt: r.created_at,
+    };
+    (out[r.message_id] ??= []).push(reaction);
+  }
+  return out;
+}
+
 export interface ConversationSummary {
   /** Messages from the peer newer than the thread's read marker. */
   unread: number;
@@ -660,7 +944,7 @@ export function getOutboxCount(): number {
 
 /** Row count per local table, for the settings storage panel. */
 export function getTableCounts(): { table: string; count: number }[] {
-  const tables = ['identity', 'peers', 'conversations', 'messages', 'outbox', 'settings'];
+  const tables = ['identity', 'peers', 'conversations', 'messages', 'outbox', 'settings', 'reactions'];
   return tables.map(table => ({
     table,
     // Table names come from the fixed list above, never user input.

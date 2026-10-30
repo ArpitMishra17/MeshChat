@@ -59,6 +59,43 @@ export interface Message {
    * relay, etc. Surfaced in the UI as "direct" or "via N relay(s)".
    */
   hops: number | null;
+  /** Id of the message this one quotes (reply-to), or null. */
+  replyTo: string | null;
+  /**
+   * Incoming: when we viewed it. Outgoing: when the peer reported reading it
+   * (READ control packet). null = not read / unknown.
+   */
+  readAt: number | null;
+  /** 'text' for normal messages; 'image' / 'audio' carry an attachment. */
+  kind: MessageKind;
+  /** file:// URI of the attachment on this device; null while still receiving. */
+  attachmentUri: string | null;
+  attachmentMeta: MediaMeta | null;
+}
+
+export type MessageKind = 'text' | MediaKind;
+export type MediaKind = 'image' | 'audio';
+
+/** Attachment descriptor carried in MESSAGE_EXT and stored (JSON) with the row. */
+export interface MediaMeta {
+  kind: MediaKind;
+  /** Total attachment size in bytes. */
+  size: number;
+  /** Number of TYPE_MEDIA chunks that follow the MESSAGE_EXT packet. */
+  chunks: number;
+  mime: string;
+  /** audio only */
+  durationMs?: number;
+  /** image only */
+  width?: number;
+  height?: number;
+}
+
+export interface Reaction {
+  messageId: string;
+  reactorDeviceId: string;
+  emoji: string;
+  createdAt: number;
 }
 
 /**
@@ -88,6 +125,26 @@ export interface MessagePayload {
   senderDisplayName: string;
   text: string;
   timestamp: number;
+  /** Optional extensions — when any is set the wire type is TYPE_MESSAGE_EXT. */
+  replyTo?: string;
+  media?: MediaMeta;
+}
+
+/**
+ * Small encrypted, unacknowledged, never-queued signals between two peers
+ * (TYPE_CTRL). Best effort: a lost one is simply lost.
+ */
+export type ControlPayload =
+  | { type: 'control'; sub: 'typing'; typing: boolean }
+  | { type: 'control'; sub: 'read'; ids: string[] }
+  | { type: 'control'; sub: 'reaction'; messageId: string; emoji: string; add: boolean };
+
+/** One slice of an attachment (TYPE_MEDIA). `index` is 0-based. */
+export interface MediaChunkPayload {
+  type: 'media';
+  messageId: string;
+  index: number;
+  data: Uint8Array;
 }
 
 export interface AckPayload {
@@ -125,7 +182,13 @@ export interface PositionPayload {
   timestamp: number;
 }
 
-export type BLEPayload = HandshakePayload | MessagePayload | AckPayload | PositionPayload;
+export type BLEPayload =
+  | HandshakePayload
+  | MessagePayload
+  | AckPayload
+  | PositionPayload
+  | ControlPayload
+  | MediaChunkPayload;
 
 /**
  * Phase 5 — an outbox row joined with its message, ready for (re)transmission.
@@ -141,4 +204,8 @@ export interface OutboxEntry {
   text: string;
   senderDeviceId: string;
   conversationId: string;
+  replyTo: string | null;
+  kind: MessageKind;
+  attachmentUri: string | null;
+  attachmentMeta: MediaMeta | null;
 }

@@ -72,7 +72,14 @@ class MeshManager {
 
     this.unsubs.push(
       bleService.scanResult.subscribe(p => this.onScanResult(p)),
-      bleService.linkUp.subscribe(() => this.neighborsChanged.emit()),
+      bleService.linkUp.subscribe(({ fingerprintHex }) => {
+        this.neighborsChanged.emit();
+        // The peer connected to us but we hold no central link to them: that
+        // direction is stuck with small fragments. Scan now so the next drain
+        // connects to them as a central too (large MTU, fast media transfer).
+        const n = bleService.getNeighbors().find(x => x.fingerprintHex === fingerprintHex);
+        if (n && n.hasPeripheral && !n.hasCentral) this.kickCycle();
+      }),
       bleService.linkDown.subscribe(() => {
         this.neighborsChanged.emit();
         // A link dropped — kick an immediate scan to refill the pool, in case

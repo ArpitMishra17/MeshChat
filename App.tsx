@@ -1,12 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import { StatusBar } from 'react-native';
 import { useFonts } from 'expo-font';
-import { NavigationContainer } from '@react-navigation/native';
+import { NavigationContainer, createNavigationContainerRef } from '@react-navigation/native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-import { AppNavigator } from './src/navigation';
+import { AppNavigator, type RootStackParamList } from './src/navigation';
 import { OnboardingScreen } from './src/screens/OnboardingScreen';
-import { getDB, getIdentity } from './src/db/database';
+import { getDB, getIdentity, getOrCreateConversation, getPeerByFingerprint } from './src/db/database';
 import { messageRouter } from './src/services/messageRouter';
+import { notifier } from './src/services/notifier';
 import { mesh } from './src/services/mesh';
 import { positionProvider } from './src/services/position';
 import { telemetry } from './src/services/telemetry';
@@ -30,6 +31,25 @@ const navTheme = {
   },
 };
 
+const navigationRef = createNavigationContainerRef<RootStackParamList>();
+// A notification tapped before the navigator exists (cold start, onboarding) is
+// parked here and flushed from NavigationContainer's onReady.
+let pendingChatOpen: { conversationId: string; peerDeviceId: string } | null = null;
+
+function openChatFromNotification(conversationId: string, peerDeviceId: string): void {
+  if (!navigationRef.isReady()) {
+    pendingChatOpen = { conversationId, peerDeviceId };
+    return;
+  }
+  const peer = getPeerByFingerprint(peerDeviceId);
+  const conv = getOrCreateConversation(peerDeviceId, peer?.displayName ?? 'peer');
+  navigationRef.navigate('Chat', {
+    conversationId: conv.id,
+    peerName: conv.peerDisplayName,
+    peerDeviceId: conv.peerDeviceId,
+  });
+}
+
 export default function App() {
   const [showOnboarding, setShowOnboarding] = useState<boolean | null>(null);
   // If the fonts fail to load we still render (system fallback) rather than
@@ -46,6 +66,8 @@ export default function App() {
     // is mounted. Also started after onboarding completes (below).
     if (identity) {
       messageRouter.start();
+      notifier.setOpenChatHandler(openChatFromNotification);
+      notifier.start();
       telemetry.start();
       // Phase 3 — start the neighbor manager: duty-cycled scan +
       // auto-connect keeps the link pool fed for multi-hop relaying.
@@ -61,6 +83,8 @@ export default function App() {
   useEffect(() => {
     if (showOnboarding === false) {
       messageRouter.start();
+      notifier.setOpenChatHandler(openChatFromNotification);
+      notifier.start();
       telemetry.start();
       mesh.start();
       void positionProvider.start();
@@ -81,7 +105,14 @@ export default function App() {
   return (
     <SafeAreaProvider>
       <StatusBar barStyle="light-content" backgroundColor={colors.bg} />
-      <NavigationContainer theme={navTheme}>
+      <NavigationContainer
+        ref={navigationRef}
+        theme={navTheme}
+        onReady={() => {
+          const pending = pendingChatOpen;
+          pendingChatOpen = null;
+          if (pending) openChatFromNotification(pending.conversationId, pending.peerDeviceId);
+        }}>
         <AppNavigator />
       </NavigationContainer>
     </SafeAreaProvider>

@@ -9,7 +9,7 @@ import { mesh, SCAN_MS, PAUSE_MS, MAX_CENTRAL_CONNECTIONS } from '../services/me
 import { HANDSHAKE_TIMEOUT_MS, POSITION_BEACON_MS, POSITION_TTL, REQUESTED_MTU } from '../services/ble';
 import { DEFAULT_TTL } from '../services/protocol';
 import { LOCATION_TTL_MS } from '../services/location';
-import { getTableCounts } from '../db/database';
+import { getBoolSetting, getTableCounts, setBoolSetting } from '../db/database';
 import { getLocationTable } from '../services/location';
 import { TerminalHeader } from '../components/TerminalHeader';
 import { BlockBar, Btn, Chip, Fingerprint, KV, Label, Panel, Rule, Toggle } from '../components/ui';
@@ -21,6 +21,9 @@ export function SettingsScreen() {
   const [saved, setSaved] = useState(false);
   const [gpsEnabled, setGpsEnabled] = useState(positionProvider.isEnabled());
   const [knownPositions, setKnownPositions] = useState(getLocationTable().size);
+  const [notifyEnabled, setNotifyEnabled] = useState(() => getBoolSetting('notifications_enabled', true));
+  const [hapticsEnabled, setHapticsEnabled] = useState(() => getBoolSetting('haptics_enabled', true));
+  const [readReceipts, setReadReceipts] = useState(() => getBoolSetting('read_receipts', true));
   const [, bump] = useState(0);
 
   // Table counts, link MTUs and the position table are read at render time, so
@@ -35,6 +38,11 @@ export function SettingsScreen() {
     setGpsEnabled(value);
     await positionProvider.setEnabled(value);
     setKnownPositions(getLocationTable().size);
+  };
+
+  const toggleSetting = (key: string, set: (v: boolean) => void) => (value: boolean) => {
+    set(value);
+    setBoolSetting(key, value);
   };
 
   const handleSave = () => {
@@ -87,6 +95,35 @@ export function SettingsScreen() {
               />
               <Btn label={saved ? 'ok' : 'save'} onPress={handleSave} tone={saved ? 'on' : 'default'} style={styles.save} />
             </View>
+          </View>
+        </Panel>
+
+        <Rule title="messages" />
+
+        <Panel title="alerts" right={notifyEnabled ? '[ on ]' : '[ off ]'} variant={notifyEnabled ? 'hot' : 'default'}>
+          <View style={styles.toggleRow}>
+            <View style={{ flex: 1 }}>
+              <Label>notifications</Label>
+              <Text style={styles.tip}>banner when the app is in the background or another chat is open.</Text>
+            </View>
+            <Toggle
+              value={notifyEnabled}
+              onValueChange={toggleSetting('notifications_enabled', setNotifyEnabled)}
+            />
+          </View>
+          <View style={styles.toggleRow}>
+            <View style={{ flex: 1 }}>
+              <Label>haptics</Label>
+              <Text style={styles.tip}>a tick when a message lands while you are in the app.</Text>
+            </View>
+            <Toggle value={hapticsEnabled} onValueChange={toggleSetting('haptics_enabled', setHapticsEnabled)} />
+          </View>
+          <View style={[styles.toggleRow, { marginBottom: 0 }]}>
+            <View style={{ flex: 1 }}>
+              <Label>read receipts</Label>
+              <Text style={styles.tip}>tell peers when you have read their messages.</Text>
+            </View>
+            <Toggle value={readReceipts} onValueChange={toggleSetting('read_receipts', setReadReceipts)} />
           </View>
         </Panel>
 

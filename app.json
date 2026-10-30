@@ -75,7 +75,8 @@
         {
           "microphonePermission": "MeshChat records voice messages you choose to send."
         }
-      ]
+      ],
+      "expo-asset"
     ],
     "extra": {
       "eas": {

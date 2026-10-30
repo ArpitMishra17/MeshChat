@@ -50,6 +50,13 @@ export const HANDSHAKE_TIMEOUT_MS = 8000;
 export const REQUESTED_MTU = 512;
 /** ble-plx ConnectionPriority.High: ~7.5-15 ms connection interval instead of ~30-50 ms. */
 const CONNECTION_PRIORITY_HIGH = 1;
+/** ble-plx BleErrorCode values that mean the central GATT link is unusable. */
+const BLE_ERR_OPERATION_START_FAILED = 4; // "Operation was rejected"
+const BLE_ERR_DEVICE_DISCONNECTED = 201;
+const BLE_ERR_DEVICE_NOT_CONNECTED = 205;
+/** Extra attempts for a rejected write before the link is declared stale. */
+const WRITE_REJECT_RETRIES = 2;
+const WRITE_REJECT_RETRY_DELAY_MS = 150;
 /** Phase 4 — POSITION beacon interval (PLAN.md: ~60 s while moving). */
 export const POSITION_BEACON_MS = 60_000;
 /** Phase 4 — TTL for POSITION beacons (broadcast, a few hops). */
@@ -179,7 +186,7 @@ class BLEService {
    * `sendFragments` call for that transport; new sends chain onto it so the
    * fragments of two packets never interleave on the same GATT link.
    */
-  private sendQueues = new Map<string, Promise<void>>();
+  private sendQueues = new Map<string, Promise<unknown>>();
 
   /** Dedupe scan hits within a 2 s window (Android re-advertises aggressively). */
   private discoveredDevices = new Map<string, number>();
@@ -816,9 +823,9 @@ class BLEService {
    * table (a prior direct encounter). `ensurePeerKey` re-derives the shared
    * AES key from the stored pubkey if it isn't cached in memory.
    */
-  async sendMessage(message: MessagePayload, dstFingerprintHex: string): Promise<void> {
+  async sendMessage(message: MessagePayload, dstFingerprintHex: string): Promise<boolean> {
     const packet = this.buildMessagePacket(message, dstFingerprintHex);
-    await this.broadcastPacket(packet);
+    return this.broadcastPacket(packet);
   }
 
   /**
@@ -869,7 +876,9 @@ class BLEService {
       const packet = this.buildEncryptedPacket(
         TYPE_MEDIA, encodeBody(chunk), dstFingerprintHex, DEFAULT_TTL,
       );
-      await this.broadcastPacket(packet);
+      if (!(await this.broadcastPacket(packet))) {
+        throw new Error(`media chunk ${index + 1}/${chunks.length} could not be sent`);
+      }
       onProgress?.(index + 1, chunks.length);
     }
   }
@@ -884,24 +893,36 @@ class BLEService {
    * (known MTU, often 512) gets bigger chunks than the peripheral side
    * (unknown MTU → default 18-byte chunks).
    */
-  async broadcastPacket(packetBytes: Uint8Array, excludeTransportKey?: string): Promise<void> {
+  async broadcastPacket(packetBytes: Uint8Array, excludeTransportKey?: string): Promise<boolean> {
     const type = packetBytes[1];
     const charUUID = this.charForType(type);
     if (!charUUID) {
       console.warn(`[BLE] broadcastPacket: unknown packet type ${type}`);
-      return;
+      return false;
     }
 
-    const sends: Promise<void>[] = [];
+    const sends: Promise<boolean>[] = [];
     for (const link of this.links.values()) {
       if (!link.established) continue;
-      const transport = this.preferredTransport(link);
-      if (!transport) continue;
       if (excludeTransportKey && this.transportMatches(link, excludeTransportKey)) continue;
-      const frags = fragmentPacket(packetBytes, transport.mtu ?? undefined);
-      sends.push(this.sendFragments(transport, charUUID, frags));
+      sends.push(this.sendToLink(link, charUUID, packetBytes));
     }
-    await Promise.all(sends);
+    // True when at least one link took the whole packet.
+    const results = await Promise.all(sends);
+    return results.some(Boolean);
+  }
+
+  /**
+   * Send one packet to one link, trying its transports in preference order. A
+   * transport that fails (e.g. a stale central connection) falls through to
+   * the other side of the link instead of losing the packet.
+   */
+  private async sendToLink(link: Link, charUUID: string, packetBytes: Uint8Array): Promise<boolean> {
+    for (const transport of this.transportsFor(link)) {
+      const frags = fragmentPacket(packetBytes, transport.mtu ?? undefined);
+      if (await this.sendFragments(transport, charUUID, frags)) return true;
+    }
+    return false;
   }
 
   /**
@@ -920,26 +941,23 @@ class BLEService {
   async sendToNeighbor(fingerprintHex: string, packetBytes: Uint8Array): Promise<boolean> {
     const link = this.links.get(fingerprintHex);
     if (!link || !link.established) return false;
-    const transport = this.preferredTransport(link);
-    if (!transport) return false;
     const type = packetBytes[1];
     const charUUID = this.charForType(type);
     if (!charUUID) return false;
-    const frags = fragmentPacket(packetBytes, transport.mtu ?? undefined);
-    await this.sendFragments(transport, charUUID, frags);
-    return true;
+    return this.sendToLink(link, charUUID, packetBytes);
   }
 
   /**
    * Queue `frags` behind any earlier send on the same transport. The returned
-   * promise never rejects: a failed send is logged and the chain moves on, so
-   * one bad write cannot poison later sends to that link.
+   * promise never rejects: it resolves true when every fragment was written
+   * and false when the send failed (logged), and the chain moves on, so one
+   * bad write cannot poison later sends to that link.
    */
   private sendFragments(
     transport: TransportRef,
     charUUID: string,
     frags: string[],
-  ): Promise<void> {
+  ): Promise<boolean> {
     const key = transport.kind === 'central'
       ? `c:${transport.bleId}`
       : `p:${transport.address}`;
@@ -957,7 +975,7 @@ class BLEService {
     transport: TransportRef,
     charUUID: string,
     frags: string[],
-  ): Promise<void> {
+  ): Promise<boolean> {
     // Large sends (media chunks) are logged so a slow transfer shows which
     // transport and MTU it actually used.
     const startedAt = Date.now();
@@ -970,7 +988,7 @@ class BLEService {
     try {
       if (transport.kind === 'central') {
         for (const frag of frags) {
-          await transport.device.writeCharacteristicWithResponseForService(SERVICE_UUID, charUUID, frag);
+          await this.writeCentralFragment(transport.device, charUUID, frag);
         }
       } else {
         for (const frag of frags) {
@@ -980,9 +998,52 @@ class BLEService {
       if (verbose) {
         console.log(`[BLE] sent ${frags.length} frags via ${transport.kind} in ${Date.now() - startedAt}ms`);
       }
+      return true;
     } catch (e: any) {
       console.warn(`[BLE] sendFragments (${transport.kind}) failed:`, e?.message ?? e);
+      if (transport.kind === 'central' && this.isStaleLinkError(e)) {
+        this.dropStaleCentral(transport.bleId);
+      }
+      return false;
     }
+  }
+
+  /**
+   * One central write. A rejected write is retried a couple of times first:
+   * Android refuses to start a GATT operation while another is in flight, which
+   * is transient, whereas a link that keeps rejecting is dead.
+   */
+  private async writeCentralFragment(device: Device, charUUID: string, frag: string): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await device.writeCharacteristicWithResponseForService(SERVICE_UUID, charUUID, frag);
+        return;
+      } catch (e: any) {
+        if (e?.errorCode !== BLE_ERR_OPERATION_START_FAILED || attempt >= WRITE_REJECT_RETRIES) throw e;
+        await new Promise<void>(resolve => setTimeout(resolve, WRITE_REJECT_RETRY_DELAY_MS));
+      }
+    }
+  }
+
+  private isStaleLinkError(e: any): boolean {
+    const code = e?.errorCode;
+    return code === BLE_ERR_OPERATION_START_FAILED
+      || code === BLE_ERR_DEVICE_DISCONNECTED
+      || code === BLE_ERR_DEVICE_NOT_CONNECTED;
+  }
+
+  /**
+   * A central connection that rejects writes is a zombie (typically the peer
+   * app restarted). Cancel it and detach it from its link right away, so sends
+   * fall back to the peripheral side and the mesh can reconnect on its next
+   * cycle instead of being blocked by "already connected".
+   */
+  private dropStaleCentral(bleId: string): void {
+    const central = this.centralConnections.get(bleId);
+    if (!central) return;
+    console.warn(`[BLE] Dropping stale central link ${bleId.slice(-8)}`);
+    central.device.cancelConnection().catch(() => {});
+    this.handleCentralDisconnected(bleId);
   }
 
   private charForType(type: number): string | null {
@@ -1005,8 +1066,15 @@ class BLEService {
   }
 
   private preferredTransport(link: Link): TransportRef | null {
-    // Prefer the central side (larger negotiated MTU → fewer fragments), unless
-    // the peripheral side reports a strictly larger MTU.
+    return this.transportsFor(link)[0] ?? null;
+  }
+
+  /**
+   * The link's usable transports, best first. The central side leads (writes
+   * with a known, larger MTU) unless it is stuck at the 23-byte default while
+   * the peripheral side has negotiated more.
+   */
+  private transportsFor(link: Link): TransportRef[] {
     const central: TransportRef | null = link.central
       ? { kind: 'central', bleId: link.central.bleId, device: link.central.device, mtu: link.central.mtu }
       : null;
@@ -1014,9 +1082,10 @@ class BLEService {
       ? { kind: 'peripheral', address: link.peripheralAddress, mtu: this.peripheralMtu(link.peripheralAddress) }
       : null;
     if (central && peripheral) {
-      return (peripheral.mtu ?? 0) > (central.mtu ?? 0) ? peripheral : central;
+      const peripheralFirst = (central.mtu ?? 0) <= 23 && (peripheral.mtu ?? 0) > 23;
+      return peripheralFirst ? [peripheral, central] : [central, peripheral];
     }
-    return central ?? peripheral;
+    return central ? [central] : peripheral ? [peripheral] : [];
   }
 
   /**

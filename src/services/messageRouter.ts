@@ -383,7 +383,10 @@ class MessageRouter {
       chunks = chunkBytes(bytes);
       if (chunks.length !== media.chunks) throw new Error('attachment chunk count does not match its descriptor');
     }
-    await bleService.sendMessage(payload, dstFingerprintHex);
+    const announced = await bleService.sendMessage(payload, dstFingerprintHex);
+    // A photo/voice announcement nobody received is useless: fail now so the
+    // retry path runs instead of streaming chunks into the void.
+    if (media && announced === false) throw new Error('could not send attachment announcement');
     if (chunks && media) {
       const messageId = payload.id;
       await bleService.sendMediaChunks(messageId, dstFingerprintHex, chunks, (done, total) => {

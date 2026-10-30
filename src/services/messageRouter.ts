@@ -49,6 +49,7 @@ import {
   deleteMessage,
   setMessageAttachment,
   updateMessageStatus,
+  markMessageSent,
   markMessageDelivered,
   markIncomingRead,
   markOutgoingRead,
@@ -223,6 +224,12 @@ class MessageRouter {
   };
   /** Phase 5 — periodic outbox drain/watchdog tick. */
   private outboxTimer: ReturnType<typeof setInterval> | null = null;
+  /** Message ids with a transmit in progress; never start a second one. */
+  private inFlight = new Set<string>();
+  /** Message id → when its last transmit finished; the ACK watchdog counts from here. */
+  private lastTransmitAt = new Map<string, number>();
+  /** Guards drainOutbox against overlapping runs (tick + linkUp). */
+  private draining = false;
   /** Feature batch — typing state for peers (remote) and throttle for our own signals. */
   private typing = new TypingTracker();
   /** Per-peer timers that emit `typingChanged` when an indicator lapses on its own. */
@@ -361,6 +368,26 @@ class MessageRouter {
     if (fields.replyTo) payload.replyTo = fields.replyTo;
     if (fields.media) payload.media = fields.media;
     return payload;
+  }
+
+  /**
+   * `transmitMessage` with bookkeeping: marks the id in flight (so the outbox
+   * tick cannot start a parallel resend) and records when it finished (so the
+   * ACK watchdog measures from the end of a long media transfer, not from
+   * when the message was composed).
+   */
+  private async transmitTracked(
+    payload: MessagePayload,
+    attachmentUri: string | null,
+    dstFingerprintHex: string,
+  ): Promise<void> {
+    this.inFlight.add(payload.id);
+    try {
+      await this.transmitMessage(payload, attachmentUri, dstFingerprintHex);
+    } finally {
+      this.inFlight.delete(payload.id);
+      this.lastTransmitAt.set(payload.id, Date.now());
+    }
   }
 
   /**
@@ -519,9 +546,10 @@ class MessageRouter {
       replyTo: msg.replyTo,
       media: msg.attachmentMeta,
     });
+    if (this.inFlight.has(msg.id)) return;
     try {
-      await this.transmitMessage(payload, msg.attachmentUri, dstFingerprintHex);
-      updateMessageStatus(msg.id, 'sent');
+      await this.transmitTracked(payload, msg.attachmentUri, dstFingerprintHex);
+      markMessageSent(msg.id);
       this.messagesChanged.emit();
     } catch (e: any) {
       console.warn('[router] send failed, queueing for retry:', e?.message ?? e);
@@ -554,9 +582,15 @@ class MessageRouter {
    * undelivered for too long so the backoff loop picks it up.
    */
   private escalateStuckSent(): void {
-    const stuck = getStuckSentMessages(this.myFingerprintHex, SENT_ACK_TIMEOUT_MS);
+    const now = Date.now();
+    const stuck = getStuckSentMessages(this.myFingerprintHex, SENT_ACK_TIMEOUT_MS).filter(m => {
+      if (this.inFlight.has(m.id)) return false;
+      const sentAt = this.lastTransmitAt.get(m.id);
+      return sentAt === undefined || now - sentAt >= SENT_ACK_TIMEOUT_MS;
+    });
     if (stuck.length === 0) return;
     for (const m of stuck) {
+      this.lastTransmitAt.delete(m.id);
       updateMessageStatus(m.id, 'queued');
       enqueueOutbox(m.id, m.dstFingerprintHex, 0, Date.now());
     }
@@ -571,10 +605,16 @@ class MessageRouter {
    */
   private async drainOutbox(opts: { onlyDue: boolean }): Promise<void> {
     if (bleService.getNeighbors().length === 0) return;
-    const now = Date.now();
-    const entries = opts.onlyDue ? getDueOutboxEntries(now) : getAllOutboxEntries();
-    for (const entry of entries) {
-      await this.retryOutboxEntry(entry, now);
+    if (this.draining) return;
+    this.draining = true;
+    try {
+      const now = Date.now();
+      const entries = opts.onlyDue ? getDueOutboxEntries(now) : getAllOutboxEntries();
+      for (const entry of entries) {
+        await this.retryOutboxEntry(entry, now);
+      }
+    } finally {
+      this.draining = false;
     }
   }
 
@@ -594,9 +634,10 @@ class MessageRouter {
       replyTo: entry.replyTo,
       media: entry.attachmentMeta,
     });
+    if (this.inFlight.has(entry.messageId)) return;
     try {
-      await this.transmitMessage(payload, entry.attachmentUri, entry.dstFingerprintHex);
-      updateMessageStatus(entry.messageId, 'sent');
+      await this.transmitTracked(payload, entry.attachmentUri, entry.dstFingerprintHex);
+      markMessageSent(entry.messageId);
       removeFromOutbox(entry.messageId);
       this.messagesChanged.emit();
       this.conversationsChanged.emit();
@@ -997,6 +1038,7 @@ class MessageRouter {
     // P0.2 — ids are fixed-width and match what we stored, so this flips the
     // row's status (previously a no-op on a truncated id).
     markMessageDelivered(ack.messageId);
+    this.lastTransmitAt.delete(ack.messageId);
     // Phase 5 — defensive: the outbox row is normally already gone by the
     // time an ACK arrives (removed on successful send), but a stale entry
     // here would otherwise retry a message that's already been delivered.

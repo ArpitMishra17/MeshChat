@@ -600,6 +600,18 @@ export function updateMessageStatus(messageId: string, status: MessageStatus): v
 }
 
 /**
+ * Flip a message to `sent` after a transmit, unless its ACK already arrived.
+ * A long photo/voice transfer can be ACKed before the send call returns;
+ * overwriting `delivered` with `sent` made the watchdog resend it forever.
+ */
+export function markMessageSent(messageId: string): void {
+  db.runSync(
+    "UPDATE messages SET status = 'sent' WHERE id = ? AND status != 'delivered'",
+    [messageId],
+  );
+}
+
+/**
  * P0.5 — Flip a message to `delivered` and stamp the delivery time. Distinct
  * from `updateMessageStatus` so the delivered_at column is only ever written
  * here, alongside the status transition that warrants it.

@@ -33,6 +33,9 @@ import {
   TYPE_MESSAGE,
   TYPE_ACK,
   TYPE_POSITION,
+  TYPE_CTRL,
+  TYPE_MESSAGE_EXT,
+  TYPE_MEDIA,
   FLAG_FLOOD_MODE,
   FINGERPRINT_SIZE,
 } from './protocol';
@@ -170,10 +173,14 @@ export function decideRelay(
   // Only MESSAGE, ACK, and POSITION are routable. Any other type (SYNC_* is
   // Phase 6) is dropped by the protocol layer before reaching here, but be
   // defensive.
+  // The features-batch types route exactly like MESSAGE (unicast to dst).
   if (
     header.type !== TYPE_MESSAGE &&
     header.type !== TYPE_ACK &&
-    header.type !== TYPE_POSITION
+    header.type !== TYPE_POSITION &&
+    header.type !== TYPE_CTRL &&
+    header.type !== TYPE_MESSAGE_EXT &&
+    header.type !== TYPE_MEDIA
   ) {
     return { action: 'ignore' };
   }

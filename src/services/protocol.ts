@@ -24,6 +24,9 @@
  *   0x04 POSITION    position beacon (Phase 4, reserved now)
  *   0x05 SYNC_OFFER  history sync (Phase 6, reserved now)
  *   0x06 SYNC_REQ    history sync (Phase 6, reserved now)
+ *   0x07 CTRL        typing / read / reaction signals (best effort, never ACKed)
+ *   0x08 MESSAGE_EXT MESSAGE + reply-to and/or attachment descriptor
+ *   0x09 MEDIA       one chunk of an attachment
  *
  * Version negotiation: a v2 node receiving a v1 packet whose first byte is
  * 0x01 (v1 HANDSHAKE) or 0x03 (v1 ACK) sees version != 0x02 and drops it. A
@@ -49,6 +52,10 @@ import type {
   MessagePayload,
   AckPayload,
   PositionPayload,
+  ControlPayload,
+  MediaChunkPayload,
+  MediaKind,
+  MediaMeta,
 } from '../types';
 
 // --- Protocol constants ---
@@ -62,6 +69,14 @@ export const TYPE_ACK = 0x03;
 export const TYPE_POSITION = 0x04;      // Phase 4 — geo position beacon
 export const TYPE_SYNC_OFFER = 0x05;    // reserved — Phase 6
 export const TYPE_SYNC_REQ = 0x06;      // reserved — Phase 6
+export const TYPE_CTRL = 0x07;          // typing / read / reaction signals (encrypted, best effort)
+export const TYPE_MESSAGE_EXT = 0x08;   // MESSAGE + reply-to and/or attachment descriptor
+export const TYPE_MEDIA = 0x09;         // one chunk of an attachment
+
+/** Attachment chunk size; keeps a chunk packet under the 255-fragment limit even at the 18-byte fallback chunk size. */
+export const MEDIA_CHUNK_BYTES = 2800;
+export const MAX_MEDIA_BYTES = 80 * 1024;
+export const MAX_READ_IDS_PER_PACKET = 8;
 
 export const FLAG_ENCRYPTED = 0x01;     // Phase 2
 export const FLAG_HAS_POSITION = 0x02;  // Phase 4 — HELLO/POSITION carry geo coords
@@ -216,6 +231,7 @@ export function encodeBody(payload: BLEPayload): Uint8Array {
       return out;
     }
     case 'message': {
+      if (hasMessageExt(payload)) return encodeMessageExtBody(payload);
       // P0.2 — ids are wire-safe 16-hex-char strings, never truncated.
       // Phase 2 — this body is encrypted end-to-end before framing; the
       // encrypted bytes become the packet payload (see encodeRawPacket).
@@ -249,6 +265,10 @@ export function encodeBody(payload: BLEPayload): Uint8Array {
       // Phase 4 — [latE6: 4 signed BE][lonE6: 4 signed BE][timestamp: 8 BE].
       return encodePositionBlock(payload);
     }
+    case 'control':
+      return encodeControlBody(payload);
+    case 'media':
+      return encodeMediaBody(payload);
   }
 }
 
@@ -309,6 +329,12 @@ export function decodeBody(type: number, bytes: Uint8Array): BLEPayload {
       }
       return decodePositionBlock(bytes);
     }
+    case TYPE_MESSAGE_EXT:
+      return decodeMessageExtBody(bytes);
+    case TYPE_CTRL:
+      return decodeControlBody(bytes);
+    case TYPE_MEDIA:
+      return decodeMediaBody(bytes);
     default:
       throw new ProtocolError(
         `Unsupported/reserved packet type: 0x${type.toString(16)}`,
@@ -319,10 +345,339 @@ export function decodeBody(type: number, bytes: Uint8Array): BLEPayload {
 function bodyType(payload: BLEPayload): number {
   switch (payload.type) {
     case 'handshake': return TYPE_HELLO;
-    case 'message': return TYPE_MESSAGE;
+    case 'message': return hasMessageExt(payload) ? TYPE_MESSAGE_EXT : TYPE_MESSAGE;
     case 'ack': return TYPE_ACK;
     case 'position': return TYPE_POSITION;
+    case 'control': return TYPE_CTRL;
+    case 'media': return TYPE_MEDIA;
   }
+}
+
+// --- Features batch: CTRL / MESSAGE_EXT / MEDIA bodies ---
+//
+// The new bodies are parsed with BodyReader, which bounds-checks every read
+// and throws ProtocolError instead of returning undefined / NaN. The legacy
+// MESSAGE / ACK decoders are deliberately left on their original code path so
+// existing bytes and behaviour do not change.
+
+const EXT_FLAG_REPLY = 0x01;
+const EXT_FLAG_MEDIA = 0x04;
+const EXT_KNOWN_FLAGS = EXT_FLAG_REPLY | EXT_FLAG_MEDIA;
+
+const MEDIA_KIND_IMAGE = 1;
+const MEDIA_KIND_AUDIO = 2;
+
+const CTRL_TYPING = 0x01;
+const CTRL_READ = 0x02;
+const CTRL_REACTION = 0x03;
+
+const MAX_EMOJI_BYTES = 16;
+
+/** A MESSAGE needs the extended wire type when it carries reply-to or an attachment. */
+function hasMessageExt(payload: MessagePayload): boolean {
+  return !!payload.replyTo || !!payload.media;
+}
+
+class BodyReader {
+  private readonly buf: Uint8Array;
+  private readonly label: string;
+  private pos = 0;
+
+  constructor(buf: Uint8Array, label: string) {
+    this.buf = buf;
+    this.label = label;
+  }
+
+  get remaining(): number {
+    return this.buf.length - this.pos;
+  }
+
+  u8(what: string): number {
+    this.need(1, what);
+    return this.buf[this.pos++];
+  }
+
+  u16(what: string): number {
+    this.need(2, what);
+    const p = this.pos;
+    this.pos += 2;
+    return (this.buf[p] << 8) | this.buf[p + 1];
+  }
+
+  u32(what: string): number {
+    this.need(4, what);
+    const p = this.pos;
+    this.pos += 4;
+    // Multiply the high byte instead of shifting so the result stays unsigned.
+    return this.buf[p] * 0x1000000 + ((this.buf[p + 1] << 16) | (this.buf[p + 2] << 8) | this.buf[p + 3]);
+  }
+
+  bytes(n: number, what: string): Uint8Array {
+    this.need(n, what);
+    const out = this.buf.subarray(this.pos, this.pos + n);
+    this.pos += n;
+    return out;
+  }
+
+  /** 1-byte length prefix followed by UTF-8; `min` rejects empty ids. */
+  str8(what: string, min: number): string {
+    const len = this.u8(`${what} length`);
+    if (len < min) {
+      throw new ProtocolError(`${this.label}: ${what} must be at least ${min} byte(s), got ${len}`);
+    }
+    return bytesToStr(this.bytes(len, what));
+  }
+
+  rest(): Uint8Array {
+    const out = this.buf.subarray(this.pos);
+    this.pos = this.buf.length;
+    return out;
+  }
+
+  end(): void {
+    if (this.remaining !== 0) {
+      throw new ProtocolError(`${this.label}: ${this.remaining} unexpected trailing byte(s)`);
+    }
+  }
+
+  private need(n: number, what: string): void {
+    if (this.remaining < n) {
+      throw new ProtocolError(
+        `${this.label}: truncated ${what} (need ${n}, have ${this.remaining})`,
+      );
+    }
+  }
+}
+
+class BodyWriter {
+  private readonly parts: Uint8Array[] = [];
+  private size = 0;
+
+  u8(v: number, what: string): void {
+    this.uint(v, 1, what);
+  }
+
+  u16(v: number, what: string): void {
+    this.uint(v, 2, what);
+  }
+
+  u32(v: number, what: string): void {
+    this.uint(v, 4, what);
+  }
+
+  raw(bytes: Uint8Array): void {
+    this.parts.push(bytes);
+    this.size += bytes.length;
+  }
+
+  /** 1-byte length prefix followed by the bytes; `min` rejects empty ids. */
+  lenBytes(bytes: Uint8Array, what: string, min: number): void {
+    if (bytes.length < min || bytes.length > 0xff) {
+      throw new ProtocolError(`${what} must be ${min}..255 bytes, got ${bytes.length}`);
+    }
+    this.u8(bytes.length, `${what} length`);
+    this.raw(bytes);
+  }
+
+  toBytes(): Uint8Array {
+    const out = new Uint8Array(this.size);
+    let p = 0;
+    for (const part of this.parts) {
+      out.set(part, p);
+      p += part.length;
+    }
+    return out;
+  }
+
+  private uint(v: number, width: number, what: string): void {
+    const max = Math.pow(2, 8 * width) - 1;
+    if (!Number.isInteger(v) || v < 0 || v > max) {
+      throw new ProtocolError(`${what} out of range: ${v}`);
+    }
+    const out = new Uint8Array(width);
+    let rem = v;
+    for (let i = width - 1; i >= 0; i--) {
+      out[i] = rem % 256;
+      rem = Math.floor(rem / 256);
+    }
+    this.raw(out);
+  }
+}
+
+function encodeMessageExtBody(payload: MessagePayload): Uint8Array {
+  const w = new BodyWriter();
+  w.lenBytes(strToBytes(payload.id), 'message id', 1);
+  w.lenBytes(strToBytes(payload.senderDeviceId), 'sender id', 0);
+  w.lenBytes(strToBytes(payload.senderDisplayName), 'sender name', 0);
+  let flags = 0;
+  if (payload.replyTo) flags |= EXT_FLAG_REPLY;
+  if (payload.media) flags |= EXT_FLAG_MEDIA;
+  w.u8(flags, 'extFlags');
+  if (payload.replyTo) w.lenBytes(strToBytes(payload.replyTo), 'replyTo id', 1);
+  if (payload.media) writeMediaMeta(w, payload.media);
+  // Text is the un-prefixed tail, so it may be empty (media-only message).
+  w.raw(strToBytes(payload.text));
+  return w.toBytes();
+}
+
+function decodeMessageExtBody(bytes: Uint8Array): MessagePayload {
+  const r = new BodyReader(bytes, 'MESSAGE_EXT');
+  const id = r.str8('message id', 1);
+  const senderDeviceId = r.str8('sender id', 0);
+  const senderDisplayName = r.str8('sender name', 0);
+  const flags = r.u8('extFlags');
+  if ((flags & ~EXT_KNOWN_FLAGS) !== 0) {
+    throw new ProtocolError(`MESSAGE_EXT: unknown extFlags 0x${flags.toString(16)}`);
+  }
+  const msg: MessagePayload = {
+    type: 'message',
+    id,
+    senderDeviceId,
+    senderDisplayName,
+    text: '',
+    timestamp: Date.now(),
+  };
+  if (flags & EXT_FLAG_REPLY) msg.replyTo = r.str8('replyTo id', 1);
+  if (flags & EXT_FLAG_MEDIA) msg.media = readMediaMeta(r);
+  msg.text = bytesToStr(r.rest());
+  return msg;
+}
+
+function writeMediaMeta(w: BodyWriter, meta: MediaMeta): void {
+  let kindCode: number;
+  if (meta.kind === 'image') kindCode = MEDIA_KIND_IMAGE;
+  else if (meta.kind === 'audio') kindCode = MEDIA_KIND_AUDIO;
+  else throw new ProtocolError(`unknown media kind: ${String(meta.kind)}`);
+  if (!(meta.size >= 1)) throw new ProtocolError(`media size must be >= 1, got ${meta.size}`);
+  if (!(meta.chunks >= 1)) throw new ProtocolError(`media chunks must be >= 1, got ${meta.chunks}`);
+  w.u8(kindCode, 'media kind');
+  w.u32(meta.size, 'media size');
+  w.u16(meta.chunks, 'media chunks');
+  w.lenBytes(strToBytes(meta.mime), 'media mime', 1);
+  // Optional fields are always present on the wire; 0 means "not applicable".
+  w.u32(meta.durationMs ?? 0, 'media durationMs');
+  w.u16(meta.width ?? 0, 'media width');
+  w.u16(meta.height ?? 0, 'media height');
+}
+
+function readMediaMeta(r: BodyReader): MediaMeta {
+  const kindCode = r.u8('media kind');
+  let kind: MediaKind;
+  if (kindCode === MEDIA_KIND_IMAGE) kind = 'image';
+  else if (kindCode === MEDIA_KIND_AUDIO) kind = 'audio';
+  else throw new ProtocolError(`unknown media kind code: ${kindCode}`);
+  const size = r.u32('media size');
+  if (size === 0) throw new ProtocolError('media size must be >= 1');
+  const chunks = r.u16('media chunks');
+  if (chunks === 0) throw new ProtocolError('media chunks must be >= 1');
+  const mime = r.str8('media mime', 1);
+  const durationMs = r.u32('media durationMs');
+  const width = r.u16('media width');
+  const height = r.u16('media height');
+  const meta: MediaMeta = { kind, size, chunks, mime };
+  if (durationMs > 0) meta.durationMs = durationMs;
+  if (width > 0) meta.width = width;
+  if (height > 0) meta.height = height;
+  return meta;
+}
+
+function encodeControlBody(payload: ControlPayload): Uint8Array {
+  const w = new BodyWriter();
+  switch (payload.sub) {
+    case 'typing':
+      w.u8(CTRL_TYPING, 'ctrl sub');
+      w.u8(payload.typing ? 1 : 0, 'typing state');
+      return w.toBytes();
+    case 'read':
+      if (payload.ids.length < 1 || payload.ids.length > MAX_READ_IDS_PER_PACKET) {
+        throw new ProtocolError(
+          `read receipt must carry 1..${MAX_READ_IDS_PER_PACKET} ids, got ${payload.ids.length}`,
+        );
+      }
+      w.u8(CTRL_READ, 'ctrl sub');
+      w.u8(payload.ids.length, 'read count');
+      for (const id of payload.ids) w.lenBytes(strToBytes(id), 'read id', 1);
+      return w.toBytes();
+    case 'reaction': {
+      const emoji = strToBytes(payload.emoji);
+      if (emoji.length < 1 || emoji.length > MAX_EMOJI_BYTES) {
+        throw new ProtocolError(`emoji must be 1..${MAX_EMOJI_BYTES} bytes, got ${emoji.length}`);
+      }
+      w.u8(CTRL_REACTION, 'ctrl sub');
+      w.lenBytes(strToBytes(payload.messageId), 'reaction message id', 1);
+      w.u8(payload.add ? 1 : 0, 'reaction op');
+      w.raw(emoji);
+      return w.toBytes();
+    }
+    default:
+      throw new ProtocolError('unknown control sub-type');
+  }
+}
+
+function decodeControlBody(bytes: Uint8Array): ControlPayload {
+  const r = new BodyReader(bytes, 'CTRL');
+  const sub = r.u8('ctrl sub');
+  switch (sub) {
+    case CTRL_TYPING: {
+      const state = r.u8('typing state');
+      if (state > 1) throw new ProtocolError(`CTRL typing: invalid state ${state}`);
+      r.end();
+      return { type: 'control', sub: 'typing', typing: state === 1 };
+    }
+    case CTRL_READ: {
+      const n = r.u8('read count');
+      if (n < 1 || n > MAX_READ_IDS_PER_PACKET) {
+        throw new ProtocolError(`CTRL read: count ${n} outside 1..${MAX_READ_IDS_PER_PACKET}`);
+      }
+      const ids: string[] = [];
+      for (let i = 0; i < n; i++) ids.push(r.str8('read id', 1));
+      r.end();
+      return { type: 'control', sub: 'read', ids };
+    }
+    case CTRL_REACTION: {
+      const messageId = r.str8('reaction message id', 1);
+      const op = r.u8('reaction op');
+      if (op > 1) throw new ProtocolError(`CTRL reaction: invalid op ${op}`);
+      const emoji = r.rest();
+      if (emoji.length < 1 || emoji.length > MAX_EMOJI_BYTES) {
+        throw new ProtocolError(`CTRL reaction: emoji must be 1..${MAX_EMOJI_BYTES} bytes, got ${emoji.length}`);
+      }
+      return {
+        type: 'control',
+        sub: 'reaction',
+        messageId,
+        emoji: bytesToStr(emoji),
+        add: op === 1,
+      };
+    }
+    default:
+      throw new ProtocolError(`unknown CTRL sub-type: 0x${sub.toString(16)}`);
+  }
+}
+
+function encodeMediaBody(payload: MediaChunkPayload): Uint8Array {
+  if (payload.data.length < 1 || payload.data.length > MEDIA_CHUNK_BYTES) {
+    throw new ProtocolError(
+      `media chunk must be 1..${MEDIA_CHUNK_BYTES} bytes, got ${payload.data.length}`,
+    );
+  }
+  const w = new BodyWriter();
+  w.lenBytes(strToBytes(payload.messageId), 'media message id', 1);
+  w.u16(payload.index, 'media chunk index');
+  w.raw(payload.data);
+  return w.toBytes();
+}
+
+function decodeMediaBody(bytes: Uint8Array): MediaChunkPayload {
+  const r = new BodyReader(bytes, 'MEDIA');
+  const messageId = r.str8('media message id', 1);
+  const index = r.u16('media chunk index');
+  const data = r.rest();
+  if (data.length < 1 || data.length > MEDIA_CHUNK_BYTES) {
+    throw new ProtocolError(`MEDIA: chunk must be 1..${MEDIA_CHUNK_BYTES} bytes, got ${data.length}`);
+  }
+  // Copy so a stored chunk does not pin the whole BLE packet buffer.
+  return { type: 'media', messageId, index, data: data.slice() };
 }
 
 // --- Phase 4: position block (shared by HELLO and POSITION) ---

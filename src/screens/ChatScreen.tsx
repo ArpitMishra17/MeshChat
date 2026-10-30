@@ -196,16 +196,17 @@ export function ChatScreen({ route, navigation }: Props) {
     const caption = input.trim();
     const quotedId = replyTo?.id ?? null;
     try {
-      // Images only, no system crop, full quality: prepareImage does the downscale.
+      // Images only, no system crop. quality 0.7: prepareImage re-encodes anyway, so full quality is wasted work.
       const picked = await launchImageLibraryAsync({
         mediaTypes: ['images'],
         allowsEditing: false,
-        quality: 1,
+        quality: 0.7,
       });
       if (picked.canceled) return;
-      const uri = picked.assets[0]?.uri;
+      const asset = picked.assets[0];
+      const uri = asset?.uri;
       if (!uri) return;
-      const media = await prepareImage(uri);
+      const media = await prepareImage(uri, { width: asset.width, height: asset.height });
       sendPrepared(media, caption, quotedId);
     } catch (e: any) {
       Alert.alert('Photo not sent', e?.message ?? 'The photo could not be prepared.');

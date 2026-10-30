@@ -11,7 +11,7 @@ import { MAX_MEDIA_BYTES, MEDIA_CHUNK_BYTES } from './protocol';
 
 const IMAGE_MAX_SIDE = 640;
 /** Tried in order until the JPEG fits MAX_MEDIA_BYTES. */
-const IMAGE_QUALITY_LADDER = [0.55, 0.45, 0.35, 0.25];
+const IMAGE_QUALITY_LADDER = [0.5, 0.35, 0.25];
 
 export const MAX_VOICE_MS = 20_000;
 
@@ -86,16 +86,21 @@ function extOf(uri: string): string {
   return m ? m[1].toLowerCase() : '';
 }
 
-/** Downscale (longest side <= 640), JPEG-compress, and return bytes plus meta. */
-export async function prepareImage(pickerUri: string): Promise<{ bytes: Uint8Array; meta: MediaMeta }> {
-  // The first render gives the true dimensions; the second works from that
-  // decoded image so the source is not decoded twice from the picker file.
-  const original = await ImageManipulator.manipulate(pickerUri).renderAsync();
-  const longest = Math.max(original.width, original.height);
-
-  let ctx = ImageManipulator.manipulate(original);
-  if (longest > IMAGE_MAX_SIDE) {
-    ctx = ctx.resize(original.width >= original.height ? { width: IMAGE_MAX_SIDE } : { height: IMAGE_MAX_SIDE });
+/**
+ * Downscale (longest side <= 640), JPEG-compress, and return bytes plus meta.
+ * `size` is the picker's dimensions; without it the image is decoded once extra to measure.
+ */
+export async function prepareImage(pickerUri: string, size?: { width: number; height: number }): Promise<{ bytes: Uint8Array; meta: MediaMeta }> {
+  let ctx = ImageManipulator.manipulate(pickerUri);
+  let dims = size;
+  if (!dims || dims.width <= 0 || dims.height <= 0) {
+    // Decode once for the true dimensions; resize from that decoded image so the source is not decoded twice.
+    const original = await ctx.renderAsync();
+    dims = original;
+    ctx = ImageManipulator.manipulate(original);
+  }
+  if (Math.max(dims.width, dims.height) > IMAGE_MAX_SIDE) {
+    ctx = ctx.resize(dims.width >= dims.height ? { width: IMAGE_MAX_SIDE } : { height: IMAGE_MAX_SIDE });
   }
   const rendered = await ctx.renderAsync();
 

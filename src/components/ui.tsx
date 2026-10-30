@@ -198,11 +198,16 @@ export function Meter({ rssi }: { rssi: number | null }) {
   );
 }
 
-/** queued → sending → sent → delivered, four-step ladder. */
-export function Ladder({ status }: { status: MessageStatus }) {
+/**
+ * queued → sending → sent → delivered, four-step ladder. `read` (only meaningful
+ * for `delivered`) recolours the ladder cyan and is announced as "read".
+ */
+export function Ladder({ status, read = false }: { status: MessageStatus; read?: boolean }) {
+  const isRead = read && status === 'delivered';
+  const label = isRead ? 'read' : status;
   if (status === 'failed') {
     return (
-      <View style={s.ladder}>
+      <View style={s.ladder} accessible accessibilityLabel={`status ${label}`}>
         {[0, 1, 2, 3].map(i => <View key={i} style={[s.ladderStep, { backgroundColor: colors.error }]} />)}
       </View>
     );
@@ -210,15 +215,17 @@ export function Ladder({ status }: { status: MessageStatus }) {
   const cur = { queued: 1, sending: 2, sent: 3, delivered: 4 }[status];
   const queued = status === 'queued';
   return (
-    <View style={s.ladder}>
+    <View style={s.ladder} accessible accessibilityLabel={`status ${label}`}>
       {[0, 1, 2, 3].map(i => {
         const done = i < cur - 1;
         const now = i === cur - 1;
-        const bg = done
-          ? colors.primary
-          : now
-            ? queued ? colors.warning : colors.success
-            : colors.border;
+        const bg = isRead
+          ? colors.accent
+          : done
+            ? colors.primary
+            : now
+              ? queued ? colors.warning : colors.success
+              : colors.border;
         return (
           <View
             key={i}

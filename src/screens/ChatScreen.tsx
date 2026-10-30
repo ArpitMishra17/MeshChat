@@ -1,70 +1,200 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
-  View, Text, TextInput, Pressable, FlatList, StyleSheet,
+  View, Text, TextInput, Pressable, FlatList, StyleSheet, AppState, Alert,
   KeyboardAvoidingView, Platform,
 } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { setStringAsync } from 'expo-clipboard';
 import { colors, fonts } from '../theme';
 import { bleService } from '../services/ble';
 import type { BLEState } from '../services/ble';
 import { messageRouter } from '../services/messageRouter';
-import { getMessages, markConversationRead } from '../db/database';
+import { notifier } from '../services/notifier';
+import { getMessages, getReactionsForConversation } from '../db/database';
 import { ensureIdentity } from '../services/identity';
 import { MessageBubble } from '../components/MessageBubble';
+import { MessageActionSheet } from '../components/MessageActionSheet';
+import { ReplyBar, snippetOf } from '../components/ReplyBar';
+import { TypingIndicator } from '../components/TypingIndicator';
 import { StatusBadge } from '../components/StatusBadge';
 import { TerminalHeader } from '../components/TerminalHeader';
 import { Btn, Chip } from '../components/ui';
 import { DEFAULT_TTL } from '../services/protocol';
-import type { Message } from '../types';
+import type { Message, Reaction } from '../types';
 import type { RootStackParamList } from '../navigation';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Chat'>;
 
+/** How long auto-scroll-to-end yields after a quote jump, so the jump is not undone. */
+const QUOTE_SCROLL_HOLD_MS = 1000;
+
 export function ChatScreen({ route, navigation }: Props) {
   const { conversationId, peerName, peerDeviceId } = route.params;
   const [messages, setMessages] = useState<Message[]>([]);
+  const [reactions, setReactions] = useState<Record<string, Reaction[]>>({});
   const [input, setInput] = useState('');
+  const [replyTo, setReplyTo] = useState<Message | null>(null);
+  const [actionFor, setActionFor] = useState<Message | null>(null);
+  const [peerTyping, setPeerTyping] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const [appActive, setAppActive] = useState(AppState.currentState === 'active');
   const [bleState, setBleState] = useState<BLEState>(bleService.getState());
-  const flatListRef = useRef<FlatList>(null);
+  const flatListRef = useRef<FlatList<Message>>(null);
+  const inputRef = useRef<TextInput>(null);
+  // Mirrors `focused && appActive` for the refresh callback, which is subscribed once.
+  const viewingRef = useRef(false);
+  // True while the peer may still believe we are typing (we sent typing=1 and not yet typing=0).
+  const typingSentRef = useRef(false);
+  const quoteHoldUntilRef = useRef(0);
   const insets = useSafeAreaInsets();
   const myDeviceId = ensureIdentity().deviceId;
+  const viewing = focused && appActive;
 
   // P0.1 — read-only view over the DB. The MessageRouter owns all writes
-  // (incoming messages, ACK flips). We just re-query on its emits.
-  // Opening (or staying in) a thread marks it read, clearing its unread badge.
+  // (incoming messages, ACK flips, reactions). We just re-query on its emits.
   const refresh = useCallback(() => {
-    setMessages(getMessages(conversationId));
-    markConversationRead(conversationId);
+    const list = getMessages(conversationId);
+    setMessages(list);
+    setReactions(getReactionsForConversation(conversationId));
     messageRouter.conversationsChanged.emit();
-  }, [conversationId]);
+    // Only an unread incoming row warrants a seen call. markConversationSeen
+    // emits messagesChanged once, and the next pass finds nothing unread, so
+    // this cannot loop.
+    const hasUnread = list.some(m => m.senderDeviceId !== myDeviceId && m.readAt == null);
+    if (viewingRef.current && hasUnread) {
+      messageRouter.markConversationSeen(conversationId, peerDeviceId);
+    }
+  }, [conversationId, peerDeviceId, myDeviceId]);
 
   useEffect(() => {
     refresh();
     const unsubMessages = messageRouter.messagesChanged.subscribe(refresh);
     const unsubState = bleService.subscribeState(setBleState);
+    const syncTyping = () => setPeerTyping(messageRouter.isPeerTyping(peerDeviceId));
+    syncTyping();
+    const unsubTyping = messageRouter.typingChanged.subscribe(syncTyping);
     return () => {
       unsubMessages();
       unsubState();
+      unsubTyping();
     };
-  }, [refresh]);
+  }, [refresh, peerDeviceId]);
 
-  // P0.5 / Phase 5 — the router owns the whole send lifecycle: it inserts as
-  // 'sending', attempts the BLE send, and falls back to the outbox ('queued')
-  // on failure or no route. All status transitions after that (sent, queued,
-  // delivered, failed) arrive asynchronously via `messagesChanged`, so we
-  // only need the optimistic prepend here — `refresh()` picks up the rest.
+  // Focus drives the notifier (suppresses banners for this thread) and the
+  // seen state. Blur or unmount clears both and stops any typing signal.
+  useFocusEffect(useCallback(() => {
+    setFocused(true);
+    notifier.setActiveConversation(conversationId);
+    return () => {
+      setFocused(false);
+      notifier.setActiveConversation(null);
+      if (typingSentRef.current) {
+        typingSentRef.current = false;
+        messageRouter.notifyTyping(peerDeviceId, false);
+      }
+    };
+  }, [conversationId, peerDeviceId]));
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', state => setAppActive(state === 'active'));
+    return () => sub.remove();
+  }, []);
+
+  useEffect(() => {
+    viewingRef.current = viewing;
+    if (viewing) messageRouter.markConversationSeen(conversationId, peerDeviceId);
+  }, [viewing, conversationId, peerDeviceId]);
+
+  const signalTyping = useCallback((text: string) => {
+    if (text.length > 0) {
+      typingSentRef.current = true;
+      messageRouter.notifyTyping(peerDeviceId, true);
+    } else {
+      typingSentRef.current = false;
+      messageRouter.notifyTyping(peerDeviceId, false);
+    }
+  }, [peerDeviceId]);
+
+  const handleChangeText = useCallback((text: string) => {
+    setInput(text);
+    signalTyping(text);
+  }, [signalTyping]);
+
+  // P0.5 / Phase 5 — the router owns the whole send lifecycle. Status changes
+  // after the initial insert arrive via `messagesChanged`. The non-media send
+  // path does not emit synchronously, so we re-query right away. The list is
+  // replaced wholesale, so the new row cannot be duplicated and there is no
+  // empty-list flash.
   const handleSend = useCallback(() => {
     const text = input.trim();
     if (!text) return;
     setInput('');
-    const msg = messageRouter.sendMessage(conversationId, peerDeviceId, text);
-    setMessages(prev => [...prev, msg]);
-  }, [input, conversationId, peerDeviceId]);
+    typingSentRef.current = false;
+    messageRouter.notifyTyping(peerDeviceId, false);
+    const quoted = replyTo;
+    setReplyTo(null);
+    messageRouter.sendMessage(conversationId, peerDeviceId, text, quoted ? { replyTo: quoted.id } : undefined);
+    refresh();
+  }, [input, replyTo, conversationId, peerDeviceId, refresh]);
 
   const handleRetry = useCallback((message: Message) => {
     messageRouter.retryMessage(message, peerDeviceId);
   }, [peerDeviceId]);
+
+  const handleReaction = useCallback((message: Message, emoji: string) => {
+    messageRouter.toggleReaction(message.id, peerDeviceId, emoji);
+  }, [peerDeviceId]);
+
+  const scrollToMessage = useCallback((id: string) => {
+    const index = messages.findIndex(m => m.id === id);
+    if (index < 0) return;
+    quoteHoldUntilRef.current = Date.now() + QUOTE_SCROLL_HOLD_MS;
+    flatListRef.current?.scrollToIndex({ index, viewPosition: 0.5, animated: true });
+  }, [messages]);
+
+  const handleContentSizeChange = useCallback(() => {
+    if (Date.now() < quoteHoldUntilRef.current) return;
+    flatListRef.current?.scrollToEnd({ animated: true });
+  }, []);
+
+  // Action sheet handlers. Each one closes the sheet first.
+  const closeActions = useCallback(() => setActionFor(null), []);
+
+  const actionReact = useCallback((emoji: string) => {
+    if (actionFor) handleReaction(actionFor, emoji);
+    setActionFor(null);
+  }, [actionFor, handleReaction]);
+
+  const actionReply = useCallback(() => {
+    if (actionFor) setReplyTo(actionFor);
+    setActionFor(null);
+    inputRef.current?.focus();
+  }, [actionFor]);
+
+  const actionCopy = useCallback(() => {
+    if (actionFor) setStringAsync(actionFor.text).catch(() => undefined);
+    setActionFor(null);
+  }, [actionFor]);
+
+  const actionDelete = useCallback(() => {
+    const id = actionFor?.id;
+    setActionFor(null);
+    if (!id) return;
+    Alert.alert(
+      'Delete message?',
+      'It is removed from this device only. The other device keeps its copy.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Delete', style: 'destructive', onPress: () => messageRouter.deleteMessageLocal(id) },
+      ],
+    );
+  }, [actionFor]);
+
+  const myReaction = actionFor
+    ? reactions[actionFor.id]?.find(r => r.reactorDeviceId === myDeviceId)?.emoji ?? null
+    : null;
 
   // Keyboard offset = the header's actual height (safe-area top + its padding
   // + one line of content), so the composer clears the keyboard on iOS.
@@ -92,13 +222,30 @@ export function ChatScreen({ route, navigation }: Props) {
           const isMine = item.senderDeviceId === myDeviceId;
           return (
             <Pressable
-              disabled={item.status !== 'failed'}
-              onPress={() => handleRetry(item)}>
-              <MessageBubble message={item} isMine={isMine} />
+              onPress={item.status === 'failed' ? () => handleRetry(item) : undefined}
+              onLongPress={() => setActionFor(item)}
+              delayLongPress={350}>
+              <MessageBubble
+                message={item}
+                isMine={isMine}
+                myDeviceId={myDeviceId}
+                peerName={peerName}
+                reactions={reactions[item.id]}
+                onQuotePress={scrollToMessage}
+                onReactionPress={emoji => handleReaction(item, emoji)}
+              />
             </Pressable>
           );
         }}
-        onContentSizeChange={() => flatListRef.current?.scrollToEnd({ animated: true })}
+        onScrollToIndexFailed={info => {
+          // Rows are variable height, so the index jump can fail before the
+          // target is measured. Fall back to an estimated offset.
+          flatListRef.current?.scrollToOffset({
+            offset: Math.max(0, info.averageItemLength * info.index),
+            animated: true,
+          });
+        }}
+        onContentSizeChange={handleContentSizeChange}
         contentContainerStyle={styles.messageList}
         ListEmptyComponent={
           <View style={styles.empty}>
@@ -111,14 +258,26 @@ export function ChatScreen({ route, navigation }: Props) {
       <View style={styles.chips}>
         <Chip label="x25519 session" tone="green" />
         <Chip label={`ttl ${DEFAULT_TTL}`} />
+        <TypingIndicator active={peerTyping} />
       </View>
 
+      {replyTo ? (
+        <ReplyBar
+          author={replyTo.senderDeviceId === myDeviceId ? 'you' : peerName}
+          snippet={snippetOf(replyTo)}
+          onDismiss={() => setReplyTo(null)}
+        />
+      ) : null}
+
+      {/* Composer row. Attachment controls (photo / voice) go before the prompt. */}
       <View style={[styles.composer, { paddingBottom: insets.bottom + 12 }]}>
         <Text style={styles.prompt}>›</Text>
         <TextInput
+          ref={inputRef}
           style={styles.input}
           value={input}
-          onChangeText={setInput}
+          onChangeText={handleChangeText}
+          onBlur={() => signalTyping('')}
           placeholder="encrypt + broadcast to neighbours"
           placeholderTextColor={colors.textMuted}
           cursorColor={colors.primary}
@@ -126,14 +285,28 @@ export function ChatScreen({ route, navigation }: Props) {
           multiline
           maxLength={500}
           autoCorrect={false}
+          accessibilityLabel="message input"
         />
         <Pressable
           style={[styles.send, canSend && styles.sendOn]}
           onPress={handleSend}
-          disabled={!canSend}>
+          disabled={!canSend}
+          accessibilityRole="button"
+          accessibilityLabel="send message">
           <Text style={[styles.sendText, canSend && { color: colors.primary }]}>SEND</Text>
         </Pressable>
       </View>
+
+      <MessageActionSheet
+        visible={actionFor !== null}
+        canCopy={!!actionFor && actionFor.text.trim().length > 0}
+        myReaction={myReaction}
+        onClose={closeActions}
+        onReact={actionReact}
+        onReply={actionReply}
+        onCopy={actionCopy}
+        onDelete={actionDelete}
+      />
     </KeyboardAvoidingView>
   );
 }
@@ -147,7 +320,7 @@ const styles = StyleSheet.create({
     fontFamily: fonts.disp, fontSize: 10, letterSpacing: 1, textTransform: 'uppercase', color: colors.textMuted,
   },
   emptyHint: { fontFamily: fonts.mono, fontSize: 11, color: colors.textMuted, marginTop: 8 },
-  chips: { flexDirection: 'row', gap: 8, paddingHorizontal: 16, paddingBottom: 12 },
+  chips: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 16, paddingBottom: 12 },
   composer: {
     flexDirection: 'row', alignItems: 'flex-end', gap: 10,
     paddingHorizontal: 16, paddingTop: 12,

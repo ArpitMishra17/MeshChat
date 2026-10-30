@@ -1,13 +1,28 @@
 import React, { useEffect, useRef } from 'react';
-import { View, Text, Animated, Easing, StyleSheet } from 'react-native';
+import { View, Text, Pressable, Animated, Easing, StyleSheet } from 'react-native';
 import { DEFAULT_TTL } from '../services/protocol';
+import { getMessageById } from '../db/database';
 import { colors, fonts } from '../theme';
 import { Chip, Ladder } from './ui';
-import type { Message } from '../types';
+import { ReactionChips } from './ReactionChips';
+import { snippetOf } from './ReplyBar';
+import type { Message, Reaction } from '../types';
 
 interface Props {
   message: Message;
   isMine: boolean;
+  /** This device's fingerprint; used to label quotes and highlight own reactions. */
+  myDeviceId: string;
+  peerName: string;
+  reactions?: Reaction[];
+  /** Called with the quoted message's id when a quote block is tapped. */
+  onQuotePress?: (messageId: string) => void;
+  onReactionPress?: (emoji: string) => void;
+  /**
+   * Attachment area (photo / voice) is inserted above the text by the media UI.
+   * Left empty by the text-only path.
+   */
+  attachment?: React.ReactNode;
 }
 
 function formatTime(ts: number): string {
@@ -32,7 +47,35 @@ function useEntrance(createdAt: number) {
   };
 }
 
-export function MessageBubble({ message, isMine }: Props) {
+/** Compact quote of the message this one replies to. Resolved from the DB on render. */
+function QuoteBlock({
+  replyTo, myDeviceId, peerName, onPress,
+}: { replyTo: string; myDeviceId: string; peerName: string; onPress?: (id: string) => void }) {
+  const quoted = getMessageById(replyTo);
+  if (!quoted) {
+    return (
+      <View style={styles.quote} accessible accessibilityLabel="quoted message unavailable">
+        <Text style={styles.quoteMissing}>message unavailable</Text>
+      </View>
+    );
+  }
+  const author = quoted.senderDeviceId === myDeviceId ? 'you' : peerName;
+  const snippet = snippetOf(quoted);
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`quoted ${author}: ${snippet}. scroll to original`}
+      onPress={() => onPress?.(quoted.id)}
+      style={({ pressed }) => [styles.quote, pressed && { opacity: 0.7 }]}>
+      <Text style={styles.quoteAuthor} numberOfLines={1}>{author}</Text>
+      <Text style={styles.quoteText} numberOfLines={1}>{snippet}</Text>
+    </Pressable>
+  );
+}
+
+export function MessageBubble({
+  message, isMine, myDeviceId, peerName, reactions, onQuotePress, onReactionPress, attachment,
+}: Props) {
   const entrance = useEntrance(message.createdAt);
   // Phase 3 — `hops` is the receive-side radio-transmission count:
   // 1 = direct, 2 = via one relay, etc. Only inbound messages carry one.
@@ -43,17 +86,33 @@ export function MessageBubble({ message, isMine }: Props) {
     hops === 1 ? 'direct' :
     `via ${relayCount} relay${relayCount === 1 ? '' : 's'}`;
   const failed = message.status === 'failed';
+  const read = isMine && message.status === 'delivered' && message.readAt != null;
 
   return (
     <Animated.View style={[styles.container, isMine ? styles.mine : styles.theirs, entrance]}>
       <View style={[styles.bubble, isMine ? styles.bubbleMine : styles.bubbleTheirs, failed && styles.bubbleFailed]}>
-        <Text style={styles.text}>{message.text}</Text>
+        {message.replyTo ? (
+          <QuoteBlock
+            replyTo={message.replyTo}
+            myDeviceId={myDeviceId}
+            peerName={peerName}
+            onPress={onQuotePress}
+          />
+        ) : null}
+        {attachment}
+        {message.text || !attachment ? <Text style={styles.text}>{message.text}</Text> : null}
       </View>
+      <ReactionChips
+        reactions={reactions ?? []}
+        myDeviceId={myDeviceId}
+        onToggle={onReactionPress}
+      />
       <View style={styles.meta}>
         <Text style={styles.time}>{formatTime(message.createdAt)}</Text>
         {isMine ? (
           <>
-            <Ladder status={message.status} />
+            <Ladder status={message.status} read={read} />
+            {read ? <Text style={styles.read}>read</Text> : null}
             {failed ? <Text style={styles.failed}>failed · tap to retry</Text> : null}
             {message.status === 'queued' ? <Text style={styles.queued}>queued</Text> : null}
           </>
@@ -81,9 +140,20 @@ const styles = StyleSheet.create({
   bubbleTheirs: { borderColor: colors.border, backgroundColor: colors.bgTertiary },
   bubbleFailed: { borderColor: colors.errorBorder, backgroundColor: colors.errorFaint },
   text: { fontFamily: fonts.mono, fontSize: 13, lineHeight: 20, color: colors.text },
+  quote: {
+    alignSelf: 'stretch', marginBottom: 8, paddingLeft: 9, paddingRight: 8, paddingVertical: 5,
+    borderLeftWidth: 2, borderLeftColor: colors.accent, backgroundColor: colors.bgInput, gap: 2,
+  },
+  quoteAuthor: {
+    fontFamily: fonts.dispBold, fontSize: 9, lineHeight: 11, letterSpacing: 0.8,
+    textTransform: 'uppercase', color: colors.accent,
+  },
+  quoteText: { fontFamily: fonts.mono, fontSize: 11, lineHeight: 15, color: colors.textDim },
+  quoteMissing: { fontFamily: fonts.mono, fontSize: 11, lineHeight: 15, color: colors.textMuted, fontStyle: 'italic' },
   meta: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   time: { fontFamily: fonts.mono, fontSize: 10, color: colors.textMuted },
   hop: { fontFamily: fonts.mono, fontSize: 10, color: colors.primary },
+  read: { fontFamily: fonts.mono, fontSize: 10, color: colors.accent },
   failed: { fontFamily: fonts.mono, fontSize: 10, color: colors.error },
   queued: { fontFamily: fonts.mono, fontSize: 10, color: colors.warning },
   ribbon: { flexDirection: 'row', gap: 6 },

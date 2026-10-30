@@ -54,6 +54,8 @@ const CONNECTION_PRIORITY_HIGH = 1;
 const BLE_ERR_OPERATION_START_FAILED = 4; // "Operation was rejected"
 const BLE_ERR_DEVICE_DISCONNECTED = 201;
 const BLE_ERR_DEVICE_NOT_CONNECTED = 205;
+/** How long after the last media chunk (sent or received) scans stay paused. */
+const BULK_TRANSFER_QUIET_MS = 8_000;
 /** Extra attempts for a rejected write before the link is declared stale. */
 const WRITE_REJECT_RETRIES = 2;
 const WRITE_REJECT_RETRY_DELAY_MS = 150;
@@ -110,6 +112,13 @@ interface CentralConn {
   subs: Subscription[];
   /** Set when the peer's HELLO arrives, so onDisconnected can detach the link. */
   fingerprintHex: string | null;
+  /**
+   * Set when writes on this connection keep being rejected while the peer is
+   * still reachable through our GATT server. Sends skip it, but it is not
+   * cancelled: both directions share one radio link, so cancelling it would
+   * also tear down the peer's working connection to us.
+   */
+  broken?: boolean;
 }
 
 /** A chosen outbound transport for a link (central preferred over peripheral). */
@@ -512,6 +521,22 @@ class BLEService {
     return this.links.size > 0;
   }
 
+  private bulkActiveUntil = 0;
+
+  /**
+   * Note that a media transfer is in progress. The mesh skips scanning while
+   * this is set: an Android scan shares the radio with the connection and
+   * noticeably slows a transfer.
+   */
+  markBulkTransfer(): void {
+    this.bulkActiveUntil = Date.now() + BULK_TRANSFER_QUIET_MS;
+  }
+
+  /** True while a media transfer was active within the last few seconds. */
+  isBulkTransferActive(): boolean {
+    return Date.now() < this.bulkActiveUntil;
+  }
+
   /** Phase 3 — Number of central-side GATT connections we hold. */
   getCentralConnectionCount(): number {
     return this.centralConnections.size;
@@ -871,12 +896,20 @@ class BLEService {
     chunks: Uint8Array[],
     onProgress?: (sent: number, total: number) => void,
   ): Promise<void> {
+    const charUUID = this.charForType(TYPE_MEDIA)!;
     for (let index = 0; index < chunks.length; index++) {
+      this.markBulkTransfer();
       const chunk: MediaChunkPayload = { type: 'media', messageId, index, data: chunks[index] };
       const packet = this.buildEncryptedPacket(
         TYPE_MEDIA, encodeBody(chunk), dstFingerprintHex, DEFAULT_TTL,
       );
-      if (!(await this.broadcastPacket(packet))) {
+      // A direct neighbor gets the chunk on its own link only; flooding every
+      // chunk to all links would multiply the airtime by the neighbor count.
+      // Otherwise (or if the direct link fails) flood so the mesh can relay.
+      const direct = this.links.get(dstFingerprintHex);
+      const sent = (direct?.established && await this.sendToLink(direct, charUUID, packet))
+        || await this.broadcastPacket(packet);
+      if (!sent) {
         throw new Error(`media chunk ${index + 1}/${chunks.length} could not be sent`);
       }
       onProgress?.(index + 1, chunks.length);
@@ -1041,6 +1074,18 @@ class BLEService {
   private dropStaleCentral(bleId: string): void {
     const central = this.centralConnections.get(bleId);
     if (!central) return;
+    const link = central.fingerprintHex ? this.links.get(central.fingerprintHex) : undefined;
+    if (link && link.central === central && link.peripheralAddress) {
+      // The peer still reaches us through our GATT server. Stop using this
+      // side but keep it open: cancelling would drop the shared radio link and
+      // the peer's working connection with it (seen on device as a 30 s
+      // disconnect/reconnect loop).
+      if (!central.broken) {
+        console.warn(`[BLE] Central link ${bleId.slice(-8)} rejects writes; using the peripheral side`);
+        central.broken = true;
+      }
+      return;
+    }
     console.warn(`[BLE] Dropping stale central link ${bleId.slice(-8)}`);
     central.device.cancelConnection().catch(() => {});
     this.handleCentralDisconnected(bleId);
@@ -1075,7 +1120,7 @@ class BLEService {
    * the peripheral side has negotiated more.
    */
   private transportsFor(link: Link): TransportRef[] {
-    const central: TransportRef | null = link.central
+    const central: TransportRef | null = link.central && !link.central.broken
       ? { kind: 'central', bleId: link.central.bleId, device: link.central.device, mtu: link.central.mtu }
       : null;
     const peripheral: TransportRef | null = link.peripheralAddress
@@ -1335,7 +1380,15 @@ class BLEService {
     for (const link of this.links.values()) {
       if (link.peripheralAddress === deviceAddress) {
         link.peripheralAddress = null;
-        this.pruneLinkIfDead(link);
+        // A central we kept open only to protect this side is useless now.
+        // handleCentralDisconnected detaches it and prunes the link itself.
+        if (link.central?.broken) {
+          const bleId = link.central.bleId;
+          link.central.device.cancelConnection().catch(() => {});
+          this.handleCentralDisconnected(bleId);
+        } else {
+          this.pruneLinkIfDead(link);
+        }
         break;
       }
     }

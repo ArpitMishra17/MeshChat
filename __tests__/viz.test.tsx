@@ -8,6 +8,12 @@ import TestRenderer, { act } from 'react-test-renderer';
 import { BarChart, StepChart, Radar, Topology, HexDump, PrecisionDial, Logo, HEADER_FIELDS } from '../src/components/viz';
 import { Chip, Ladder, Meter, BlockBar, Cells, KV, Fingerprint } from '../src/components/ui';
 
+// The charts/chips start Animated timers (entrance, blinking cursor). Under real
+// timers they outlive the test run and fire after Jest tears the environment
+// down, crashing Node. Fake timers keep them from ever firing.
+beforeAll(() => { jest.useFakeTimers(); });
+afterAll(() => { jest.clearAllTimers(); jest.useRealTimers(); });
+
 /** All rendered text, one entry per <Text>, with split children re-joined. */
 function text(r: TestRenderer.ReactTestRenderer): string {
   const out: string[] = [];

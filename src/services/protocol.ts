@@ -105,7 +105,10 @@ const TYPE_FRAG_END = 0xf2;
 
 // Conservative fallback when no MTU is known (peripheral-notify path).
 const DEFAULT_CHUNK_SIZE = 18;
-// P0.6 — reassembly buffers older than this are assumed orphaned (lost END).
+// P0.6 — reassembly buffers idle (no fragment arrived) for this long are
+// assumed orphaned (lost END). Measured from the LAST fragment, not the first:
+// a large media chunk is ~190 fragments and can legitimately take longer than
+// this end to end while still making steady progress.
 export const REASSEMBLY_TTL_MS = 10_000;
 /** Fragment markers, exported for the wire inspector's legend. */
 export const FRAGMENT_MARKERS = [0xf0, 0xf1, 0xf2] as const;
@@ -998,6 +1001,7 @@ interface ReassemblyBuffer {
   msgSeq: number;
   chunks: Map<number, Uint8Array>;
   createdAt: number;
+  lastActivityAt: number;
 }
 
 const reassemblyBuffers = new Map<string, ReassemblyBuffer>();
@@ -1028,10 +1032,10 @@ export function getReassemblyStats(): {
 function sweepStaleBuffers(): void {
   const now = Date.now();
   for (const [key, buf] of reassemblyBuffers) {
-    if (now - buf.createdAt > REASSEMBLY_TTL_MS) {
+    if (now - buf.lastActivityAt > REASSEMBLY_TTL_MS) {
       console.warn(
         `[Protocol] Discarding stale reassembly buffer for ${key} ` +
-          `(${now - buf.createdAt}ms old)`,
+          `(idle ${now - buf.lastActivityAt}ms, ${now - buf.createdAt}ms old)`,
       );
       reassemblyBuffers.delete(key);
       reassemblyDiscarded += 1;
@@ -1182,6 +1186,7 @@ export function decodeBLEChunkRaw(
       msgSeq,
       chunks: new Map([[0, data]]),
       createdAt: Date.now(),
+      lastActivityAt: Date.now(),
     });
     return null;
   }
@@ -1206,6 +1211,7 @@ export function decodeBLEChunkRaw(
   }
 
   buffer.chunks.set(seqNum, data);
+  buffer.lastActivityAt = Date.now();
 
   if (firstByte === TYPE_FRAG_END) {
     const assembled = reassemble(buffer);

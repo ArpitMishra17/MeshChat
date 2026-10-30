@@ -604,6 +604,26 @@ describe('fragment reassembly safety (P0.6)', () => {
     warnSpy.mockRestore();
     jest.useRealTimers();
   });
+
+  it('keeps a buffer alive past 10s total while fragments keep arriving', () => {
+    const packet = encodePacket({
+      type: TYPE_ACK, ttl: 5, msgId: MSGID, src: SRC, dst: DST, payload: encodeBody(ack),
+    });
+    const third = Math.ceil(packet.length / 3);
+    const parts = [packet.subarray(0, third), packet.subarray(third, 2 * third), packet.subarray(2 * third)];
+
+    jest.useFakeTimers();
+    jest.setSystemTime(0);
+    expect(decodeBLEChunkFull(b64(fragStart(packet.length, 3, 7, parts[0])), 'slow')).toBeNull();
+    // Each gap is under the idle limit but the whole transfer exceeds it.
+    jest.setSystemTime(8_000);
+    expect(decodeBLEChunkFull(b64(fragCont(1, 7, parts[1])), 'slow')).toBeNull();
+    jest.setSystemTime(16_000);
+    const result = decodeBLEChunkFull(b64(fragEnd(2, 7, parts[2])), 'slow');
+    expect(result).not.toBeNull();
+    expect(result!.payload.type).toBe('ack');
+    jest.useRealTimers();
+  });
 });
 
 // =====================================================================

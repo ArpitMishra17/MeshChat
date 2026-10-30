@@ -15,8 +15,11 @@ import {
   DEFAULT_TTL,
   TYPE_HELLO,
   TYPE_MESSAGE,
+  TYPE_MESSAGE_EXT,
   TYPE_ACK,
   TYPE_POSITION,
+  TYPE_CTRL,
+  TYPE_MEDIA,
   FLAG_ENCRYPTED,
   FLAG_HAS_POSITION,
   type PacketHeader,
@@ -32,6 +35,8 @@ import type {
   MessagePayload,
   AckPayload,
   PositionPayload,
+  ControlPayload,
+  MediaChunkPayload,
 } from '../types';
 
 const SERVICE_UUID = '12345678-1234-5678-1234-56789abcdef0';
@@ -47,6 +52,8 @@ export const REQUESTED_MTU = 512;
 export const POSITION_BEACON_MS = 60_000;
 /** Phase 4 — TTL for POSITION beacons (broadcast, a few hops). */
 export const POSITION_TTL = 3;
+/** Feature batch — TTL for encrypted CTRL signals (typing / read / reaction). */
+export const CONTROL_TTL = 3;
 
 export type BLEState = 'idle' | 'scanning' | 'connecting' | 'connected' | 'error';
 
@@ -165,6 +172,12 @@ class BLEService {
   private transportToFingerprint = new Map<string, string>();
   /** BLE MACs we are currently establishing a central connection to. */
   private connectingBleIds = new Set<string>();
+  /**
+   * Per-transport send tail. Each entry is the promise of the last queued
+   * `sendFragments` call for that transport; new sends chain onto it so the
+   * fragments of two packets never interleave on the same GATT link.
+   */
+  private sendQueues = new Map<string, Promise<void>>();
 
   /** Dedupe scan hits within a 2 s window (Android re-advertises aggressively). */
   private discoveredDevices = new Map<string, number>();
@@ -815,6 +828,44 @@ class BLEService {
   }
 
   /**
+   * Feature batch — Best-effort encrypted CTRL signal (typing / read / reaction).
+   * Never acknowledged, never queued for retry, and never throws: a lost
+   * signal is simply lost, so the only trace is one warning.
+   */
+  async sendControl(payload: ControlPayload, dstFingerprintHex: string): Promise<void> {
+    try {
+      const packet = this.buildEncryptedPacket(
+        TYPE_CTRL, encodeBody(payload), dstFingerprintHex, CONTROL_TTL,
+      );
+      await this.broadcastPacket(packet);
+    } catch (e: any) {
+      console.warn(`[BLE] sendControl (${payload.sub}) failed:`, e?.message ?? e);
+    }
+  }
+
+  /**
+   * Feature batch — Send an attachment's chunks as encrypted TYPE_MEDIA packets,
+   * one at a time so the peer's assembler sees them in order and the sender's
+   * per-transport queue is not flooded. Unlike the other sends this THROWS when
+   * a packet cannot be built, so the router can fall back to the retry path.
+   */
+  async sendMediaChunks(
+    messageId: string,
+    dstFingerprintHex: string,
+    chunks: Uint8Array[],
+    onProgress?: (sent: number, total: number) => void,
+  ): Promise<void> {
+    for (let index = 0; index < chunks.length; index++) {
+      const chunk: MediaChunkPayload = { type: 'media', messageId, index, data: chunks[index] };
+      const packet = this.buildEncryptedPacket(
+        TYPE_MEDIA, encodeBody(chunk), dstFingerprintHex, DEFAULT_TTL,
+      );
+      await this.broadcastPacket(packet);
+      onProgress?.(index + 1, chunks.length);
+    }
+  }
+
+  /**
    * Phase 3 — Flood `packetBytes` to every established neighbor, optionally
    * excluding the transport the packet arrived on (so we don't echo it back).
    *
@@ -838,8 +889,7 @@ class BLEService {
       const transport = this.preferredTransport(link);
       if (!transport) continue;
       if (excludeTransportKey && this.transportMatches(link, excludeTransportKey)) continue;
-      const mtu = transport.kind === 'central' ? transport.mtu : null;
-      const frags = fragmentPacket(packetBytes, mtu ?? undefined);
+      const frags = fragmentPacket(packetBytes, transport.mtu ?? undefined);
       sends.push(this.sendFragments(transport, charUUID, frags));
     }
     await Promise.all(sends);
@@ -866,13 +916,35 @@ class BLEService {
     const type = packetBytes[1];
     const charUUID = this.charForType(type);
     if (!charUUID) return false;
-    const mtu = transport.kind === 'central' ? transport.mtu : null;
-    const frags = fragmentPacket(packetBytes, mtu ?? undefined);
+    const frags = fragmentPacket(packetBytes, transport.mtu ?? undefined);
     await this.sendFragments(transport, charUUID, frags);
     return true;
   }
 
-  private async sendFragments(
+  /**
+   * Queue `frags` behind any earlier send on the same transport. The returned
+   * promise never rejects: a failed send is logged and the chain moves on, so
+   * one bad write cannot poison later sends to that link.
+   */
+  private sendFragments(
+    transport: TransportRef,
+    charUUID: string,
+    frags: string[],
+  ): Promise<void> {
+    const key = transport.kind === 'central'
+      ? `c:${transport.bleId}`
+      : `p:${transport.address}`;
+    const prev = this.sendQueues.get(key) ?? Promise.resolve();
+    const run = prev.then(() => this.writeFragments(transport, charUUID, frags));
+    const tail = run.catch(() => {});
+    this.sendQueues.set(key, tail);
+    void tail.then(() => {
+      if (this.sendQueues.get(key) === tail) this.sendQueues.delete(key);
+    });
+    return run;
+  }
+
+  private async writeFragments(
     transport: TransportRef,
     charUUID: string,
     frags: string[],
@@ -902,6 +974,11 @@ class BLEService {
       // not by which characteristic it arrived on. This avoids a 4th GATT
       // characteristic (and native-module changes).
       case TYPE_POSITION: return MESSAGE_CHAR_UUID;
+      // Feature batch — CTRL, EXT and MEDIA share the MESSAGE characteristic for
+      // the same reason as POSITION: dispatch is by header type.
+      case TYPE_CTRL: return MESSAGE_CHAR_UUID;
+      case TYPE_MESSAGE_EXT: return MESSAGE_CHAR_UUID;
+      case TYPE_MEDIA: return MESSAGE_CHAR_UUID;
       default: return null;
     }
   }
@@ -912,9 +989,23 @@ class BLEService {
       return { kind: 'central', bleId: link.central.bleId, device: link.central.device, mtu: link.central.mtu };
     }
     if (link.peripheralAddress) {
-      return { kind: 'peripheral', address: link.peripheralAddress, mtu: null };
+      return { kind: 'peripheral', address: link.peripheralAddress, mtu: this.peripheralMtu(link.peripheralAddress) };
     }
     return null;
+  }
+
+  /**
+   * ATT MTU the central negotiated with our GATT server, or null when unknown
+   * (or still the 23-byte default). null keeps the old 18-byte fragment path.
+   */
+  private peripheralMtu(address: string): number | null {
+    try {
+      const mtu = BlePeripheral.getMtu(address);
+      return mtu > 23 ? mtu : null;
+    } catch {
+      // Stale native build without getMtu: keep the legacy chunk size.
+      return null;
+    }
   }
 
   private transportMatches(link: Link, transportKey: string): boolean {
@@ -963,16 +1054,34 @@ class BLEService {
    * before — required for any TOFU-based mesh).
    */
   private buildMessagePacket(message: MessagePayload, dstFingerprintHex: string): Uint8Array {
+    // Plain text stays TYPE_MESSAGE (byte-identical to before the feature
+    // batch); reply-to or an attachment descriptor selects TYPE_MESSAGE_EXT.
+    const hasExtras = !!message.replyTo || !!message.media;
+    const type = hasExtras ? TYPE_MESSAGE_EXT : TYPE_MESSAGE;
+    return this.buildEncryptedPacket(type, encodeBody(message), dstFingerprintHex, DEFAULT_TTL);
+  }
+
+  /**
+   * Encrypt `plaintext` end-to-end to `dstFingerprintHex` and frame it as a v2
+   * packet of `type`. The header (TTL zeroed) is bound as AAD so a relay cannot
+   * alter src/dst/msgId/type without failing authentication. The same header
+   * type is used for the AAD and the final packet.
+   */
+  private buildEncryptedPacket(
+    type: number,
+    plaintext: Uint8Array,
+    dstFingerprintHex: string,
+    ttl: number,
+  ): Uint8Array {
     const myFp = this.getMyFingerprint();
     const peerFp = this.ensurePeerKey(dstFingerprintHex);
     const msgId = generatePacketId();
-    const plaintext = encodeBody(message);
 
     const encryptedLen = NONCE_SIZE + plaintext.length + GCM_TAG_SIZE;
     const headerForAAD = buildHeaderBytes({
-      type: TYPE_MESSAGE,
+      type,
       flags: FLAG_ENCRYPTED,
-      ttl: DEFAULT_TTL,
+      ttl,
       msgId,
       src: myFp,
       dst: peerFp,
@@ -982,9 +1091,9 @@ class BLEService {
     const encrypted = getCrypto().encrypt(peerFp, plaintext, aad);
 
     return encodePacket({
-      type: TYPE_MESSAGE,
+      type,
       flags: FLAG_ENCRYPTED,
-      ttl: DEFAULT_TTL,
+      ttl,
       msgId,
       src: myFp,
       dst: peerFp,

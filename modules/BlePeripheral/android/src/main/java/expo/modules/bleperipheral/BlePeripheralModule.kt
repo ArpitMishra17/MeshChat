@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
 import android.content.Context
+import android.os.Build
 import android.os.ParcelUuid
 import android.util.Base64
 import android.util.Log
@@ -11,16 +12,34 @@ import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import java.io.ByteArrayOutputStream
 import java.util.UUID
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 @SuppressLint("MissingPermission")
 class BlePeripheralModule : Module() {
   private val TAG = "BlePeripheral"
+
+  /** Upper bound on how long one notification may wait for onNotificationSent. */
+  private val NOTIFY_TIMEOUT_MS = 1000L
+  /** ATT default MTU; what a central gets before any MTU exchange. */
+  private val DEFAULT_ATT_MTU = 23
 
   private var gattServer: BluetoothGattServer? = null
   private var advertiser: BluetoothLeAdvertiser? = null
   private var advertising = false
   private val connectedDevices = mutableSetOf<BluetoothDevice>()
   private val characteristics = mutableMapOf<String, BluetoothGattCharacteristic>()
+
+  // Callbacks run on Binder threads while the module methods run on Expo's
+  // async queue, so the maps touched from both sides must be concurrent.
+  /** Device address -> ATT MTU reported by onMtuChanged. Absent = default 23. */
+  private val mtuByAddress = ConcurrentHashMap<String, Int>()
+  /** Device address -> the in-flight notification waiting for onNotificationSent. */
+  private val notifyWaiters = ConcurrentHashMap<String, CompletableFuture<Int>>()
+  /** Device address -> lock that keeps one notification in flight per central. */
+  private val notifyLocks = ConcurrentHashMap<String, Any>()
 
   // Buffer for prepared (long) writes: device address -> (char uuid -> accumulated bytes)
   private val preparedWriteBuffers = mutableMapOf<String, MutableMap<String, ByteArrayOutputStream>>()
@@ -41,16 +60,68 @@ class BlePeripheralModule : Module() {
     ))
   }
 
+  /**
+   * Notify one connected central and wait (bounded) for the stack to confirm
+   * the send. Throws if the notify is rejected, the confirmation times out, or
+   * the stack reports a non-success status, so the JS caller sees the failure.
+   *
+   * The waiter is registered BEFORE notifying so a fast onNotificationSent
+   * cannot be missed. The per-device lock keeps one notification in flight per
+   * central, so a confirmation can only belong to the waiter that is current.
+   */
+  @Suppress("DEPRECATION")
+  private fun notifyDevice(device: BluetoothDevice, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
+    val server = gattServer ?: throw Exception("GATT server is not running")
+    val lock = notifyLocks.getOrPut(device.address) { Any() }
+
+    synchronized(lock) {
+      val waiter = CompletableFuture<Int>()
+      notifyWaiters[device.address] = waiter
+      try {
+        val queued = if (Build.VERSION.SDK_INT >= 33) {
+          // API 33+ takes the value directly and returns a status code, so the
+          // shared characteristic.value is never mutated here.
+          server.notifyCharacteristicChanged(device, characteristic, false, value) ==
+            BluetoothStatusCodes.SUCCESS
+        } else {
+          // Legacy API: the value lives on the shared characteristic, so set
+          // and notify under one lock so another central cannot swap it between.
+          synchronized(characteristic) {
+            characteristic.value = value
+            server.notifyCharacteristicChanged(device, characteristic, false)
+          }
+        }
+        if (!queued) throw Exception("Notify rejected for ${device.address}")
+
+        val status = try {
+          waiter.get(NOTIFY_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch (e: TimeoutException) {
+          throw Exception("Notify confirmation timed out for ${device.address}")
+        }
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+          throw Exception("Notify failed for ${device.address}, status $status")
+        }
+      } finally {
+        notifyWaiters.remove(device.address, waiter)
+      }
+    }
+  }
+
   private val gattCallback = object : BluetoothGattServerCallback() {
     override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
       if (newState == BluetoothProfile.STATE_CONNECTED) {
         Log.i(TAG, "Device connected: ${device.address}")
         connectedDevices.add(device)
+        // A fresh link starts at the default MTU until onMtuChanged reports otherwise.
+        mtuByAddress.remove(device.address)
         sendEvent("onDeviceConnected", mapOf("deviceAddress" to device.address))
       } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
         Log.i(TAG, "Device disconnected: ${device.address}")
         connectedDevices.remove(device)
         preparedWriteBuffers.remove(device.address)
+        mtuByAddress.remove(device.address)
+        // Fail a pending notify now instead of letting it run into its timeout.
+        notifyWaiters[device.address]?.complete(BluetoothGatt.GATT_FAILURE)
         sendEvent("onDeviceDisconnected", mapOf("deviceAddress" to device.address))
       }
     }
@@ -134,10 +205,12 @@ class BlePeripheralModule : Module() {
 
     override fun onNotificationSent(device: BluetoothDevice, status: Int) {
       Log.d(TAG, "Notification sent to ${device.address}, status: $status")
+      notifyWaiters[device.address]?.complete(status)
     }
 
     override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
       Log.i(TAG, "MTU changed to $mtu for ${device.address}")
+      mtuByAddress[device.address] = mtu
     }
   }
 
@@ -282,18 +355,26 @@ class BlePeripheralModule : Module() {
         ?: throw Exception("Characteristic $charUUID not found")
 
       val value = Base64.decode(base64Value, Base64.NO_WRAP)
-      characteristic.value = value
 
       val device = connectedDevices.find { it.address == deviceAddress }
         ?: throw Exception("Device $deviceAddress is not connected")
 
       try {
-        gattServer?.notifyCharacteristicChanged(device, characteristic, false)
+        notifyDevice(device, characteristic, value)
       } catch (e: Exception) {
         Log.w(TAG, "Failed to notify ${device.address}: ${e.message}")
         throw e
       }
       "sent"
+    }
+
+    /**
+     * Feature batch — ATT MTU negotiated with a connected central. JS uses it to
+     * size notification fragments (MTU minus the 3-byte ATT header). 23 means
+     * unknown or no MTU exchange yet.
+     */
+    Function("getMtu") { deviceAddress: String ->
+      mtuByAddress[deviceAddress] ?: DEFAULT_ATT_MTU
     }
 
     Function("isAdvertising") { advertising }
@@ -318,6 +399,10 @@ class BlePeripheralModule : Module() {
       connectedDevices.clear()
       characteristics.clear()
       preparedWriteBuffers.clear()
+      mtuByAddress.clear()
+      // Release any notify still waiting so its caller fails now, not at timeout.
+      for (waiter in notifyWaiters.values) waiter.complete(BluetoothGatt.GATT_FAILURE)
+      notifyWaiters.clear()
       "Stopped"
     }
   }

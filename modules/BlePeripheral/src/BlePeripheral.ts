@@ -20,6 +20,11 @@ declare class BlePeripheralNative extends NativeModule<BlePeripheralEvents> {
   getConnectedDeviceCount(): number;
   /** Phase 3 — BLE MAC addresses of all centrals connected to our GATT server. */
   getConnectedDevices(): string[];
+  /**
+   * Feature batch — ATT MTU negotiated with a connected central, as reported by
+   * onMtuChanged. Returns 23 (the BLE default) when unknown or disconnected.
+   */
+  getMtu(deviceAddress: string): number;
   stop(): Promise<string>;
 }
 

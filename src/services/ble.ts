@@ -48,6 +48,8 @@ const ACK_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef3';
 export const HANDSHAKE_TIMEOUT_MS = 8000;
 /** MTU we ask the OS to negotiate on every central connection. */
 export const REQUESTED_MTU = 512;
+/** ble-plx ConnectionPriority.High: ~7.5-15 ms connection interval instead of ~30-50 ms. */
+const CONNECTION_PRIORITY_HIGH = 1;
 /** Phase 4 — POSITION beacon interval (PLAN.md: ~60 s while moving). */
 export const POSITION_BEACON_MS = 60_000;
 /** Phase 4 — TTL for POSITION beacons (broadcast, a few hops). */
@@ -442,6 +444,13 @@ class BLEService {
       const mtuDevice = await device.requestMTU(REQUESTED_MTU);
       const mtu = mtuDevice.mtu ?? 23;
       console.log(`[BLE] Negotiated MTU: ${mtu} with ${bleId.slice(-8)}`);
+      // Shorter connection interval = more packets per second. Best effort:
+      // an unsupported stack just keeps the default interval.
+      try {
+        await device.requestConnectionPriority(CONNECTION_PRIORITY_HIGH as any);
+      } catch (e: any) {
+        console.log(`[BLE] requestConnectionPriority failed: ${e?.message ?? e}`);
+      }
       await device.discoverAllServicesAndCharacteristics();
 
       const central: CentralConn = { bleId, device, mtu, subs: [], fingerprintHex: null };
@@ -949,6 +958,15 @@ class BLEService {
     charUUID: string,
     frags: string[],
   ): Promise<void> {
+    // Large sends (media chunks) are logged so a slow transfer shows which
+    // transport and MTU it actually used.
+    const startedAt = Date.now();
+    const verbose = frags.length > 20;
+    if (verbose) {
+      console.log(
+        `[BLE] send ${frags.length} frags via ${transport.kind} (mtu ${transport.mtu ?? 'unknown→18B chunks'})`,
+      );
+    }
     try {
       if (transport.kind === 'central') {
         for (const frag of frags) {
@@ -958,6 +976,9 @@ class BLEService {
         for (const frag of frags) {
           await BlePeripheral.sendNotificationToDevice(transport.address, charUUID, frag);
         }
+      }
+      if (verbose) {
+        console.log(`[BLE] sent ${frags.length} frags via ${transport.kind} in ${Date.now() - startedAt}ms`);
       }
     } catch (e: any) {
       console.warn(`[BLE] sendFragments (${transport.kind}) failed:`, e?.message ?? e);
@@ -984,14 +1005,18 @@ class BLEService {
   }
 
   private preferredTransport(link: Link): TransportRef | null {
-    // Prefer the central side: larger negotiated MTU → fewer fragments.
-    if (link.central) {
-      return { kind: 'central', bleId: link.central.bleId, device: link.central.device, mtu: link.central.mtu };
+    // Prefer the central side (larger negotiated MTU → fewer fragments), unless
+    // the peripheral side reports a strictly larger MTU.
+    const central: TransportRef | null = link.central
+      ? { kind: 'central', bleId: link.central.bleId, device: link.central.device, mtu: link.central.mtu }
+      : null;
+    const peripheral: TransportRef | null = link.peripheralAddress
+      ? { kind: 'peripheral', address: link.peripheralAddress, mtu: this.peripheralMtu(link.peripheralAddress) }
+      : null;
+    if (central && peripheral) {
+      return (peripheral.mtu ?? 0) > (central.mtu ?? 0) ? peripheral : central;
     }
-    if (link.peripheralAddress) {
-      return { kind: 'peripheral', address: link.peripheralAddress, mtu: this.peripheralMtu(link.peripheralAddress) };
-    }
-    return null;
+    return central ?? peripheral;
   }
 
   /**

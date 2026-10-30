@@ -7,11 +7,13 @@ import { useFocusEffect } from '@react-navigation/native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { setStringAsync } from 'expo-clipboard';
+import { launchImageLibraryAsync } from 'expo-image-picker';
 import { colors, fonts } from '../theme';
 import { bleService } from '../services/ble';
 import type { BLEState } from '../services/ble';
 import { messageRouter } from '../services/messageRouter';
 import { notifier } from '../services/notifier';
+import { prepareAudio, prepareImage, deleteMediaFile } from '../services/media';
 import { getMessages, getReactionsForConversation } from '../db/database';
 import { ensureIdentity } from '../services/identity';
 import { MessageBubble } from '../components/MessageBubble';
@@ -20,12 +22,21 @@ import { ReplyBar, snippetOf } from '../components/ReplyBar';
 import { TypingIndicator } from '../components/TypingIndicator';
 import { StatusBadge } from '../components/StatusBadge';
 import { TerminalHeader } from '../components/TerminalHeader';
+import { AttachmentView } from '../components/AttachmentView';
+import { AttachButton } from '../components/AttachButton';
+import { VoiceButton, type VoiceButtonHandle } from '../components/VoiceButton';
 import { Btn, Chip } from '../components/ui';
 import { DEFAULT_TTL } from '../services/protocol';
-import type { Message, Reaction } from '../types';
+import type { MediaMeta, Message, Reaction } from '../types';
 import type { RootStackParamList } from '../navigation';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Chat'>;
+
+/** A photo or voice note after `prepareImage` / `prepareAudio`, ready for sendMessage. */
+interface PreparedMedia {
+  bytes: Uint8Array;
+  meta: MediaMeta;
+}
 
 /** How long auto-scroll-to-end yields after a quote jump, so the jump is not undone. */
 const QUOTE_SCROLL_HOLD_MS = 1000;
@@ -41,6 +52,11 @@ export function ChatScreen({ route, navigation }: Props) {
   const [focused, setFocused] = useState(false);
   const [appActive, setAppActive] = useState(AppState.currentState === 'active');
   const [bleState, setBleState] = useState<BLEState>(bleService.getState());
+  // A photo or voice note is being prepared (or the photo picker is open).
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const [recording, setRecording] = useState(false);
+  const voiceRef = useRef<VoiceButtonHandle>(null);
   const flatListRef = useRef<FlatList<Message>>(null);
   const inputRef = useRef<TextInput>(null);
   // Mirrors `focused && appActive` for the refresh callback, which is subscribed once.
@@ -94,6 +110,8 @@ export function ChatScreen({ route, navigation }: Props) {
         typingSentRef.current = false;
         messageRouter.notifyTyping(peerDeviceId, false);
       }
+      // Leaving the thread mid-recording discards it (the mic must not stay hot).
+      voiceRef.current?.discard();
     };
   }, [conversationId, peerDeviceId]));
 
@@ -138,6 +156,82 @@ export function ChatScreen({ route, navigation }: Props) {
     messageRouter.sendMessage(conversationId, peerDeviceId, text, quoted ? { replyTo: quoted.id } : undefined);
     refresh();
   }, [input, replyTo, conversationId, peerDeviceId, refresh]);
+
+  // Attachment preparation is async and the picker is modal, so one at a time.
+  // The ref guards the window before React re-renders with the new `busy` value.
+  const beginBusy = useCallback((): boolean => {
+    if (busyRef.current) return false;
+    busyRef.current = true;
+    setBusy(true);
+    return true;
+  }, []);
+
+  const endBusy = useCallback(() => {
+    busyRef.current = false;
+    setBusy(false);
+  }, []);
+
+  /**
+   * Sends a prepared attachment and then clears what it consumed: the caption
+   * (only if the input still holds the text it was built from) and the reply.
+   */
+  const sendPrepared = useCallback((media: PreparedMedia, caption: string, quotedId: string | null) => {
+    messageRouter.sendMessage(conversationId, peerDeviceId, caption, {
+      media,
+      replyTo: quotedId ?? undefined,
+    });
+    setInput(cur => (cur.trim() === caption ? '' : cur));
+    setReplyTo(cur => (quotedId != null && cur?.id === quotedId ? null : cur));
+    // Only a send that consumed a caption ends the typing signal. A voice note
+    // leaves any half-typed text in the input, so the peer should still see typing.
+    if (caption.length > 0) {
+      typingSentRef.current = false;
+      messageRouter.notifyTyping(peerDeviceId, false);
+    }
+    refresh();
+  }, [conversationId, peerDeviceId, refresh]);
+
+  const handlePickPhoto = useCallback(async () => {
+    if (!beginBusy()) return;
+    const caption = input.trim();
+    const quotedId = replyTo?.id ?? null;
+    try {
+      // Images only, no system crop, full quality: prepareImage does the downscale.
+      const picked = await launchImageLibraryAsync({
+        mediaTypes: ['images'],
+        allowsEditing: false,
+        quality: 1,
+      });
+      if (picked.canceled) return;
+      const uri = picked.assets[0]?.uri;
+      if (!uri) return;
+      const media = await prepareImage(uri);
+      sendPrepared(media, caption, quotedId);
+    } catch (e: any) {
+      Alert.alert('Photo not sent', e?.message ?? 'The photo could not be prepared.');
+    } finally {
+      endBusy();
+    }
+  }, [beginBusy, endBusy, input, replyTo, sendPrepared]);
+
+  // Called by VoiceButton with a finished recording (already past the minimum length).
+  const handleVoiceRecorded = useCallback(async ({ uri, durationMs }: { uri: string; durationMs: number }) => {
+    if (!beginBusy()) {
+      void deleteMediaFile(uri);
+      return;
+    }
+    const quotedId = replyTo?.id ?? null;
+    try {
+      const media = await prepareAudio(uri, durationMs);
+      sendPrepared(media, '', quotedId);
+    } catch (e: any) {
+      Alert.alert('Voice message not sent', e?.message ?? 'The recording could not be prepared.');
+    } finally {
+      // The bytes are in memory now; the recording file is no longer needed.
+      void deleteMediaFile(uri);
+      endBusy();
+    }
+  }, [beginBusy, endBusy, replyTo, sendPrepared]);
 
   const handleRetry = useCallback((message: Message) => {
     messageRouter.retryMessage(message, peerDeviceId);
@@ -220,6 +314,9 @@ export function ChatScreen({ route, navigation }: Props) {
         keyExtractor={item => item.id}
         renderItem={({ item }) => {
           const isMine = item.senderDeviceId === myDeviceId;
+          const attachment = item.kind !== 'text'
+            ? <AttachmentView message={item} isMine={isMine} onLongPress={() => setActionFor(item)} />
+            : undefined;
           return (
             <Pressable
               onPress={item.status === 'failed' ? () => handleRetry(item) : undefined}
@@ -233,6 +330,7 @@ export function ChatScreen({ route, navigation }: Props) {
                 reactions={reactions[item.id]}
                 onQuotePress={scrollToMessage}
                 onReactionPress={emoji => handleReaction(item, emoji)}
+                attachment={attachment}
               />
             </Pressable>
           );
@@ -259,6 +357,7 @@ export function ChatScreen({ route, navigation }: Props) {
         <Chip label="x25519 session" tone="green" />
         <Chip label={`ttl ${DEFAULT_TTL}`} />
         <TypingIndicator active={peerTyping} />
+        {busy ? <Chip label="preparing…" tone="amber" /> : null}
       </View>
 
       {replyTo ? (
@@ -269,32 +368,42 @@ export function ChatScreen({ route, navigation }: Props) {
         />
       ) : null}
 
-      {/* Composer row. Attachment controls (photo / voice) go before the prompt. */}
+      {/* Composer row. While recording, only the voice controls and a disabled input show. */}
       <View style={[styles.composer, { paddingBottom: insets.bottom + 12 }]}>
-        <Text style={styles.prompt}>›</Text>
+        {recording ? null : <AttachButton onPress={handlePickPhoto} disabled={busy} />}
+        <VoiceButton
+          ref={voiceRef}
+          disabled={busy}
+          onRecordingChange={setRecording}
+          onRecorded={handleVoiceRecorded}
+        />
+        {recording ? null : <Text style={styles.prompt}>›</Text>}
         <TextInput
           ref={inputRef}
           style={styles.input}
           value={input}
           onChangeText={handleChangeText}
           onBlur={() => signalTyping('')}
-          placeholder="encrypt + broadcast to neighbours"
+          placeholder={recording ? 'recording voice message…' : 'encrypt + broadcast to neighbours'}
           placeholderTextColor={colors.textMuted}
           cursorColor={colors.primary}
           selectionColor={colors.primary}
           multiline
           maxLength={500}
           autoCorrect={false}
+          editable={!recording}
           accessibilityLabel="message input"
         />
-        <Pressable
-          style={[styles.send, canSend && styles.sendOn]}
-          onPress={handleSend}
-          disabled={!canSend}
-          accessibilityRole="button"
-          accessibilityLabel="send message">
-          <Text style={[styles.sendText, canSend && { color: colors.primary }]}>SEND</Text>
-        </Pressable>
+        {recording ? null : (
+          <Pressable
+            style={[styles.send, canSend && styles.sendOn]}
+            onPress={handleSend}
+            disabled={!canSend}
+            accessibilityRole="button"
+            accessibilityLabel="send message">
+            <Text style={[styles.sendText, canSend && { color: colors.primary }]}>SEND</Text>
+          </Pressable>
+        )}
       </View>
 
       <MessageActionSheet

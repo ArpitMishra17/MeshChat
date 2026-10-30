@@ -70,7 +70,12 @@
         }
       ],
       "expo-font",
-      "expo-audio"
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "MeshChat records voice messages you choose to send."
+        }
+      ]
     ],
     "extra": {
       "eas": {

@@ -9,7 +9,13 @@ import {
   TYPE_MESSAGE,
   TYPE_ACK,
   TYPE_POSITION,
+  TYPE_CTRL,
+  TYPE_MESSAGE_EXT,
+  TYPE_MEDIA,
   FLAG_FLOOD_MODE,
+  MAX_MEDIA_BYTES,
+  MAX_READ_IDS_PER_PACKET,
+  MEDIA_CHUNK_BYTES,
 } from './protocol';
 import { bytesToHex, hexToBytes } from './ids';
 import {
@@ -20,12 +26,37 @@ import {
 } from './location';
 import { positionProvider } from './position';
 import { backoffDelayMs, shouldGiveUp, SENT_ACK_TIMEOUT_MS } from './outbox';
-import type { AckPayload, MessagePayload, PositionPayload, Message, OutboxEntry } from '../types';
+import { MediaAssembler, chunkBytes } from './mediaAssembler';
+import { saveMediaBytes, readMediaBytes, deleteMediaFile } from './media';
+import { TypingTracker, TYPING_HOLD_MS } from './typingTracker';
+import type {
+  AckPayload,
+  ControlPayload,
+  MediaChunkPayload,
+  MediaMeta,
+  MessageKind,
+  MessagePayload,
+  PositionPayload,
+  Message,
+  OutboxEntry,
+} from '../types';
 import {
   getOrCreateConversation,
+  getAllConversations,
   insertMessage,
+  insertMessageEx,
+  getMessageById,
+  deleteMessage,
+  setMessageAttachment,
   updateMessageStatus,
   markMessageDelivered,
+  markIncomingRead,
+  markOutgoingRead,
+  upsertReaction,
+  removeReaction,
+  getReactionsForConversation,
+  markConversationRead,
+  getBoolSetting,
   messageExists,
   getPeerByFingerprint,
   enqueueOutbox,
@@ -71,7 +102,7 @@ import { Emitter, PayloadEmitter } from './events';
 /** Phase 4 — one routing decision, for the demo log + report evaluation. */
 export interface RouteLogEntry {
   timestamp: number;
-  type: 'MESSAGE' | 'ACK' | 'POSITION';
+  type: 'MESSAGE' | 'MESSAGE_EXT' | 'ACK' | 'POSITION' | 'CTRL' | 'MEDIA';
   msgId: string;           // first 8 hex chars of the 8-byte transport msgId
   strategy: 'greedy' | 'flood' | 'deliver' | 'drop';
   target?: string;         // neighbor fingerprint (greedy) — first 8 hex
@@ -96,6 +127,75 @@ export interface RouteStats {
 /** Phase 5 — how often the outbox watchdog/drain tick runs. */
 const OUTBOX_TICK_MS = 15_000;
 
+/** Feature batch — how often stale incoming attachment transfers are swept. */
+const ASSEMBLER_SWEEP_MS = 30_000;
+
+/** Settings key gating whether we *send* READ receipts (UI toggle writes it). */
+export const READ_RECEIPTS_SETTING = 'read_receipts';
+
+/** Whether read receipts are enabled; defaults to on. */
+export function readReceiptsEnabled(): boolean {
+  return getBoolSetting(READ_RECEIPTS_SETTING, true);
+}
+
+/** Matches the MediaAssembler bound; a valid chunk index is always below this. */
+const MAX_MEDIA_CHUNKS = 64;
+
+/** Reactions travel as a short emoji string; the wire allows at most 16 UTF-8 bytes. */
+const MAX_EMOJI_BYTES = 16;
+
+export interface MediaProgressEvent {
+  messageId: string;
+  done: number;
+  total: number;
+  direction: 'in' | 'out';
+}
+
+export interface MessageReceivedEvent {
+  conversationId: string;
+  peerDeviceId: string;
+  senderName: string;
+  /** Message text; empty for attachment-only messages. */
+  preview: string;
+  messageId: string;
+  kind: MessageKind;
+}
+
+/** Descriptor sanity checks applied before any attachment state is created. */
+function isValidMediaMeta(m: MediaMeta): boolean {
+  if (m.kind !== 'image' && m.kind !== 'audio') return false;
+  if (!Number.isInteger(m.size) || m.size < 1 || m.size > MAX_MEDIA_BYTES) return false;
+  if (!Number.isInteger(m.chunks) || m.chunks < 1 || m.chunks > MAX_MEDIA_CHUNKS) return false;
+  return m.chunks === Math.ceil(m.size / MEDIA_CHUNK_BYTES);
+}
+
+function utf8ByteLength(s: string): number {
+  let n = 0;
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) ?? 0;
+    n += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+  }
+  return n;
+}
+
+/** Phase 4 — maps a wire packet type to the label used in the routing log. */
+function routeTypeLabel(type: number): RouteLogEntry['type'] {
+  switch (type) {
+    case TYPE_MESSAGE: return 'MESSAGE';
+    case TYPE_MESSAGE_EXT: return 'MESSAGE_EXT';
+    case TYPE_ACK: return 'ACK';
+    case TYPE_CTRL: return 'CTRL';
+    case TYPE_MEDIA: return 'MEDIA';
+    default: return 'POSITION';
+  }
+}
+
+/** Peer fingerprint that owns a conversation, or null if the conversation is unknown. */
+function peerOfConversation(conversationId: string): string | null {
+  const conv = getAllConversations().find(c => c.id === conversationId);
+  return conv ? conv.peerDeviceId : null;
+}
+
 class MessageRouter {
   /** Fires when any message is inserted or its status changes. */
   readonly messagesChanged = new Emitter();
@@ -105,6 +205,12 @@ class MessageRouter {
   readonly peersChanged = new Emitter();
   /** Phase 4 — fires on every routing decision (greedy/flood/deliver/drop). */
   readonly routingLog = new PayloadEmitter<RouteLogEntry>();
+  /** Feature batch — fires when any peer's typing indicator appears, lapses or clears. */
+  readonly typingChanged = new Emitter();
+  /** Feature batch — attachment transfer progress, both directions. */
+  readonly mediaProgress = new PayloadEmitter<MediaProgressEvent>();
+  /** Feature batch — fires once per NEW incoming message row (notifications, haptics). */
+  readonly messageReceived = new PayloadEmitter<MessageReceivedEvent>();
 
   private started = false;
   /** Transport-level flood dedup. In-memory for Phase 3 (persisted best-effort is Phase 5). */
@@ -117,6 +223,13 @@ class MessageRouter {
   };
   /** Phase 5 — periodic outbox drain/watchdog tick. */
   private outboxTimer: ReturnType<typeof setInterval> | null = null;
+  /** Feature batch — typing state for peers (remote) and throttle for our own signals. */
+  private typing = new TypingTracker();
+  /** Per-peer timers that emit `typingChanged` when an indicator lapses on its own. */
+  private typingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Feature batch — reassembly of incoming attachments, keyed by message id. */
+  private assembler = new MediaAssembler();
+  private assemblerTimer: ReturnType<typeof setInterval> | null = null;
 
   start(): void {
     if (this.started) return;
@@ -138,6 +251,10 @@ class MessageRouter {
     // whatever persisted from a previous app run.
     this.outboxTimer = setInterval(() => void this.tickOutbox(), OUTBOX_TICK_MS);
     void this.tickOutbox();
+
+    // Feature batch — drop incoming attachment transfers that stopped progressing.
+    if (this.assemblerTimer) clearInterval(this.assemblerTimer);
+    this.assemblerTimer = setInterval(() => this.assembler.sweep(), ASSEMBLER_SWEEP_MS);
 
     // Phase 5 — app foreground is a trigger of its own: RN suspends JS
     // timers in the background, so resuming needs its own nudge to catch up
@@ -163,10 +280,116 @@ class MessageRouter {
    * optimistic UI) and kicks off the send attempt in the background; the
    * caller learns the outcome (sent/queued/delivered) via `messagesChanged`.
    */
-  sendMessage(conversationId: string, dstFingerprintHex: string, text: string): Message {
-    const msg = insertMessage(conversationId, this.myFingerprintHex, text, 'sending');
-    void this.attemptSend(msg, dstFingerprintHex);
+  sendMessage(
+    conversationId: string,
+    dstFingerprintHex: string,
+    text: string,
+    opts?: { replyTo?: string; media?: { bytes: Uint8Array; meta: MediaMeta } },
+  ): Message {
+    const replyTo = opts?.replyTo ?? null;
+    if (!opts?.media) {
+      const msg = replyTo
+        ? insertMessageEx({ conversationId, senderDeviceId: this.myFingerprintHex, text, status: 'sending', replyTo })
+        : insertMessage(conversationId, this.myFingerprintHex, text, 'sending');
+      void this.attemptSend(msg, dstFingerprintHex);
+      return msg;
+    }
+
+    const { bytes, meta } = opts.media;
+    if (!isValidMediaMeta(meta) || meta.size !== bytes.length) {
+      throw new Error('sendMessage: attachment descriptor does not match its bytes');
+    }
+    // The row exists before the file does: attachmentUri stays null (the UI
+    // shows a progress overlay) until saveMediaBytes has written the bytes.
+    const msg = insertMessageEx({
+      conversationId,
+      senderDeviceId: this.myFingerprintHex,
+      text,
+      status: 'sending',
+      replyTo,
+      kind: meta.kind,
+      attachmentMeta: meta,
+    });
+    void this.stageAndSendMedia(msg, dstFingerprintHex, bytes);
     return msg;
+  }
+
+  /**
+   * Feature batch — Persist an outgoing attachment's bytes, record the uri on
+   * the row, then run the normal send path (EXT packet, then chunks). A save
+   * failure cannot be retried from the outbox (there is nothing to read back),
+   * so it is terminal.
+   */
+  private async stageAndSendMedia(msg: Message, dstFingerprintHex: string, bytes: Uint8Array): Promise<void> {
+    const meta = msg.attachmentMeta;
+    if (!meta) return;
+    let uri: string;
+    try {
+      uri = await saveMediaBytes(msg.id, meta.kind, bytes, meta.mime);
+      setMessageAttachment(msg.id, uri, meta);
+    } catch (e: any) {
+      console.warn('[router] could not store attachment:', e?.message ?? e);
+      updateMessageStatus(msg.id, 'failed');
+      this.messagesChanged.emit();
+      return;
+    }
+    this.messagesChanged.emit();
+    await this.attemptSend({ ...msg, attachmentUri: uri }, dstFingerprintHex);
+  }
+
+  /**
+   * Feature batch — Build the wire payload for a stored message. Plain rows
+   * (no reply, no attachment) produce exactly the object the MESSAGE path has
+   * always sent; the optional keys are only added when they carry a value.
+   */
+  private buildPayload(fields: {
+    messageId: string;
+    senderDeviceId: string;
+    text: string;
+    timestamp: number;
+    replyTo: string | null;
+    media: MediaMeta | null;
+  }): MessagePayload {
+    const payload: MessagePayload = {
+      type: 'message',
+      id: fields.messageId,
+      senderDeviceId: fields.senderDeviceId,
+      senderDisplayName: ensureIdentity().displayName,
+      text: fields.text,
+      timestamp: fields.timestamp,
+    };
+    if (fields.replyTo) payload.replyTo = fields.replyTo;
+    if (fields.media) payload.media = fields.media;
+    return payload;
+  }
+
+  /**
+   * Feature batch — Transmit one message: the MESSAGE / MESSAGE_EXT packet and,
+   * for attachments, every MEDIA chunk after it. The attachment is read and
+   * validated before anything is sent so a bad file never leaves a dangling
+   * EXT behind. Throws on any failure; callers route that to the outbox.
+   */
+  private async transmitMessage(
+    payload: MessagePayload,
+    attachmentUri: string | null,
+    dstFingerprintHex: string,
+  ): Promise<void> {
+    let chunks: Uint8Array[] | null = null;
+    const media = payload.media;
+    if (media) {
+      if (!attachmentUri) throw new Error('attachment not stored yet');
+      const bytes = await readMediaBytes(attachmentUri);
+      if (bytes.length !== media.size) throw new Error('attachment size does not match its descriptor');
+      chunks = chunkBytes(bytes);
+      if (chunks.length !== media.chunks) throw new Error('attachment chunk count does not match its descriptor');
+    }
+    await bleService.sendMessage(payload, dstFingerprintHex);
+    if (chunks && media) {
+      const messageId = payload.id;
+      await bleService.sendMediaChunks(messageId, dstFingerprintHex, chunks, (done, total) => {
+        this.mediaProgress.emit({ messageId, done, total, direction: 'out' });
+      });
+    }
   }
 
   /**
@@ -181,6 +404,99 @@ class MessageRouter {
     void this.attemptSend(message, dstFingerprintHex);
   }
 
+  /** Feature batch — whether `peer` is currently typing to us (6 s after their last typing=1). */
+  isPeerTyping(peerFingerprintHex: string): boolean {
+    return this.typing.isTyping(peerFingerprintHex);
+  }
+
+  /**
+   * Feature batch — Tell a peer we are typing (`true`) or stopped (`false`).
+   * typing=1 is throttled to one per 3 s per peer; typing=0 always goes out.
+   * Nothing is sent unless the peer is a currently linked neighbour, and
+   * nothing is ever queued or written to the DB.
+   */
+  notifyTyping(peerFingerprintHex: string, typing: boolean): void {
+    try {
+      if (!this.isLinked(peerFingerprintHex)) return;
+      if (typing && !this.typing.tryAcquireSend(peerFingerprintHex)) return;
+      void bleService.sendControl({ type: 'control', sub: 'typing', typing }, peerFingerprintHex);
+    } catch (e: any) {
+      console.warn('[router] notifyTyping failed:', e?.message ?? e);
+    }
+  }
+
+  /**
+   * Feature batch — The user has looked at a thread. Marks its unread incoming
+   * messages as read, tells the peer (READ control, batched, only when the
+   * read_receipts setting is on), and clears the unread badge.
+   */
+  markConversationSeen(conversationId: string, peerFingerprintHex: string): void {
+    try {
+      const ids = markIncomingRead(conversationId, this.myFingerprintHex);
+      if (ids.length > 0 && readReceiptsEnabled()) {
+        for (let i = 0; i < ids.length; i += MAX_READ_IDS_PER_PACKET) {
+          const batch = ids.slice(i, i + MAX_READ_IDS_PER_PACKET);
+          void bleService.sendControl({ type: 'control', sub: 'read', ids: batch }, peerFingerprintHex);
+        }
+      }
+      markConversationRead(conversationId);
+      if (ids.length > 0) this.messagesChanged.emit();
+      this.conversationsChanged.emit();
+    } catch (e: any) {
+      console.warn('[router] markConversationSeen failed:', e?.message ?? e);
+    }
+  }
+
+  /**
+   * Feature batch — Set or clear our reaction on a message in the thread with
+   * `peerFingerprintHex`. Choosing the emoji we already reacted with removes
+   * it. The change is applied locally first and then sent best-effort.
+   */
+  toggleReaction(messageId: string, peerFingerprintHex: string, emoji: string): void {
+    try {
+      if (!emoji || utf8ByteLength(emoji) > MAX_EMOJI_BYTES) return;
+      const msg = getMessageById(messageId);
+      if (!msg || peerOfConversation(msg.conversationId) !== peerFingerprintHex) return;
+
+      const mine = getReactionsForConversation(msg.conversationId)[messageId]
+        ?.find(r => r.reactorDeviceId === this.myFingerprintHex);
+      const add = !(mine && mine.emoji === emoji);
+      if (add) {
+        upsertReaction(messageId, this.myFingerprintHex, emoji);
+      } else {
+        removeReaction(messageId, this.myFingerprintHex);
+      }
+      this.messagesChanged.emit();
+      void bleService.sendControl(
+        { type: 'control', sub: 'reaction', messageId, emoji, add },
+        peerFingerprintHex,
+      );
+    } catch (e: any) {
+      console.warn('[router] toggleReaction failed:', e?.message ?? e);
+    }
+  }
+
+  /**
+   * Feature batch — Remove a message from this device only (the peer keeps
+   * their copy). Also drops its attachment file and any pending outbox row.
+   */
+  deleteMessageLocal(messageId: string): void {
+    try {
+      const removed = deleteMessage(messageId);
+      if (!removed) return;
+      void deleteMediaFile(removed.attachmentUri);
+      this.messagesChanged.emit();
+      this.conversationsChanged.emit();
+    } catch (e: any) {
+      console.warn('[router] deleteMessageLocal failed:', e?.message ?? e);
+    }
+  }
+
+  /** Feature batch — true when `peer` is one of our currently established links. */
+  private isLinked(peerFingerprintHex: string): boolean {
+    return bleService.getNeighbors().some(n => n.fingerprintHex === peerFingerprintHex);
+  }
+
   /**
    * Phase 5 — Attempt to send a message right now. `sent` on success (the
    * radio accepted it — `delivered` still waits on the ACK); `queued` and
@@ -192,16 +508,16 @@ class MessageRouter {
       this.enqueueForRetry(msg.id, dstFingerprintHex);
       return;
     }
-    const payload: MessagePayload = {
-      type: 'message',
-      id: msg.id,
+    const payload = this.buildPayload({
+      messageId: msg.id,
       senderDeviceId: msg.senderDeviceId,
-      senderDisplayName: ensureIdentity().displayName,
       text: msg.text,
       timestamp: msg.createdAt,
-    };
+      replyTo: msg.replyTo,
+      media: msg.attachmentMeta,
+    });
     try {
-      await bleService.sendMessage(payload, dstFingerprintHex);
+      await this.transmitMessage(payload, msg.attachmentUri, dstFingerprintHex);
       updateMessageStatus(msg.id, 'sent');
       this.messagesChanged.emit();
     } catch (e: any) {
@@ -267,16 +583,16 @@ class MessageRouter {
    * attempt/age budget is exhausted.
    */
   private async retryOutboxEntry(entry: OutboxEntry, now: number): Promise<void> {
-    const payload: MessagePayload = {
-      type: 'message',
-      id: entry.messageId,
+    const payload = this.buildPayload({
+      messageId: entry.messageId,
       senderDeviceId: entry.senderDeviceId,
-      senderDisplayName: ensureIdentity().displayName,
       text: entry.text,
       timestamp: entry.createdAt,
-    };
+      replyTo: entry.replyTo,
+      media: entry.attachmentMeta,
+    });
     try {
-      await bleService.sendMessage(payload, entry.dstFingerprintHex);
+      await this.transmitMessage(payload, entry.attachmentUri, entry.dstFingerprintHex);
       updateMessageStatus(entry.messageId, 'sent');
       removeFromOutbox(entry.messageId);
       this.messagesChanged.emit();
@@ -340,6 +656,261 @@ class MessageRouter {
       this.deliverAck(p);
     } else if (p.header.type === TYPE_POSITION) {
       this.deliverPosition(p);
+    } else if (p.header.type === TYPE_CTRL) {
+      this.deliverControl(p);
+    } else if (p.header.type === TYPE_MESSAGE_EXT) {
+      this.deliverMessageExt(p);
+    } else if (p.header.type === TYPE_MEDIA) {
+      this.deliverMedia(p);
+    }
+  }
+
+  /**
+   * Feature batch — Decrypt the body of an encrypted feature packet
+   * (CTRL / MESSAGE_EXT / MEDIA). Same AES-GCM + header-AAD scheme as MESSAGE.
+   * Returns null (after a warning) when the key is unknown or the tag fails.
+   */
+  private decryptFrom(p: IncomingPacket): Uint8Array | null {
+    try {
+      this.ensurePeerKey(bytesToHex(p.header.src));
+      const aad = headerToAAD(p.headerBytes);
+      return getCrypto().decrypt(p.header.src, p.payloadBytes, aad);
+    } catch (e: any) {
+      console.warn('[router] decrypt failed:', e?.message ?? e);
+      return null;
+    }
+  }
+
+  /** Feature batch — Typing started or stopped for `peer`, with a timer to announce lapses. */
+  private setRemoteTyping(peer: string, typing: boolean): void {
+    const changed = typing ? this.typing.markTyping(peer) : this.typing.clearTyping(peer);
+    const existing = this.typingTimers.get(peer);
+    if (existing) clearTimeout(existing);
+    this.typingTimers.delete(peer);
+    if (typing) {
+      // Re-arm while still inside the window: a timer can fire a little early
+      // relative to the tracker's clock, and the lapse must still be announced.
+      const lapse = (): void => {
+        if (this.typing.isTyping(peer)) {
+          this.typingTimers.set(peer, setTimeout(lapse, 250));
+          return;
+        }
+        this.typingTimers.delete(peer);
+        this.typingChanged.emit();
+      };
+      this.typingTimers.set(peer, setTimeout(lapse, TYPING_HOLD_MS));
+    }
+    if (changed) this.typingChanged.emit();
+  }
+
+  /**
+   * Feature batch — CTRL packets. The sender is `header.src`, never a body
+   * field. Typing never touches the DB; read and reaction only act on
+   * messages that belong to a conversation with that peer.
+   */
+  private deliverControl(p: IncomingPacket): void {
+    try {
+      const plaintext = this.decryptFrom(p);
+      if (!plaintext) return;
+      const ctrl = decodeBody(TYPE_CTRL, plaintext) as ControlPayload;
+      const src = bytesToHex(p.header.src);
+      if (ctrl.sub === 'typing') {
+        this.setRemoteTyping(src, ctrl.typing);
+      } else if (ctrl.sub === 'read') {
+        this.applyRemoteRead(src, ctrl.ids);
+      } else if (ctrl.sub === 'reaction') {
+        this.applyRemoteReaction(src, ctrl);
+      }
+    } catch (e: any) {
+      console.warn('[router] control packet failed:', e?.message ?? e);
+    }
+  }
+
+  /** Peer read our messages: only our own rows in their conversation are touched. */
+  private applyRemoteRead(src: string, ids: string[]): void {
+    const valid: string[] = [];
+    for (const id of ids.slice(0, MAX_READ_IDS_PER_PACKET)) {
+      const msg = getMessageById(id);
+      if (!msg) continue;
+      if (msg.senderDeviceId !== this.myFingerprintHex) continue;
+      if (peerOfConversation(msg.conversationId) !== src) continue;
+      valid.push(id);
+    }
+    if (valid.length === 0) return;
+    markOutgoingRead(valid);
+    this.messagesChanged.emit();
+    this.conversationsChanged.emit();
+  }
+
+  /** Peer reacted (or un-reacted) to a message in their conversation with us. */
+  private applyRemoteReaction(src: string, ctrl: Extract<ControlPayload, { sub: 'reaction' }>): void {
+    const msg = getMessageById(ctrl.messageId);
+    if (!msg || peerOfConversation(msg.conversationId) !== src) return;
+    if (ctrl.add) {
+      if (!ctrl.emoji || utf8ByteLength(ctrl.emoji) > MAX_EMOJI_BYTES) return;
+      upsertReaction(msg.id, src, ctrl.emoji);
+    } else {
+      removeReaction(msg.id, src);
+    }
+    this.messagesChanged.emit();
+  }
+
+  /**
+   * Feature batch — MESSAGE_EXT: a message with reply-to and/or an attachment
+   * descriptor. Text-only messages are stored and ACKed like MESSAGE. Messages
+   * with media are stored with no file yet; the ACK waits until every chunk has
+   * arrived and been saved, so the sender's `delivered` means the photo arrived.
+   */
+  private deliverMessageExt(p: IncomingPacket): void {
+    try {
+      const src = bytesToHex(p.header.src);
+      const plaintext = this.decryptFrom(p);
+      if (!plaintext) return;
+      const msg = decodeBody(TYPE_MESSAGE_EXT, plaintext) as MessagePayload;
+      // The body's sender field is only trusted when it matches the link-layer
+      // source of the authenticated packet.
+      if (msg.senderDeviceId !== src) {
+        console.warn('[router] MESSAGE_EXT sender mismatch, dropped');
+        return;
+      }
+      if (msg.media && !isValidMediaMeta(msg.media)) {
+        console.warn('[router] MESSAGE_EXT attachment descriptor invalid, dropped');
+        return;
+      }
+      this.setRemoteTyping(src, false);
+
+      const existing = getMessageById(msg.id);
+      if (existing) {
+        // Duplicate of a message we already hold. Either it is complete (ACK
+        // again so the sender stops retrying) or its transfer is in flight and
+        // must not be restarted, which would discard chunks already received.
+        if (existing.senderDeviceId !== src) return;
+        if (existing.attachmentUri || !msg.media) {
+          void bleService.sendAck(msg.id, src);
+        } else if (this.assembler.progress(msg.id) === null) {
+          // The transfer was swept before it finished; re-arm it from this EXT.
+          this.armIncomingMedia(msg.id, src, msg.media);
+        }
+        return;
+      }
+
+      const conversation = getOrCreateConversation(
+        msg.senderDeviceId,
+        msg.senderDisplayName || msg.senderDeviceId,
+      );
+      const hops = receivedHopCount(p.header.ttl, DEFAULT_TTL);
+      insertMessageEx({
+        conversationId: conversation.id,
+        senderDeviceId: src,
+        text: msg.text,
+        status: 'delivered',
+        id: msg.id,
+        hops,
+        replyTo: msg.replyTo ?? null,
+        kind: msg.media ? msg.media.kind : 'text',
+        attachmentUri: null,
+        attachmentMeta: msg.media ?? null,
+      });
+      this.messagesChanged.emit();
+      this.conversationsChanged.emit();
+      this.messageReceived.emit({
+        conversationId: conversation.id,
+        peerDeviceId: src,
+        senderName: msg.senderDisplayName || src,
+        preview: msg.text,
+        messageId: msg.id,
+        kind: msg.media ? msg.media.kind : 'text',
+      });
+      this.stats.delivered += 1;
+      this.logRoute(p, 'deliver', { hops });
+
+      if (!msg.media) {
+        void bleService.sendAck(msg.id, src);
+      } else {
+        this.armIncomingMedia(msg.id, src, msg.media);
+      }
+    } catch (e: any) {
+      console.warn('[router] message_ext failed:', e?.message ?? e);
+    }
+  }
+
+  /**
+   * Feature batch — Register an expected attachment. If chunks that raced ahead
+   * of the EXT already complete it, finish right away (expect() reports that).
+   */
+  private armIncomingMedia(messageId: string, src: string, meta: MediaMeta): void {
+    const done = this.assembler.expect(messageId, meta.chunks, meta.size);
+    this.mediaProgress.emit({ messageId, done: 0, total: meta.chunks, direction: 'in' });
+    if (done && done.done) void this.completeIncomingMedia(messageId, src, meta, done.bytes);
+  }
+
+  /**
+   * Feature batch — One MEDIA chunk. Chunks for a stored message must come from
+   * its sender and are bounded by the descriptor's chunk count. Chunks that
+   * arrive before their EXT are held by the assembler until it is announced.
+   */
+  private deliverMedia(p: IncomingPacket): void {
+    try {
+      const src = bytesToHex(p.header.src);
+      const plaintext = this.decryptFrom(p);
+      if (!plaintext) return;
+      const chunk = decodeBody(TYPE_MEDIA, plaintext) as MediaChunkPayload;
+
+      const row = getMessageById(chunk.messageId);
+      if (row) {
+        const meta = row.attachmentMeta;
+        if (row.senderDeviceId !== src || row.attachmentUri || !meta) return;
+        if (chunk.index >= meta.chunks) return;
+      } else if (chunk.index >= MAX_MEDIA_CHUNKS) {
+        return;
+      }
+
+      const result = this.assembler.addChunk(chunk.messageId, chunk.index, chunk.data);
+      if (result.done) {
+        if (row && row.attachmentMeta) {
+          void this.completeIncomingMedia(chunk.messageId, src, row.attachmentMeta, result.bytes);
+        } else {
+          // The row was deleted locally while its bytes were in flight. The
+          // sender still deserves the ACK: the attachment did arrive.
+          void bleService.sendAck(chunk.messageId, src);
+        }
+        return;
+      }
+      if (result.total > 0) {
+        this.mediaProgress.emit({
+          messageId: chunk.messageId,
+          done: result.received,
+          total: result.total,
+          direction: 'in',
+        });
+      }
+    } catch (e: any) {
+      console.warn('[router] media chunk failed:', e?.message ?? e);
+    }
+  }
+
+  /**
+   * Feature batch — A fully received attachment: write it to disk, point the
+   * row at it, refresh the UI, and only then ACK the sender.
+   */
+  private async completeIncomingMedia(
+    messageId: string,
+    src: string,
+    meta: MediaMeta,
+    bytes: Uint8Array,
+  ): Promise<void> {
+    try {
+      if (!getMessageById(messageId)) {
+        void bleService.sendAck(messageId, src);
+        return;
+      }
+      const uri = await saveMediaBytes(messageId, meta.kind, bytes, meta.mime);
+      setMessageAttachment(messageId, uri, meta);
+      this.mediaProgress.emit({ messageId, done: meta.chunks, total: meta.chunks, direction: 'in' });
+      this.messagesChanged.emit();
+      void bleService.sendAck(messageId, src);
+    } catch (e: any) {
+      console.warn('[router] could not store received attachment:', e?.message ?? e);
     }
   }
 
@@ -386,11 +957,22 @@ class MessageRouter {
       msg.senderDisplayName || msg.senderDeviceId,
     );
 
+    // A message from the peer means they are no longer typing.
+    this.setRemoteTyping(senderFpHex, false);
+
     if (!alreadySeen) {
       const hops = receivedHopCount(p.header.ttl, DEFAULT_TTL);
       insertMessage(conversation.id, msg.senderDeviceId, msg.text, 'delivered', msg.id, hops);
       this.messagesChanged.emit();
       this.conversationsChanged.emit();
+      this.messageReceived.emit({
+        conversationId: conversation.id,
+        peerDeviceId: msg.senderDeviceId,
+        senderName: msg.senderDisplayName || msg.senderDeviceId,
+        preview: msg.text,
+        messageId: msg.id,
+        kind: 'text',
+      });
     }
 
     this.stats.delivered += 1;
@@ -552,9 +1134,7 @@ class MessageRouter {
     extra: { target?: string; reason?: string; progressMeters?: number; neighborCount?: number; hops?: number },
   ): void {
     const msgId = bytesToHex(p.header.msgId).slice(0, 8);
-    const typeName =
-      p.header.type === TYPE_MESSAGE ? 'MESSAGE' :
-      p.header.type === TYPE_ACK ? 'ACK' : 'POSITION';
+    const typeName = routeTypeLabel(p.header.type);
     const neighborCount = extra.neighborCount ?? bleService.getNeighbors().length;
     const entry: RouteLogEntry = {
       timestamp: Date.now(),

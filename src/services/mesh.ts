@@ -38,6 +38,8 @@ export const MAX_CENTRAL_CONNECTIONS = 4;
 const RSSI_REFRESH_MS = 10_000;
 /** Don't re-attempt an auto-connect to a MAC we just tried for this long. */
 const RECENT_ATTEMPT_COOLDOWN_MS = 20_000;
+/** Retry delay for a duty-cycle scan skipped while a media transfer is active. */
+const BULK_RETRY_MS = 5_000;
 
 class MeshManager {
   /** Fires whenever a link comes up or goes down (neighbors list changed). */
@@ -139,6 +141,8 @@ class MeshManager {
     if (!this.running) return;
     // If a scan is in progress, let it finish naturally.
     if (bleService.getState() === 'scanning') return;
+    // Scanning slows an active media transfer; the periodic cycle picks it up.
+    if (bleService.isBulkTransferActive()) return;
     if (this.cycleTimer !== null) {
       clearTimeout(this.cycleTimer);
       this.cycleTimer = null;
@@ -154,6 +158,12 @@ class MeshManager {
    */
   private async dutyCycle(): Promise<void> {
     if (!this.running) return;
+    // Scanning shares the radio and slows media transfers: skip this scan and
+    // retry soon, leaving discovered peers untouched.
+    if (bleService.isBulkTransferActive()) {
+      this.cycleTimer = setTimeout(() => void this.dutyCycle(), BULK_RETRY_MS);
+      return;
+    }
     this.discoveredThisCycle.clear();
     try {
       await bleService.startScan(SCAN_MS);
@@ -175,6 +185,14 @@ class MeshManager {
    */
   private async drainDiscovered(): Promise<void> {
     const peers = Array.from(this.discoveredThisCycle.values());
+    // Advertised names of peers we already hold a central link to. Phones rotate
+    // their BLE MAC, so the same device can come back under a new bleId.
+    const centralNames = new Set(
+      bleService
+        .getNeighbors()
+        .filter(n => n.hasCentral)
+        .map(n => `MC_${n.displayName.slice(0, 8)}`),
+    );
     for (const peer of peers) {
       if (!this.running) return;
       const bleId = peer.bleId;
@@ -183,9 +201,11 @@ class MeshManager {
       if (bleService.getCentralConnectionCount() >= MAX_CENTRAL_CONNECTIONS) return;
       const last = this.lastAttempt.get(bleId);
       if (last && Date.now() - last < RECENT_ATTEMPT_COOLDOWN_MS) continue;
-      // Don't auto-connect to a peer we already have a link to (by bleId).
-      // bleService.connectToPeer also guards this, but checking first avoids
-      // spawning a doomed promise.
+      // Don't auto-connect to a peer we already have a central link to. Matched
+      // by advertised name (MC_ + first 8 chars), not bleId, since the MAC rotates.
+      // Limit: two peers sharing those 8 chars look identical, so we skip both and
+      // rely on the other one connecting to us, which still works via the peripheral side.
+      if (centralNames.has(peer.displayName)) continue;
       void this.autoConnect(bleId);
     }
   }

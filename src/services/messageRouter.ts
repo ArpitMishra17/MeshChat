@@ -894,6 +894,8 @@ class MessageRouter {
    * arrive before their EXT are held by the assembler until it is announced.
    */
   private deliverMedia(p: IncomingPacket): void {
+    // Keep the mesh from scanning while chunks are still arriving.
+    bleService.markBulkTransfer();
     try {
       const src = bytesToHex(p.header.src);
       const plaintext = this.decryptFrom(p);

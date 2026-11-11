@@ -63,6 +63,70 @@ export function fingerprintHexFromPubKey(pubKey: Uint8Array): string {
   return bytesToHex(fingerprintFromPubKey(pubKey));
 }
 
+/** Domain-separation prefix for safety-number hashing. */
+const SAFETY_DOMAIN = new TextEncoder().encode('meshchat-safety-v1');
+/** Total SHA-256 rounds per key — slows brute-force search for colliding keys. */
+const SAFETY_ITERATIONS = 5200;
+
+/** Concatenate byte arrays into one new array. */
+function joinBytes(...parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((sum, p) => sum + p.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const p of parts) {
+    out.set(p, offset);
+    offset += p.length;
+  }
+  return out;
+}
+
+/**
+ * 30 decimal digits derived from one X25519 public key.
+ *
+ * `h = SHA-256("meshchat-safety-v1" ‖ pubkey)`, re-hashed as
+ * `h = SHA-256(h ‖ pubkey)` until 5200 rounds total. The first 30 bytes are
+ * read as six big-endian 40-bit integers, each reduced mod 100000 and
+ * zero-padded to 5 digits. The 40-bit values stay below 2^40, so plain JS
+ * number arithmetic is exact (no 32-bit bitwise ops).
+ */
+export function safetyNumberHalf(pubKey: Uint8Array): string {
+  if (pubKey.length !== PUBLIC_KEY_SIZE) {
+    throw new Error(`public key must be ${PUBLIC_KEY_SIZE} bytes, got ${pubKey.length}`);
+  }
+  let h = sha256(joinBytes(SAFETY_DOMAIN, pubKey));
+  for (let i = 1; i < SAFETY_ITERATIONS; i++) {
+    h = sha256(joinBytes(h, pubKey));
+  }
+  let digits = '';
+  for (let chunk = 0; chunk < 6; chunk++) {
+    let n = 0;
+    for (let j = 0; j < 5; j++) {
+      n = n * 256 + h[chunk * 5 + j];
+    }
+    digits += (n % 100000).toString().padStart(5, '0');
+  }
+  return digits;
+}
+
+/**
+ * 60-digit safety number for a pair of public keys, formatted as 12 groups
+ * of 5 digits separated by single spaces.
+ *
+ * Order-independent: each key's 30-digit half is computed, the two halves
+ * are sorted lexicographically, then concatenated. Both phones therefore
+ * display the same number. Users compare it in person to confirm they hold
+ * each other's real keys.
+ */
+export function safetyNumber(pubKeyA: Uint8Array, pubKeyB: Uint8Array): string {
+  const [first, second] = [safetyNumberHalf(pubKeyA), safetyNumberHalf(pubKeyB)].sort();
+  const digits = first + second;
+  const groups: string[] = [];
+  for (let i = 0; i < digits.length; i += 5) {
+    groups.push(digits.slice(i, i + 5));
+  }
+  return groups.join(' ');
+}
+
 /**
  * Cryptographic identity + per-peer encryption for one node.
  *

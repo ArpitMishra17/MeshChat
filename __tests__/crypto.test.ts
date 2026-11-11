@@ -17,6 +17,8 @@ import {
   generateTestKey,
   fingerprintFromPubKey,
   fingerprintHexFromPubKey,
+  safetyNumber,
+  safetyNumberHalf,
   NONCE_SIZE,
   GCM_TAG_SIZE,
   PUBLIC_KEY_SIZE,
@@ -430,5 +432,50 @@ describe('headerToAAD', () => {
       dst: hexToBytes('0807060504030201'), payloadLen: 10,
     });
     expect(bytesToHex(headerToAAD(h1))).toBe(bytesToHex(headerToAAD(h2)));
+  });
+});
+
+// =====================================================================
+// Safety numbers
+// =====================================================================
+
+describe('safety number', () => {
+  const SAFETY_RE = /^(\d{5} ){11}\d{5}$/;
+
+  it('is identical regardless of argument order', () => {
+    const alice = new CryptoService(generateTestKey()).getPublicKey();
+    const bob = new CryptoService(generateTestKey()).getPublicKey();
+    expect(safetyNumber(alice, bob)).toBe(safetyNumber(bob, alice));
+  });
+
+  it('is formatted as 12 groups of 5 digits', () => {
+    const alice = new CryptoService(generateTestKey()).getPublicKey();
+    const bob = new CryptoService(generateTestKey()).getPublicKey();
+    expect(safetyNumber(alice, bob)).toMatch(SAFETY_RE);
+  });
+
+  it('changes when the peer key changes', () => {
+    const alice = new CryptoService(generateTestKey()).getPublicKey();
+    const bob = new CryptoService(generateTestKey()).getPublicKey();
+    const eve = new CryptoService(generateTestKey()).getPublicKey();
+    expect(safetyNumber(alice, bob)).not.toBe(safetyNumber(alice, eve));
+  });
+
+  it('is deterministic for a fixed key', () => {
+    const key = new Uint8Array(PUBLIC_KEY_SIZE).fill(0x01);
+    const other = new Uint8Array(PUBLIC_KEY_SIZE).fill(0x02);
+    const first = safetyNumber(key, other);
+    expect(safetyNumber(key, other)).toBe(first);
+    expect(safetyNumberHalf(key)).toBe(safetyNumberHalf(new Uint8Array(key)));
+    expect(safetyNumberHalf(key)).toMatch(/^\d{30}$/);
+  });
+
+  it('throws when either key has the wrong length', () => {
+    const good = new Uint8Array(PUBLIC_KEY_SIZE).fill(0x03);
+    const short = new Uint8Array(31);
+    const long = new Uint8Array(33);
+    expect(() => safetyNumberHalf(short)).toThrow();
+    expect(() => safetyNumber(short, good)).toThrow();
+    expect(() => safetyNumber(good, long)).toThrow();
   });
 });

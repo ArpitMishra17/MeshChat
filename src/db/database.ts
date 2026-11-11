@@ -946,6 +946,18 @@ export function getConversationSummaries(myFingerprintHex: string): Record<strin
   return out;
 }
 
+/** Total unread messages across all conversations, using the same rule as getConversationSummaries. */
+export function getTotalUnread(myFingerprintHex: string): number {
+  const rows = db.getAllSync<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM messages m
+       JOIN conversations c ON c.id = m.conversation_id
+      WHERE m.sender_device_id != ?
+        AND m.created_at > COALESCE(c.last_read_at, 0)`,
+    [myFingerprintHex],
+  );
+  return rows[0]?.n ?? 0;
+}
+
 // --- Telemetry helpers ---
 
 /** Number of messages currently waiting in the outbox. */

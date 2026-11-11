@@ -9,6 +9,7 @@ import { ChatScreen } from './screens/ChatScreen';
 import { SettingsScreen } from './screens/SettingsScreen';
 import { MeshScreen } from './screens/MeshScreen';
 import { WireScreen } from './screens/WireScreen';
+import { VerifyScreen } from './screens/VerifyScreen';
 
 export type RootStackParamList = {
   Main: undefined;
@@ -16,6 +17,10 @@ export type RootStackParamList = {
     conversationId: string;
     peerName: string;
     peerDeviceId: string;
+  };
+  Verify: {
+    peerDeviceId: string;
+    peerName: string;
   };
 };
 
@@ -54,6 +59,7 @@ export function AppNavigator() {
       }}>
       <Stack.Screen name="Main" component={MainTabs} />
       <Stack.Screen name="Chat" component={ChatScreen} options={{ animation: 'slide_from_right' }} />
+      <Stack.Screen name="Verify" component={VerifyScreen} options={{ animation: 'slide_from_right' }} />
     </Stack.Navigator>
   );
 }

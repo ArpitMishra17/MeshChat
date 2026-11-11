@@ -60,6 +60,7 @@ import {
   getBoolSetting,
   messageExists,
   getPeerByFingerprint,
+  flagPeerKeyWarning,
   enqueueOutbox,
   setOutboxAttempt,
   removeFromOutbox,
@@ -206,6 +207,12 @@ class MessageRouter {
   readonly peersChanged = new Emitter();
   /** Phase 4 — fires on every routing decision (greedy/flood/deliver/drop). */
   readonly routingLog = new PayloadEmitter<RouteLogEntry>();
+  /**
+   * A peer presented a different key than expected (TOFU violation, or a
+   * known display name with a new fingerprint). Fired after the warning is
+   * stored on the peer row, so listeners can re-query it.
+   */
+  readonly keyWarning = new PayloadEmitter<{ deviceId: string; displayName: string }>();
   /** Feature batch — fires when any peer's typing indicator appears, lapses or clears. */
   readonly typingChanged = new Emitter();
   /** Feature batch — attachment transfer progress, both directions. */
@@ -247,6 +254,15 @@ class MessageRouter {
       bleService.packetReceived.subscribe(p => this.handlePacket(p)),
       bleService.peerDiscovered.subscribe(() => this.peersChanged.emit()),
       bleService.handshakeReceived.subscribe(() => this.peersChanged.emit()),
+      bleService.keyWarning.subscribe(w => {
+        try {
+          flagPeerKeyWarning(w.deviceId, w.displayName);
+        } catch (e: any) {
+          console.warn('[router] flagPeerKeyWarning failed:', e?.message ?? e);
+        }
+        this.peersChanged.emit();
+        this.keyWarning.emit(w);
+      }),
       // Phase 5 — a new link may unblock delivery for queued messages
       // addressed to someone reachable through it, even if it isn't the
       // destination itself (the mesh may relay further).

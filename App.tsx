@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { StatusBar } from 'react-native';
+import { Alert, StatusBar } from 'react-native';
 import { useFonts } from 'expo-font';
 import { NavigationContainer, createNavigationContainerRef } from '@react-navigation/native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -35,6 +35,9 @@ const navigationRef = createNavigationContainerRef<RootStackParamList>();
 // A notification tapped before the navigator exists (cold start, onboarding) is
 // parked here and flushed from NavigationContainer's onReady.
 let pendingChatOpen: { conversationId: string; peerDeviceId: string } | null = null;
+
+/** Repeat key-change alerts for the same peer within this window are dropped. */
+const KEY_ALERT_DEDUP_MS = 10_000;
 
 function openChatFromNotification(conversationId: string, peerDeviceId: string): void {
   if (!navigationRef.isReady()) {
@@ -77,6 +80,32 @@ export default function App() {
       // as a flooding-only relay.
       void positionProvider.start();
     }
+  }, []);
+
+  // A peer's key changed: the router saves the warning, then emits. Alert once
+  // per peer per burst so a chatty peer does not stack dialogs.
+  useEffect(() => {
+    const lastAlertAt = new Map<string, number>();
+    return messageRouter.keyWarning.subscribe(w => {
+      const now = Date.now();
+      const prev = lastAlertAt.get(w.deviceId);
+      if (prev !== undefined && now - prev < KEY_ALERT_DEDUP_MS) return;
+      lastAlertAt.set(w.deviceId, now);
+      Alert.alert(
+        'Key changed',
+        `${w.displayName} is using a different key than before. This can happen after a reinstall, or someone may be impersonating them. Compare safety numbers before trusting new messages.`,
+        [
+          { text: 'Later', style: 'cancel' },
+          {
+            text: 'Verify',
+            onPress: () => {
+              if (!navigationRef.isReady()) return;
+              navigationRef.navigate('Verify', { peerDeviceId: w.deviceId, peerName: w.displayName });
+            },
+          },
+        ],
+      );
+    });
   }, []);
 
   // P0.1 — onboarding just created an identity; start the router now.

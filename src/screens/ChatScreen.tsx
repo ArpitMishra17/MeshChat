@@ -14,7 +14,7 @@ import type { BLEState } from '../services/ble';
 import { messageRouter } from '../services/messageRouter';
 import { notifier } from '../services/notifier';
 import { prepareAudio, prepareImage, deleteMediaFile } from '../services/media';
-import { getMessages, getReactionsForConversation } from '../db/database';
+import { getMessages, getPeerByFingerprint, getReactionsForConversation } from '../db/database';
 import { ensureIdentity } from '../services/identity';
 import { MessageBubble } from '../components/MessageBubble';
 import { MessageActionSheet } from '../components/MessageActionSheet';
@@ -27,7 +27,7 @@ import { AttachButton } from '../components/AttachButton';
 import { VoiceButton, type VoiceButtonHandle } from '../components/VoiceButton';
 import { Btn, Chip } from '../components/ui';
 import { DEFAULT_TTL } from '../services/protocol';
-import type { MediaMeta, Message, Reaction } from '../types';
+import type { MediaMeta, Message, Peer, Reaction } from '../types';
 import type { RootStackParamList } from '../navigation';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Chat'>;
@@ -56,6 +56,7 @@ export function ChatScreen({ route, navigation }: Props) {
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [recording, setRecording] = useState(false);
+  const [peer, setPeer] = useState<Peer | null>(null);
   const voiceRef = useRef<VoiceButtonHandle>(null);
   const flatListRef = useRef<FlatList<Message>>(null);
   const inputRef = useRef<TextInput>(null);
@@ -114,6 +115,22 @@ export function ChatScreen({ route, navigation }: Props) {
       voiceRef.current?.discard();
     };
   }, [conversationId, peerDeviceId]));
+
+  // Peer row carries the verified flag and any key-change warning. Reloaded on
+  // focus (the verify screen may have changed it) and on router peer changes.
+  const loadPeer = useCallback(() => {
+    setPeer(getPeerByFingerprint(peerDeviceId));
+  }, [peerDeviceId]);
+
+  useFocusEffect(useCallback(() => {
+    loadPeer();
+  }, [loadPeer]));
+
+  useEffect(() => messageRouter.peersChanged.subscribe(loadPeer), [loadPeer]);
+
+  const openVerify = useCallback(() => {
+    navigation.navigate('Verify', { peerDeviceId, peerName });
+  }, [navigation, peerDeviceId, peerName]);
 
   useEffect(() => {
     const sub = AppState.addEventListener('change', state => setAppActive(state === 'active'));
@@ -309,6 +326,19 @@ export function ChatScreen({ route, navigation }: Props) {
         right={<StatusBadge state={bleState} />}
       />
 
+      {peer?.keyWarningAt != null ? (
+        <Pressable
+          style={styles.keyWarning}
+          onPress={openVerify}
+          accessibilityRole="button"
+          accessibilityLabel={`key changed for ${peer.displayName}, compare safety numbers`}>
+          <Text style={styles.keyWarningText}>
+            <Text style={styles.keyWarningTitle}>KEY CHANGED</Text>
+            {` — ${peer.displayName} is using a new key. tap to compare safety numbers.`}
+          </Text>
+        </Pressable>
+      ) : null}
+
       <FlatList
         ref={flatListRef}
         data={messages}
@@ -355,7 +385,20 @@ export function ChatScreen({ route, navigation }: Props) {
       />
 
       <View style={styles.chips}>
-        <Chip label="x25519 session" tone="green" />
+        <Pressable
+          onPress={openVerify}
+          accessibilityRole="button"
+          accessibilityLabel={peer?.verified ? 'verified, open safety number' : 'x25519 session, open safety number'}>
+          {peer?.verified ? <Chip label="verified" tone="green" /> : <Chip label="x25519 session" tone="green" />}
+        </Pressable>
+        {peer && !peer.verified ? (
+          <Pressable
+            onPress={openVerify}
+            accessibilityRole="button"
+            accessibilityLabel="verify peer safety number">
+            <Chip label="verify" tone="amber" />
+          </Pressable>
+        ) : null}
         <Chip label={`ttl ${DEFAULT_TTL}`} />
         <TypingIndicator active={peerTyping} />
         {busy ? <Chip label="preparing…" tone="amber" /> : null}
@@ -431,6 +474,12 @@ const styles = StyleSheet.create({
   },
   emptyHint: { fontFamily: fonts.mono, fontSize: 11, color: colors.textMuted, marginTop: 8 },
   chips: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 16, paddingBottom: 12 },
+  keyWarning: {
+    paddingHorizontal: 16, paddingVertical: 10,
+    borderBottomWidth: 1, borderBottomColor: colors.errorBorder, backgroundColor: colors.errorFaint,
+  },
+  keyWarningText: { fontFamily: fonts.mono, fontSize: 11, lineHeight: 17, color: colors.textDim },
+  keyWarningTitle: { fontFamily: fonts.dispBold, fontSize: 10, letterSpacing: 1.2, color: colors.error },
   composer: {
     flexDirection: 'row', alignItems: 'flex-end', gap: 10,
     paddingHorizontal: 16, paddingTop: 12,

@@ -30,6 +30,25 @@ function formatTime(ts: number): string {
   return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
 }
 
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** HH:MM, prefixed with a short date ("12 Nov 14:32") when ts falls on another day than createdAt. */
+function formatStamp(ts: number, createdAt: number): string {
+  const d = new Date(ts);
+  const c = new Date(createdAt);
+  const sameDay =
+    d.getFullYear() === c.getFullYear() && d.getMonth() === c.getMonth() && d.getDate() === c.getDate();
+  const time = formatTime(ts);
+  return sameDay ? time : `${d.getDate()} ${MONTHS[d.getMonth()]} ${time}`;
+}
+
+/** Delivery/read status line for an outgoing message, e.g. "delivered 14:32" or "read". */
+function deliveryLabel(verb: 'read' | 'delivered', ts: number | null, createdAt: number) {
+  if (ts == null) return { text: verb, a11y: verb };
+  const stamp = formatStamp(ts, createdAt);
+  return { text: `${verb} ${stamp}`, a11y: `${verb} at ${stamp}` };
+}
+
 /** Bubbles that arrive live ease in (opacity + lift + slight scale). */
 function useEntrance(createdAt: number) {
   const fresh = Date.now() - createdAt < 2000;
@@ -87,6 +106,11 @@ export function MessageBubble({
     `via ${relayCount} relay${relayCount === 1 ? '' : 's'}`;
   const failed = message.status === 'failed';
   const read = isMine && message.status === 'delivered' && message.readAt != null;
+  const receipt = isMine && message.status === 'delivered'
+    ? read
+      ? deliveryLabel('read', message.readAt, message.createdAt)
+      : deliveryLabel('delivered', message.deliveredAt, message.createdAt)
+    : null;
 
   return (
     <Animated.View style={[styles.container, isMine ? styles.mine : styles.theirs, entrance]}>
@@ -112,7 +136,13 @@ export function MessageBubble({
         {isMine ? (
           <>
             <Ladder status={message.status} read={read} />
-            {read ? <Text style={styles.read}>read</Text> : null}
+            {receipt ? (
+              <Text
+                style={read ? styles.read : styles.delivered}
+                accessibilityLabel={receipt.a11y}>
+                {receipt.text}
+              </Text>
+            ) : null}
             {failed ? <Text style={styles.failed}>failed · tap to retry</Text> : null}
             {message.status === 'queued' ? <Text style={styles.queued}>queued</Text> : null}
           </>
@@ -154,6 +184,7 @@ const styles = StyleSheet.create({
   time: { fontFamily: fonts.mono, fontSize: 10, color: colors.textMuted },
   hop: { fontFamily: fonts.mono, fontSize: 10, color: colors.primary },
   read: { fontFamily: fonts.mono, fontSize: 10, color: colors.accent },
+  delivered: { fontFamily: fonts.mono, fontSize: 10, color: colors.primary },
   failed: { fontFamily: fonts.mono, fontSize: 10, color: colors.error },
   queued: { fontFamily: fonts.mono, fontSize: 10, color: colors.warning },
   ribbon: { flexDirection: 'row', gap: 6 },

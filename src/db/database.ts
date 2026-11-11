@@ -46,7 +46,9 @@ function initSchema() {
       rssi INTEGER,
       ble_id TEXT,
       public_key TEXT,
-      key_pinned INTEGER NOT NULL DEFAULT 0
+      key_pinned INTEGER NOT NULL DEFAULT 0,
+      verified INTEGER NOT NULL DEFAULT 0,
+      key_warning_at INTEGER
     );
   `);
 
@@ -153,6 +155,10 @@ function initSchema() {
  * so existing rows read as plain text and everything else stays NULL. The new
  * `reactions` table is additive. Each ALTER is guarded by PRAGMA table_info so
  * a partially-applied or already-current table is not altered twice.
+ *
+ * v9 adds `peers.verified` (the user compared safety numbers in person) and
+ * `peers.key_warning_at` (when a key-change warning was raised for this peer,
+ * cleared once the user verifies). Both default to "not verified, no warning".
  */
 function runMigrations() {
   const versionRow = db.getAllSync<{ user_version: number }>('PRAGMA user_version');
@@ -240,6 +246,16 @@ function runMigrations() {
       )
     `);
     version = 8;
+  }
+
+  if (version < 9) {
+    const cols = db.getAllSync<{ name: string }>('PRAGMA table_info(peers)');
+    if (cols.length > 0) {
+      const has = (name: string) => cols.some(c => c.name === name);
+      if (!has('verified')) db.execSync('ALTER TABLE peers ADD COLUMN verified INTEGER NOT NULL DEFAULT 0');
+      if (!has('key_warning_at')) db.execSync('ALTER TABLE peers ADD COLUMN key_warning_at INTEGER');
+    }
+    version = 9;
   }
 
   db.runSync(`PRAGMA user_version = ${version}`);
@@ -341,6 +357,36 @@ export function checkPeerKeyChange(deviceId: string, publicKey: string): 'match'
   return row.public_key === publicKey ? 'match' : 'changed';
 }
 
+/**
+ * Mark a peer as verified (safety numbers compared in person) or not.
+ * Verifying also clears any pending key-change warning for that peer.
+ */
+export function setPeerVerified(deviceId: string, verified: boolean): void {
+  db.runSync(
+    `UPDATE peers SET verified = ?,
+       key_warning_at = CASE WHEN ? = 1 THEN NULL ELSE key_warning_at END
+     WHERE device_id = ?`,
+    [verified ? 1 : 0, verified ? 1 : 0, deviceId],
+  );
+}
+
+/**
+ * Record a key-change warning for a peer and drop any earlier verification.
+ * The warning can fire during the HELLO, before the peer row exists, so this
+ * inserts a stub row when needed; the normal upsert fills in the rest.
+ */
+export function flagPeerKeyWarning(deviceId: string, displayName: string): void {
+  const now = Date.now();
+  db.runSync(
+    `INSERT INTO peers (device_id, display_name, last_seen, key_warning_at, verified)
+     VALUES (?, ?, ?, ?, 0)
+     ON CONFLICT(device_id) DO UPDATE SET
+       key_warning_at = excluded.key_warning_at,
+       verified = 0`,
+    [deviceId, displayName, now, now],
+  );
+}
+
 export function getAllPeers(): Peer[] {
   const rows = db.getAllSync<any>(
     `SELECT * FROM peers ORDER BY last_seen DESC`,
@@ -353,6 +399,8 @@ export function getAllPeers(): Peer[] {
     bleId: row.ble_id,
     publicKey: row.public_key ?? null,
     keyPinned: row.key_pinned === 1,
+    verified: row.verified === 1,
+    keyWarningAt: row.key_warning_at ?? null,
   }));
 }
 
@@ -378,6 +426,8 @@ export function getPeerByFingerprint(fingerprintHex: string): Peer | null {
     bleId: row.ble_id,
     publicKey: row.public_key ?? null,
     keyPinned: row.key_pinned === 1,
+    verified: row.verified === 1,
+    keyWarningAt: row.key_warning_at ?? null,
   };
 }
 

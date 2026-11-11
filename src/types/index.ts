@@ -26,6 +26,10 @@ export interface Peer {
   bleId: string | null;
   publicKey: string | null;
   keyPinned: boolean;
+  /** The user compared safety numbers in person and marked this peer verified. */
+  verified?: boolean;
+  /** When a key-change warning was raised for this peer; null once verified. */
+  keyWarningAt?: number | null;
 }
 
 export interface Conversation {

@@ -38,6 +38,8 @@ import {
   headerToAAD,
   _clearReassemblyBuffers,
   _resetMsgSeq,
+  fragmentPacket,
+  MAX_CHUNK_SIZE,
 } from '../src/services/protocol';
 import type { HandshakePayload, MessagePayload, AckPayload, PositionPayload } from '../src/types';
 
@@ -410,6 +412,15 @@ describe('fragmentation', () => {
     expect(frags.length).toBe(1);
     const decoded = decodeBLEChunk(frags[0], 'k');
     expect((decoded as MessagePayload).text).toBe('y'.repeat(400));
+  });
+
+  it('never emits a fragment over the 512-byte attribute limit, even at MTU 517', () => {
+    const packet = new Uint8Array(3000).fill(7);
+    for (const mtu of [512, 517]) {
+      const sizes = fragmentPacket(packet, mtu).map(f => atob(f).length);
+      expect(Math.max(...sizes)).toBeLessThanOrEqual(MAX_CHUNK_SIZE);
+    }
+    expect(Math.max(...fragmentPacket(packet, 517).map(f => atob(f).length))).toBe(MAX_CHUNK_SIZE);
   });
 
   it('round-trips through separate sourceKeys without cross-talk', () => {

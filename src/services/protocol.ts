@@ -105,6 +105,10 @@ const TYPE_FRAG_END = 0xf2;
 
 // Conservative fallback when no MTU is known (peripheral-notify path).
 const DEFAULT_CHUNK_SIZE = 18;
+// A GATT attribute value is at most 512 bytes (Bluetooth Core spec), so one
+// write or notification can never carry more, even when the negotiated MTU is
+// 517. Android rejects a larger value outright ("Operation was rejected").
+export const MAX_CHUNK_SIZE = 512;
 // P0.6 — reassembly buffers idle (no fragment arrived) for this long are
 // assumed orphaned (lost END). Measured from the LAST fragment, not the first:
 // a large media chunk is ~190 fragments and can legitimately take longer than
@@ -890,7 +894,7 @@ export interface EncodeContext {
 
 function resolveChunkSize(mtu?: number): number {
   if (!mtu || mtu <= 3) return DEFAULT_CHUNK_SIZE;
-  return mtu - 3;
+  return Math.min(mtu - 3, MAX_CHUNK_SIZE);
 }
 
 /**

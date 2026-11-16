@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, TextInput, Pressable, FlatList, StyleSheet, AppState, Alert,
-  KeyboardAvoidingView, Platform,
+  KeyboardAvoidingView, Platform, Keyboard,
 } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
@@ -271,6 +271,21 @@ export function ChatScreen({ route, navigation }: Props) {
     flatListRef.current?.scrollToEnd({ animated: true });
   }, []);
 
+  // Track keyboard visibility so the composer drops its bottom inset while typing,
+  // and keep the latest message in view once the keyboard is up.
+  const [keyboardOpen, setKeyboardOpen] = useState(false);
+  useEffect(() => {
+    const showSub = Keyboard.addListener('keyboardDidShow', () => {
+      setKeyboardOpen(true);
+      flatListRef.current?.scrollToEnd({ animated: true });
+    });
+    const hideSub = Keyboard.addListener('keyboardDidHide', () => setKeyboardOpen(false));
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, []);
+
   // Action sheet handlers. Each one closes the sheet first.
   const closeActions = useCallback(() => setActionFor(null), []);
 
@@ -317,7 +332,7 @@ export function ChatScreen({ route, navigation }: Props) {
   return (
     <KeyboardAvoidingView
       style={styles.container}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      behavior="padding"
       keyboardVerticalOffset={keyboardOffset}>
       <TerminalHeader
         title={peerName}
@@ -413,7 +428,7 @@ export function ChatScreen({ route, navigation }: Props) {
       ) : null}
 
       {/* Composer row. While recording, only the voice controls and a disabled input show. */}
-      <View style={[styles.composer, { paddingBottom: insets.bottom + 12 }]}>
+      <View style={[styles.composer, { paddingBottom: keyboardOpen ? 12 : insets.bottom + 12 }]}>
         {recording ? null : <AttachButton onPress={handlePickPhoto} disabled={busy} />}
         <VoiceButton
           ref={voiceRef}
@@ -428,7 +443,7 @@ export function ChatScreen({ route, navigation }: Props) {
           value={input}
           onChangeText={handleChangeText}
           onBlur={() => signalTyping('')}
-          placeholder={recording ? 'recording voice message…' : 'encrypt + broadcast to neighbours'}
+          placeholder={recording ? 'recording…' : 'encrypted message'}
           placeholderTextColor={colors.textMuted}
           cursorColor={colors.primary}
           selectionColor={colors.primary}
@@ -489,6 +504,9 @@ const styles = StyleSheet.create({
   input: {
     flex: 1, minWidth: 0, maxHeight: 100, paddingVertical: 8, paddingHorizontal: 0,
     fontFamily: fonts.mono, fontSize: 13, color: colors.textBright,
+    // No lineHeight: on Android it shifts the glyphs but not the cursor, so the
+    // two drift apart. Without the font's extra padding the cursor matches the text.
+    includeFontPadding: false, textAlignVertical: 'center',
   },
   send: {
     paddingHorizontal: 14, paddingVertical: 11,

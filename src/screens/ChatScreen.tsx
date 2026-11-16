@@ -443,7 +443,7 @@ export function ChatScreen({ route, navigation }: Props) {
           value={input}
           onChangeText={handleChangeText}
           onBlur={() => signalTyping('')}
-          placeholder={recording ? 'recording…' : 'encrypted message'}
+          placeholder={recording ? ' recording…' : ' encrypted message'}
           placeholderTextColor={colors.textMuted}
           cursorColor={colors.primary}
           selectionColor={colors.primary}
@@ -500,7 +500,12 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16, paddingTop: 12,
     borderTopWidth: 1, borderTopColor: colors.border, backgroundColor: colors.bgSecondary,
   },
-  prompt: { fontFamily: fonts.mono, fontSize: 15, lineHeight: 20, color: colors.primary, paddingBottom: 9 },
+  // Same font as `input` with no font padding, bottom-aligned like the input,
+  // so the arrow centres on the text line instead of floating above it.
+  prompt: {
+    fontFamily: fonts.mono, fontSize: 17, color: colors.primary,
+    includeFontPadding: false, paddingBottom: 5.5,
+  },
   input: {
     flex: 1, minWidth: 0, maxHeight: 100, paddingVertical: 8, paddingHorizontal: 0,
     fontFamily: fonts.mono, fontSize: 13, color: colors.textBright,

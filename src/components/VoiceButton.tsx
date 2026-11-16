@@ -1,5 +1,6 @@
 import React, { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { Alert, Linking, Pressable, Text, View, StyleSheet } from 'react-native';
+import { Feather } from '@expo/vector-icons';
 import {
   getRecordingPermissionsAsync,
   requestRecordingPermissionsAsync,
@@ -42,8 +43,8 @@ async function ensureMicPermission(): Promise<boolean> {
 }
 
 /**
- * Mic control for the composer. Idle it is a MIC button. Once recording it
- * becomes REC timer, cancel and STOP controls. Stopping (manual, or the
+ * Mic control for the composer. Idle it is a mic icon button. Once recording it
+ * becomes REC timer, cancel and stop controls. Stopping (manual, or the
  * MAX_VOICE_MS cap) hands the file to `onRecorded`. Cancel and discard delete it.
  */
 export const VoiceButton = forwardRef<VoiceButtonHandle, Props>(function VoiceButton(
@@ -188,7 +189,7 @@ export const VoiceButton = forwardRef<VoiceButtonHandle, Props>(function VoiceBu
           accessibilityRole="button"
           accessibilityLabel="stop and send voice message"
           style={({ pressed }) => [styles.stop, pressed && { opacity: 0.7 }]}>
-          <Text style={styles.stopText}>STOP</Text>
+          <Feather name="square" size={14} color={colors.error} />
         </Pressable>
       </View>
     );
@@ -206,18 +207,17 @@ export const VoiceButton = forwardRef<VoiceButtonHandle, Props>(function VoiceBu
         (disabled || phase === 'starting') && styles.micOff,
         pressed && { opacity: 0.7 },
       ]}>
-      <Text style={styles.micText}>MIC</Text>
+      <Feather name="mic" size={16} color={colors.textDim} />
     </Pressable>
   );
 });
 
 const styles = StyleSheet.create({
   mic: {
-    paddingHorizontal: 10, paddingVertical: 11,
+    paddingHorizontal: 10, paddingVertical: 9,
     borderWidth: 1, borderColor: colors.border, backgroundColor: colors.bgInput,
   },
   micOff: { opacity: 0.4 },
-  micText: { fontFamily: fonts.dispBold, fontSize: 10, lineHeight: 12, letterSpacing: 1, color: colors.textDim },
   group: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   cancel: {
     width: 36, height: 36, alignItems: 'center', justifyContent: 'center',
@@ -226,8 +226,7 @@ const styles = StyleSheet.create({
   cancelText: { fontFamily: fonts.mono, fontSize: 16, lineHeight: 18, color: colors.textDim },
   timer: { fontFamily: fonts.mono, fontSize: 12, color: colors.error, minWidth: 64 },
   stop: {
-    paddingHorizontal: 12, paddingVertical: 11,
+    width: 36, height: 36, alignItems: 'center', justifyContent: 'center',
     borderWidth: 1, borderColor: colors.errorBorder, backgroundColor: colors.errorFaint,
   },
-  stopText: { fontFamily: fonts.dispBold, fontSize: 10, lineHeight: 12, letterSpacing: 1, color: colors.error },
 });

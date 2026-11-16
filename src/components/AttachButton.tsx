@@ -1,6 +1,7 @@
 import React from 'react';
-import { Pressable, Text, StyleSheet } from 'react-native';
-import { colors, fonts } from '../theme';
+import { Pressable, StyleSheet } from 'react-native';
+import { Feather } from '@expo/vector-icons';
+import { colors } from '../theme';
 
 interface Props {
   onPress: () => void;
@@ -18,16 +19,15 @@ export function AttachButton({ onPress, disabled = false }: Props) {
       accessibilityLabel="attach photo"
       accessibilityState={{ disabled }}
       style={({ pressed }) => [styles.button, pressed && !disabled && { opacity: 0.7 }, disabled && styles.disabled]}>
-      <Text style={styles.text}>IMG</Text>
+      <Feather name="image" size={16} color={colors.textDim} />
     </Pressable>
   );
 }
 
 const styles = StyleSheet.create({
   button: {
-    paddingHorizontal: 10, paddingVertical: 11,
+    paddingHorizontal: 10, paddingVertical: 9,
     borderWidth: 1, borderColor: colors.border, backgroundColor: colors.bgInput,
   },
   disabled: { opacity: 0.4 },
-  text: { fontFamily: fonts.dispBold, fontSize: 10, lineHeight: 12, letterSpacing: 1, color: colors.textDim },
 });

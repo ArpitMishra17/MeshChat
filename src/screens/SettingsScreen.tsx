@@ -4,7 +4,7 @@ import { View, Text, TextInput, StyleSheet, Alert, ScrollView } from 'react-nati
 import { colors, fonts } from '../theme';
 import { ensureIdentity, updateDisplayName } from '../services/identity';
 import { bytesToHex } from '../services/ids';
-import { positionProvider, PUBLISH_DECIMALS, MIN_TIME_MS, MIN_DISTANCE_M } from '../services/position';
+import { positionProvider, MIN_TIME_MS, MIN_DISTANCE_M } from '../services/position';
 import { mesh, SCAN_MS, PAUSE_MS, MAX_CENTRAL_CONNECTIONS } from '../services/mesh';
 import { HANDSHAKE_TIMEOUT_MS, POSITION_BEACON_MS, POSITION_TTL, REQUESTED_MTU } from '../services/ble';
 import { DEFAULT_TTL } from '../services/protocol';
@@ -13,7 +13,7 @@ import { getBoolSetting, getTableCounts, setBoolSetting } from '../db/database';
 import { getLocationTable } from '../services/location';
 import { TerminalHeader } from '../components/TerminalHeader';
 import { BlockBar, Btn, Chip, Fingerprint, KV, Label, Panel, Rule, Toggle } from '../components/ui';
-import { PrecisionDial, Stagger } from '../components/viz';
+import { Stagger } from '../components/viz';
 
 export function SettingsScreen() {
   const identity = ensureIdentity();
@@ -55,9 +55,6 @@ export function SettingsScreen() {
 
   const pubKeyHex = bytesToHex(identity.publicKey);
   const pos = positionProvider.getCurrent();
-  // Size of the coordinate-truncation cell: one unit of the last kept decimal
-  // is 1/10^dp degrees; ~111.32 km per degree of latitude.
-  const cellMeters = Math.round(111_320 / Math.pow(10, PUBLISH_DECIMALS));
   const tableCounts = getTableCounts();
   const maxRows = Math.max(...tableCounts.map(r => r.count), 1);
   const links = mesh.getNeighbors();
@@ -141,17 +138,12 @@ export function SettingsScreen() {
             </View>
             <Toggle value={gpsEnabled} onValueChange={handleGpsToggle} />
           </View>
-          <View style={styles.dialRow}>
-            <PrecisionDial cellMeters={cellMeters} decimals={PUBLISH_DECIMALS} />
-            <View style={{ flex: 1 }}>
-              <KV k="my position" v={pos ? `${pos.lat.toFixed(3)}, ${pos.lon.toFixed(3)}` : 'no fix'} dim={!pos} />
-              <KV k="precision" v={`${PUBLISH_DECIMALS} dp · ~${cellMeters} m`} dim />
-              <KV k="known peers" v={knownPositions} />
-              <KV k="table ttl" v={`${LOCATION_TTL_MS / 60_000} min`} dim last />
-            </View>
-          </View>
+          <KV k="my position" v={pos ? `${pos.lat.toFixed(6)}, ${pos.lon.toFixed(6)}` : 'no fix'} dim={!pos} />
+          <KV k="gps accuracy" v={pos?.accuracy != null ? `±${pos.accuracy.toFixed(1)} m` : 'unknown'} dim={pos?.accuracy == null} />
+          <KV k="known peers" v={knownPositions} />
+          <KV k="table ttl" v={`${LOCATION_TTL_MS / 60_000} min`} dim last />
           <Text style={[styles.tip, { marginTop: 12 }]}>
-            Peers only learn which ~{cellMeters} m cell you are in. Opt out here for flooding-only relay.
+            Your exact position is broadcast unencrypted to nearby nodes. Opt out here for flooding-only relay.
           </Text>
         </Panel>
 
@@ -233,7 +225,6 @@ const styles = StyleSheet.create({
     fontFamily: fonts.mono, fontSize: 13, color: colors.primary,
   },
   save: { paddingVertical: 11 },
-  dialRow: { flexDirection: 'row', alignItems: 'center', gap: 16 },
   slab: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 10 },
   slabLabel: {
     width: 96, fontFamily: fonts.disp, fontSize: 9.5, letterSpacing: 0.8, textTransform: 'uppercase', color: colors.textMuted,

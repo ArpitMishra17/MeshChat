@@ -157,9 +157,9 @@ export interface AckPayload {
 }
 
 /**
- * Phase 4 — A geographic coordinate (WGS-84). Latitude/longitude in degrees,
- * truncated to ~3 decimal places (~110 m) before going on the wire for
- * privacy (see position.ts / protocol.ts POSITION body). `timestamp` is the
+ * Phase 4 — A geographic coordinate (WGS-84). Latitude/longitude in degrees
+ * at full GPS precision (microdegrees on the wire, see protocol.ts position
+ * block), plus the fix's accuracy radius when known. `timestamp` is the
  * sender's claim of when the fix was taken; the location table uses arrival
  * time for staleness eviction to stay robust against clock skew.
  */
@@ -167,6 +167,8 @@ export interface GeoPosition {
   lat: number;
   lon: number;
   timestamp: number;
+  /** Horizontal accuracy radius in metres (68% confidence), when known. */
+  accuracy?: number;
 }
 
 /**
@@ -184,6 +186,8 @@ export interface PositionPayload {
   lat: number;
   lon: number;
   timestamp: number;
+  /** Sender's GPS accuracy radius in metres; absent from older senders. */
+  accuracy?: number;
 }
 
 export type BLEPayload =

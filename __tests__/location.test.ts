@@ -52,7 +52,7 @@ const NEIGHBOR_A_FP = 'aaaaaaaaaaaaaaaa';
 const NEIGHBOR_B_FP = 'bbbbbbbbbbbbbbbb';
 const DEST_FP = 'cccccccccccccccc';
 
-// SF ~ (37.7749, -122.4194). Use truncated 3-decimal coords (as on the wire).
+// SF ~ (37.7749, -122.4194). Rounded to 3 decimals for readable fixtures.
 const SF: PositionEntry = { lat: 37.775, lon: -122.419, timestamp: 0 };
 // Oakland ~ (37.8044, -122.2712) — NE of SF, ~13 km.
 const OAKLAND: PositionEntry = { lat: 37.804, lon: -122.271, timestamp: 0 };
@@ -133,6 +133,14 @@ describe('LocationTable', () => {
     expect(pos!.lat).toBeCloseTo(37.775, 5);
     expect(pos!.lon).toBeCloseTo(-122.419, 5);
     expect(t.has(MY_FP)).toBe(true);
+  });
+
+  it('stores the reported accuracy, and leaves it undefined when absent', () => {
+    const t = new LocationTable();
+    t.set(MY_FP, 37.775, -122.419, undefined, 4.3);
+    expect(t.get(MY_FP)!.accuracy).toBe(4.3);
+    t.set(DEST_FP, 37.775, -122.419);
+    expect(t.get(DEST_FP)!.accuracy).toBeUndefined();
   });
 
   it('evicts entries older than the TTL (stale → null)', () => {

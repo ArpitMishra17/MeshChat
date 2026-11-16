@@ -23,6 +23,7 @@ import {
   FINGERPRINT_SIZE,
   MSGID_SIZE,
   POSITION_BLOCK_SIZE,
+  POSITION_BLOCK_SIZE_EXT,
   ProtocolError,
   ProtocolVersionError,
   encodePacket,
@@ -208,8 +209,8 @@ describe('POSITION body codec (Phase 4)', () => {
       timestamp: 1_700_000_000_000,
     };
     const body = encodeBody(pos);
-    // [latE6: 4][lonE6: 4][timestamp: 8] = 16 bytes
-    expect(body.length).toBe(POSITION_BLOCK_SIZE);
+    // [latE6: 4][lonE6: 4][timestamp: 8][accuracy: 2] = 18 bytes
+    expect(body.length).toBe(POSITION_BLOCK_SIZE_EXT);
     const decoded = decodeBody(TYPE_POSITION, body) as PositionPayload;
     expect(decoded.type).toBe('position');
     // lat 37.7749 × 1e6 = 37774900, divided back = 37.7749
@@ -251,6 +252,52 @@ describe('POSITION body codec (Phase 4)', () => {
     expect(() => decodeBody(TYPE_POSITION, new Uint8Array(15))).toThrow(ProtocolError);
   });
 
+  it('round-trips accuracy in decimetres (4.3 m -> 4.3)', () => {
+    const pos: PositionPayload = {
+      type: 'position', lat: 37.7749, lon: -122.4194, timestamp: 1_700_000_000_000, accuracy: 4.3,
+    };
+    const decoded = decodeBody(TYPE_POSITION, encodeBody(pos)) as PositionPayload;
+    expect(decoded.accuracy).toBeCloseTo(4.3, 10);
+  });
+
+  it('round-trips an unknown accuracy as undefined', () => {
+    const pos: PositionPayload = { type: 'position', lat: 1, lon: 2, timestamp: 3 };
+    const decoded = decodeBody(TYPE_POSITION, encodeBody(pos)) as PositionPayload;
+    expect(decoded.accuracy).toBeUndefined();
+  });
+
+  it('clamps accuracy to the 0..6553.4 m range (65535 reserved for unknown)', () => {
+    const big = decodeBody(TYPE_POSITION, encodeBody({
+      type: 'position', lat: 0, lon: 0, timestamp: 0, accuracy: 1e9,
+    })) as PositionPayload;
+    expect(big.accuracy).toBeCloseTo(6553.4, 10);
+    const neg = decodeBody(TYPE_POSITION, encodeBody({
+      type: 'position', lat: 0, lon: 0, timestamp: 0, accuracy: -5,
+    })) as PositionPayload;
+    expect(neg.accuracy).toBe(0);
+  });
+
+  it('decodes a legacy 16-byte POSITION block with accuracy undefined', () => {
+    // Build a 16-byte block exactly as a pre-accuracy sender would.
+    const legacy = encodeBody({ type: 'position', lat: 37.7749, lon: -122.4194, timestamp: 42 }).subarray(0, POSITION_BLOCK_SIZE);
+    expect(legacy.length).toBe(POSITION_BLOCK_SIZE);
+    const decoded = decodeBody(TYPE_POSITION, legacy) as PositionPayload;
+    expect(decoded.lat).toBeCloseTo(37.7749, 6);
+    expect(decoded.lon).toBeCloseTo(-122.4194, 6);
+    expect(decoded.timestamp).toBe(42);
+    expect(decoded.accuracy).toBeUndefined();
+  });
+
+  it('keeps coordinates 5 m apart distinct after encode/decode (no truncation)', () => {
+    // 5 m of latitude ≈ 0.000045 deg; microdegree precision (~0.11 m) resolves it.
+    const a: PositionPayload = { type: 'position', lat: 37.774900, lon: -122.419400, timestamp: 0, accuracy: 3 };
+    const b: PositionPayload = { type: 'position', lat: 37.774945, lon: -122.419400, timestamp: 0, accuracy: 3 };
+    const da = decodeBody(TYPE_POSITION, encodeBody(a)) as PositionPayload;
+    const db = decodeBody(TYPE_POSITION, encodeBody(b)) as PositionPayload;
+    expect(da.lat).not.toBe(db.lat);
+    expect(Math.abs(db.lat - da.lat) * 111_320).toBeGreaterThan(4.5);
+  });
+
   it('round-trips a POSITION beacon through full packet framing + fragmentation', () => {
     const pos: PositionPayload = {
       type: 'position',
@@ -279,8 +326,8 @@ describe('HELLO with position (Phase 4)', () => {
       position: { lat: 48.8566, lon: 2.3522, timestamp: 1_700_000_000_000 },
     };
     const body = encodeBody(helloWithPos);
-    // 32 (pubkey) + 1 (nameLen) + 5 (name "alice") + 16 (position block)
-    expect(body.length).toBe(32 + 1 + 5 + POSITION_BLOCK_SIZE);
+    // 32 (pubkey) + 1 (nameLen) + 5 (name "alice") + 18 (position block)
+    expect(body.length).toBe(32 + 1 + 5 + POSITION_BLOCK_SIZE_EXT);
     const decoded = decodeBody(TYPE_HELLO, body) as HandshakePayload;
     expect(decoded.displayName).toBe('alice');
     expect(bytesToHex(decoded.publicKey)).toBe(bytesToHex(PEER_PUBKEY));
@@ -288,6 +335,18 @@ describe('HELLO with position (Phase 4)', () => {
     expect(decoded.position!.lat).toBeCloseTo(48.8566, 6);
     expect(decoded.position!.lon).toBeCloseTo(2.3522, 6);
     expect(decoded.position!.timestamp).toBe(1_700_000_000_000);
+  });
+
+  it('decodes a HELLO carrying a legacy 16-byte position block (accuracy undefined)', () => {
+    const full = encodeBody({ ...handshake, position: { lat: 48.8566, lon: 2.3522, timestamp: 7, accuracy: 5 } });
+    // Drop the 2 accuracy bytes to mimic a pre-accuracy sender.
+    const legacy = full.subarray(0, full.length - 2);
+    expect(legacy.length).toBe(32 + 1 + 5 + POSITION_BLOCK_SIZE);
+    const decoded = decodeBody(TYPE_HELLO, legacy) as HandshakePayload;
+    expect(decoded.position).not.toBeNull();
+    expect(decoded.position!.lat).toBeCloseTo(48.8566, 6);
+    expect(decoded.position!.timestamp).toBe(7);
+    expect(decoded.position!.accuracy).toBeUndefined();
   });
 
   it('round-trips a HELLO with position=null (GPS off / no fix)', () => {

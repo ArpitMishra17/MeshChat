@@ -4,46 +4,66 @@
  *
  * Responsibilities:
  *   - **Permission + watch:** request foreground location permission and run
- *     `watchPositionAsync` with balanced accuracy, no more often than every
- *     30 s or 50 m (PLAN.md Phase 4). Keeps the battery cost of GPS bounded
- *     for the demo.
- *   - **Privacy:** coordinates are truncated to ~3 decimal places (~110 m)
- *     before being published (returned via `getCurrent()`). The full-precision
- *     fix is never exposed to the mesh — relays and peers only ever see the
- *     truncated value. This is the documented privacy trade-off: positions
- *     must be visible to the mesh for geographic routing to work, but their
- *     precision is deliberately blunted.
+ *     `watchPositionAsync` at best-for-navigation accuracy, no more often than
+ *     every 2 s or every 1 m of movement. Accuracy is the priority: the fix
+ *     is as precise as the phone can produce.
+ *   - **Accuracy over privacy:** full-precision coordinates and the GPS
+ *     accuracy radius are published as-is (no rounding or truncation). Exact
+ *     coordinates are broadcast unencrypted in POSITION beacons and HELLO
+ *     packets, so any node in radio range can read them. This is a deliberate
+ *     product decision, not an oversight.
+ *   - **Change events:** `changed` fires when the fix has moved ≥ 1 m from the
+ *     last *published* fix, or its accuracy radius improved by ≥ 30%. Such
+ *     events are throttled to at most one per 3 s. Fixes that don't qualify
+ *     refresh `getCurrent()` silently; a qualifying fix that lands inside the
+ *     throttle window is kept as current and carried by the next fix or the
+ *     periodic beacon in ble.ts.
  *   - **Toggle:** GPS is opt-in per user (Settings). When disabled, the node
  *     originates no POSITION beacons and participates as a flooding-only
  *     relay. The toggle persists across launches in the settings table.
- *   - **Change events:** fires `changed` whenever a fresh truncated fix
- *     arrives, so ble.ts can emit a POSITION beacon on movement.
+ *   - **Start/stop safety:** concurrent `start()` calls share one in-flight
+ *     start, so only one GPS watch exists. `stop()` during a start cancels it:
+ *     the subscription is removed as soon as it resolves.
  *
- * This module is the only place that imports `expo-location`. Everything
- * downstream (ble.ts, messageRouter) consumes the abstract `GeoPosition`.
+ * This module owns the GPS watch. Everything downstream (ble.ts,
+ * messageRouter) consumes the abstract `GeoPosition`; NearbyScreen separately
+ * reads the compass heading from `expo-location` for the radar.
  */
 
 import * as Location from 'expo-location';
 import { Emitter } from './events';
 import { getDB, getBoolSetting, setBoolSetting } from '../db/database';
+import { haversineMeters } from './location';
 import type { GeoPosition } from '../types';
 
 const SETTING_GPS_ENABLED = 'gps_enabled';
 
-/** Minimum interval between GPS fixes (PLAN.md: 30 s). */
-export const MIN_TIME_MS = 30_000;
-/** Minimum distance change to trigger a fix (PLAN.md: 50 m). */
-export const MIN_DISTANCE_M = 50;
-/** Decimal places to retain when publishing (~110 m precision). */
-export const PUBLISH_DECIMALS = 3;
+/** Minimum interval between GPS fixes requested from the platform (2 s). */
+export const MIN_TIME_MS = 2_000;
+/** Minimum movement between GPS fixes requested from the platform (1 m). */
+export const MIN_DISTANCE_M = 1;
+/** A fix that moved at least this far from the last published fix is published. */
+export const MIN_MOVE_PUBLISH_M = 1;
+/** A fix whose accuracy radius shrank by at least this fraction is published. */
+export const ACCURACY_IMPROVEMENT_RATIO = 0.3;
+/** At most one `changed` emit per this many ms. */
+export const MIN_EMIT_INTERVAL_MS = 3_000;
 
 class PositionProvider {
-  /** Fires with the new truncated position whenever a fresh fix arrives. */
+  /** Fires when a fix qualifies for publication (see the header comment). */
   readonly changed = new Emitter();
 
   private current: GeoPosition | null = null;
+  /** The last fix that was announced via `changed`. Qualification compares against this. */
+  private lastPublished: GeoPosition | null = null;
+  /** Wall-clock time of the last `changed` emit, for throttling. */
+  private lastEmitAt = 0;
   private watching = false;
   private subscription: Location.LocationSubscription | null = null;
+  /** In-flight start, shared by concurrent `start()` callers. */
+  private starting: Promise<boolean> | null = null;
+  /** Bumped by `stop()`; an in-flight start whose generation is stale tears itself down. */
+  private generation = 0;
   private enabled: boolean;
 
   constructor() {
@@ -75,28 +95,47 @@ class PositionProvider {
   /**
    * Begin watching the GPS. Idempotent. Requests permission first; if the
    * user denies, the provider stays disabled-by-effect (returns false).
-   * Safe to call when already watching.
+   *
+   * Concurrent callers share one in-flight start, so only one platform watch
+   * is ever created (App.tsx calls this twice at launch).
    *
    * Called by App.tsx at startup (if the toggle is on) and by setEnabled.
    */
-  async start(): Promise<boolean> {
-    if (!this.enabled) return false;
-    if (this.watching) return true;
+  start(): Promise<boolean> {
+    if (!this.enabled) return Promise.resolve(false);
+    if (this.watching) return Promise.resolve(true);
+    if (this.starting) return this.starting;
 
+    const gen = this.generation;
+    const pending: Promise<boolean> = this.doStart(gen).finally(() => {
+      if (this.starting === pending) this.starting = null;
+    });
+    this.starting = pending;
+    return pending;
+  }
+
+  private async doStart(gen: number): Promise<boolean> {
     try {
       const perm = await Location.requestForegroundPermissionsAsync();
       if (perm.status !== 'granted') {
         console.warn('[position] foreground location permission denied');
         return false;
       }
-      this.subscription = await Location.watchPositionAsync(
+      if (gen !== this.generation) return false; // stopped while asking
+      const sub = await Location.watchPositionAsync(
         {
-          accuracy: Location.Accuracy.Balanced,
+          accuracy: Location.Accuracy.BestForNavigation,
           timeInterval: MIN_TIME_MS,
           distanceInterval: MIN_DISTANCE_M,
         },
         loc => this.onLocation(loc),
       );
+      if (gen !== this.generation) {
+        // stop() was called while the watch was starting: tear it down now.
+        void sub.remove();
+        return false;
+      }
+      this.subscription = sub;
       this.watching = true;
       console.log('[position] GPS watch started');
       return true;
@@ -106,55 +145,66 @@ class PositionProvider {
     }
   }
 
-  /** Stop the GPS watch and clear the current fix. */
+  /**
+   * Stop the GPS watch and clear the current fix. Safe during an in-flight
+   * `start()`: that start's subscription is removed once it resolves.
+   */
   stop(): void {
+    this.generation += 1;
+    this.starting = null;
     if (this.subscription) {
       void this.subscription.remove();
       this.subscription = null;
     }
     this.watching = false;
     this.current = null;
+    this.lastPublished = null;
+    this.lastEmitAt = 0;
   }
 
   /**
-   * The current truncated position, or null if GPS is disabled or no fix yet.
-   * The returned object is safe to share — it is already truncated to
-   * PUBLISH_DECIMALS for privacy.
+   * The current position (full precision, with accuracy), or null if GPS is
+   * disabled or no fix yet. Safe to share with the mesh.
    */
   getCurrent(): GeoPosition | null {
     return this.current;
   }
 
   private onLocation(loc: Location.LocationObject): void {
-    const truncated = truncate(loc.coords.latitude, loc.coords.longitude);
-    // Suppress no-op updates: if the truncated coords didn't change, don't
-    // fire (avoids beacon storms when stationary). The timestamp still
-    // refreshes so staleness reflects the last real fix.
-    if (
-      this.current &&
-      this.current.lat === truncated.lat &&
-      this.current.lon === truncated.lon
-    ) {
-      this.current = { ...truncated, timestamp: Date.now() };
-      return;
-    }
-    this.current = { ...truncated, timestamp: Date.now() };
+    const now = Date.now();
+    const fix: GeoPosition = {
+      lat: loc.coords.latitude,
+      lon: loc.coords.longitude,
+      timestamp: now,
+      accuracy: loc.coords.accuracy ?? undefined,
+    };
+    // Always keep the freshest fix, so the periodic beacon sends the latest.
+    this.current = fix;
+
+    if (!this.qualifiesForPublish(fix)) return;
+    // Throttle: a qualifying fix inside the window stays as `current` and is
+    // carried by the next fix or the periodic beacon.
+    if (now - this.lastEmitAt < MIN_EMIT_INTERVAL_MS) return;
+
+    this.lastPublished = fix;
+    this.lastEmitAt = now;
     this.changed.emit();
   }
-}
 
-/**
- * Truncate lat/lon to PUBLISH_DECIMALS (~110 m at the equator). This blunts
- * precision for privacy: a relay learns roughly where you are (enough to
- * route) but not exactly. Math.trunc keeps the value toward zero, which is
- * fine for routing (relative distances are preserved).
- */
-function truncate(lat: number, lon: number): { lat: number; lon: number } {
-  const factor = Math.pow(10, PUBLISH_DECIMALS);
-  return {
-    lat: Math.trunc(lat * factor) / factor,
-    lon: Math.trunc(lon * factor) / factor,
-  };
+  /** True if `fix` moved ≥ 1 m or improved its accuracy ≥ 30% vs the last published fix. */
+  private qualifiesForPublish(fix: GeoPosition): boolean {
+    const prev = this.lastPublished;
+    if (!prev) return true;
+    if (haversineMeters(prev, fix) >= MIN_MOVE_PUBLISH_M) return true;
+    if (
+      prev.accuracy !== undefined &&
+      fix.accuracy !== undefined &&
+      fix.accuracy <= prev.accuracy * (1 - ACCURACY_IMPROVEMENT_RATIO)
+    ) {
+      return true;
+    }
+    return false;
+  }
 }
 
 export const positionProvider = new PositionProvider();

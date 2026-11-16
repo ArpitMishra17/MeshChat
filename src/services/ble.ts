@@ -59,8 +59,12 @@ const BULK_TRANSFER_QUIET_MS = 8_000;
 /** Extra attempts for a rejected write before the link is declared stale. */
 const WRITE_REJECT_RETRIES = 2;
 const WRITE_REJECT_RETRY_DELAY_MS = 150;
-/** Phase 4 — POSITION beacon interval (PLAN.md: ~60 s while moving). */
-export const POSITION_BEACON_MS = 60_000;
+/**
+ * Phase 4 — POSITION beacon keep-alive interval. Movement and new links
+ * trigger beacons immediately (event-driven); this periodic beacon keeps a
+ * peer's view of us fresh between those events.
+ */
+export const POSITION_BEACON_MS = 10_000;
 /** Phase 4 — TTL for POSITION beacons (broadcast, a few hops). */
 export const POSITION_TTL = 3;
 /** Feature batch — TTL for encrypted CTRL signals (typing / read / reaction). */
@@ -278,11 +282,12 @@ class BLEService {
     this.peripheralStarted = true;
     console.log('[BLE] Peripheral fully started');
 
-    // Phase 4 — start the POSITION beacon loop. Sends our truncated GPS fix
-    // to all neighbors every POSITION_BEACON_MS while we have a fix, so the
-    // mesh can route geographically toward us. Also fires immediately when
-    // our position changes (movement) and when a new link comes up (so a
-    // fresh neighbor learns our position without waiting for the timer).
+    // Phase 4 — start the POSITION beacon loop. Sends our GPS fix (with its
+    // accuracy radius) to all neighbors every POSITION_BEACON_MS while we
+    // have a fix, so the mesh can route geographically toward us. Also fires
+    // immediately when our position changes (movement) and when a new link
+    // comes up (so a fresh neighbor learns our position without waiting for
+    // the timer).
     this.startPositionBeacons();
 
     return result;
@@ -827,7 +832,13 @@ class BLEService {
     // waiting for the first POSITION beacon. Arrival time is used for
     // staleness (robust against clock skew).
     if (hp.position) {
-      getLocationTable().set(peerFpHex, hp.position.lat, hp.position.lon);
+      getLocationTable().set(
+        peerFpHex,
+        hp.position.lat,
+        hp.position.lon,
+        undefined,
+        hp.position.accuracy,
+      );
     }
 
     // Peripheral side: reply with our HELLO so the central learns our identity.
@@ -1160,7 +1171,7 @@ class BLEService {
 
   private buildHelloPacket(): Uint8Array {
     const identity = ensureIdentity();
-    // Phase 4 — include our truncated GPS fix in the HELLO if we have one,
+    // Phase 4 — include our GPS fix (with accuracy) in the HELLO if we have one,
     // so the peer's location table is populated immediately on connect
     // (FLAG_HAS_POSITION). null when GPS is disabled or no fix yet.
     const pos = positionProvider.getCurrent();
@@ -1260,7 +1271,7 @@ class BLEService {
 
   /**
    * Phase 4 — Build a POSITION beacon packet. Broadcast (dst = 0x00…00),
-   * TTL = POSITION_TTL (~3 hops), carrying our truncated GPS fix. Every node
+   * TTL = POSITION_TTL (~3 hops), carrying our GPS fix. Every node
    * that receives it updates its location table with our position keyed by
    * our fingerprint (`header.src`), so the mesh can route geographically
    * toward us.
@@ -1293,6 +1304,7 @@ class BLEService {
       lat: pos.lat,
       lon: pos.lon,
       timestamp: pos.timestamp,
+      accuracy: pos.accuracy,
     });
     await this.broadcastPacket(packet);
   }
@@ -1302,8 +1314,9 @@ class BLEService {
    *
    * - A POSITION_BEACON_MS interval sends our fix to all neighbors while we
    *   have one (refreshes their location table's freshness timestamp).
-   * - positionProvider.changed fires when our truncated position changes
-   *   (movement) → immediate beacon so neighbors re-route promptly.
+   * - positionProvider.changed fires when our position changes meaningfully
+   *   (movement or accuracy improvement) → immediate beacon so neighbors
+   *   re-route promptly.
    * - linkUp fires when a new neighbor connects → immediate beacon so they
    *   learn our position without waiting up to POSITION_BEACON_MS.
    *

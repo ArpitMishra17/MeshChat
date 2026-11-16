@@ -38,6 +38,8 @@ export interface GeoCoord {
 
 export interface PositionEntry extends GeoCoord {
   timestamp: number;
+  /** Peer's reported GPS accuracy radius in metres, when known. */
+  accuracy?: number;
 }
 
 /** Entries older than this are considered stale (PLAN.md: ~10 min). */
@@ -71,13 +73,21 @@ export class LocationTable {
   /**
    * Record (or refresh) `fingerprintHex`'s position. `timestamp` is the
    * arrival time (robust against sender clock skew); the beacon's own
-   * timestamp is informational and not used for staleness.
+   * timestamp is informational and not used for staleness. `accuracy` is the
+   * sender's GPS accuracy radius in metres, when the sender reported one.
    */
-  set(fingerprintHex: string, lat: number, lon: number, timestamp?: number): void {
+  set(
+    fingerprintHex: string,
+    lat: number,
+    lon: number,
+    timestamp?: number,
+    accuracy?: number,
+  ): void {
     this.entries.set(fingerprintHex, {
       lat,
       lon,
       timestamp: timestamp ?? this.now(),
+      accuracy,
     });
   }
 

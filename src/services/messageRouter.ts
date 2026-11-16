@@ -1082,7 +1082,7 @@ class MessageRouter {
       return;
     }
     const senderFpHex = bytesToHex(p.header.src);
-    getLocationTable().set(senderFpHex, pos.lat, pos.lon);
+    getLocationTable().set(senderFpHex, pos.lat, pos.lon, undefined, pos.accuracy);
     this.stats.positionBeaconsRouted += 1;
     this.peersChanged.emit(); // neighbors' positions may have changed → refresh Nearby
   }

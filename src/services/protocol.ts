@@ -219,7 +219,7 @@ export function encodeBody(payload: BLEPayload): Uint8Array {
       // name. The fingerprint (deviceId) is derived from the pubkey by the
       // receiver, so it is not sent on the wire.
       // Phase 4 — if the sender has a GPS fix, the position is appended
-      // (16 bytes: latE6, lonE6, ts) and FLAG_HAS_POSITION is set on the
+      // (18 bytes: latE6, lonE6, ts, accuracy) and FLAG_HAS_POSITION is set on the
       // packet header by the caller. The body is self-describing: a
       // receiver parses the position iff trailing bytes remain after the
       // name, so decodeBody needs no flags argument.
@@ -269,7 +269,8 @@ export function encodeBody(payload: BLEPayload): Uint8Array {
       return out;
     }
     case 'position': {
-      // Phase 4 — [latE6: 4 signed BE][lonE6: 4 signed BE][timestamp: 8 BE].
+      // Phase 4 — [latE6: 4 signed BE][lonE6: 4 signed BE][timestamp: 8 BE]
+      // [accuracy: 2 BE, decimetres]. See the position block below.
       return encodePositionBlock(payload);
     }
     case 'control':
@@ -286,9 +287,11 @@ export function decodeBody(type: number, bytes: Uint8Array): BLEPayload {
       // is NOT in the wire body; it is derived from the pubkey by the caller
       // (ble.ts) via `fingerprintHexFromPubKey`. We leave deviceId empty here
       // to keep protocol.ts free of crypto dependencies.
-      // Phase 4 — [pubkey: 32][nameLen: 1][name][?latE6: 4][lonE6: 4][ts: 8].
-      // The position block is present iff >= 16 trailing bytes remain after
-      // the name (self-describing, so no flags argument is needed).
+      // Phase 4 — [pubkey: 32][nameLen: 1][name][?latE6: 4][lonE6: 4][ts: 8][?acc: 2].
+      // The position block is present iff >= POSITION_BLOCK_SIZE (16, legacy)
+      // trailing bytes remain after the name (self-describing, so no flags
+      // argument is needed). Its accuracy field is read only when the block
+      // is the extended 18-byte form.
       if (bytes.length < 33) {
         throw new ProtocolError(`HELLO body too short: ${bytes.length} < 33`);
       }
@@ -330,7 +333,7 @@ export function decodeBody(type: number, bytes: Uint8Array): BLEPayload {
       return { type: 'ack', messageId };
     }
     case TYPE_POSITION: {
-      // Phase 4 — [latE6: 4][lonE6: 4][timestamp: 8].
+      // Phase 4 — [latE6: 4][lonE6: 4][timestamp: 8][accuracy: 2, optional].
       if (bytes.length < POSITION_BLOCK_SIZE) {
         throw new ProtocolError(`POSITION body too short: ${bytes.length} < ${POSITION_BLOCK_SIZE}`);
       }
@@ -689,20 +692,46 @@ function decodeMediaBody(bytes: Uint8Array): MediaChunkPayload {
 
 // --- Phase 4: position block (shared by HELLO and POSITION) ---
 //
-// Layout (16 bytes, big-endian):
-//   [0..3]   latE6  — signed 32-bit, latitude × 1e6 (microdegrees)
+// Layout (18 bytes, big-endian):
+//   [0..3]   latE6  — signed 32-bit, latitude × 1e6 (microdegrees, ~0.11 m)
 //   [4..7]   lonE6  — signed 32-bit, longitude × 1e6
 //   [8..15]  timestamp — unsigned 64-bit, ms since epoch (sender's clock)
+//   [16..17] accuracy — unsigned 16-bit, GPS accuracy radius in decimetres
+//                       (metres × 10, clamped to 0..65534). 0xFFFF = unknown.
 //
-// latE6 range: ±180_000_000, fits in int32. The position provider truncates
-// to ~3 decimal places (millidegrees, ~110 m) before encoding for privacy,
-// so the low 3 digits of latE6 are always zero on the wire. Decoding
-// reconstructs the float by dividing by 1e6.
+// Coordinates are sent at full precision (no privacy rounding): accuracy is
+// prioritised over blunting, and the fix is broadcast unencrypted in POSITION
+// beacons. Decoding reconstructs the float by dividing by 1e6.
+//
+// Compatibility: senders always write 18 bytes (POSITION_BLOCK_SIZE_EXT).
+// Legacy senders write the 16-byte form (POSITION_BLOCK_SIZE). Receivers
+// accept either: the accuracy field is read only when >= 18 bytes are
+// available, otherwise `accuracy` is undefined. Pre-accuracy receivers read
+// only the first 16 bytes of the block and ignore the trailing 2.
 
+/** Legacy (pre-accuracy) position block size, and the minimum accepted. */
 export const POSITION_BLOCK_SIZE = 16;
+/** Current position block size, including the 2-byte accuracy field. */
+export const POSITION_BLOCK_SIZE_EXT = 18;
 
-function encodePositionBlock(pos: { lat: number; lon: number; timestamp: number }): Uint8Array {
-  const out = new Uint8Array(POSITION_BLOCK_SIZE);
+const ACCURACY_UNKNOWN_RAW = 0xffff;
+const ACCURACY_MAX_RAW = 0xfffe;
+
+function encodeAccuracyRaw(accuracy: number | undefined): number {
+  if (accuracy === undefined || !Number.isFinite(accuracy)) {
+    return ACCURACY_UNKNOWN_RAW;
+  }
+  const dm = Math.round(accuracy * 10);
+  return Math.min(ACCURACY_MAX_RAW, Math.max(0, dm));
+}
+
+function encodePositionBlock(pos: {
+  lat: number;
+  lon: number;
+  timestamp: number;
+  accuracy?: number;
+}): Uint8Array {
+  const out = new Uint8Array(POSITION_BLOCK_SIZE_EXT);
   const latE6 = Math.round(pos.lat * 1e6);
   const lonE6 = Math.round(pos.lon * 1e6);
   // Signed 32-bit big-endian via unsigned shift (two's complement).
@@ -726,6 +755,10 @@ function encodePositionBlock(pos: { lat: number; lon: number; timestamp: number 
   out[13] = (lo >>> 16) & 0xff;
   out[14] = (lo >>> 8) & 0xff;
   out[15] = lo & 0xff;
+  // 16-bit accuracy in decimetres.
+  const acc = encodeAccuracyRaw(pos.accuracy);
+  out[16] = (acc >>> 8) & 0xff;
+  out[17] = acc & 0xff;
   return out;
 }
 
@@ -736,12 +769,18 @@ function decodePositionBlock(bytes: Uint8Array): PositionPayload {
   const hi = (bytes[8] * 0x1000000) + (bytes[9] << 16) + (bytes[10] << 8) + bytes[11];
   const lo = (bytes[12] * 0x1000000) + (bytes[13] << 16) + (bytes[14] << 8) + bytes[15];
   const timestamp = hi * 0x100000000 + lo;
-  return {
+  const out: PositionPayload = {
     type: 'position',
     lat: latE6 / 1e6,
     lon: lonE6 / 1e6,
     timestamp,
   };
+  // Legacy 16-byte blocks carry no accuracy; leave it undefined.
+  if (bytes.length >= POSITION_BLOCK_SIZE_EXT) {
+    const raw = (bytes[16] << 8) | bytes[17];
+    if (raw !== ACCURACY_UNKNOWN_RAW) out.accuracy = raw / 10;
+  }
+  return out;
 }
 
 // --- Pure packet encode / decode (the unit-testable core) ---

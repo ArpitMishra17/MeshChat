@@ -226,7 +226,7 @@ function Body({ p, encrypted }: { p: CapturedPacket; encrypted: boolean }) {
         { name: 'lonE6', size: '4 B', value: String(Math.round(pos.lon * 1e6)) },
         { name: 'timestamp', size: '8 B', value: new Date(pos.timestamp).toISOString() },
       );
-      note = 'Beacons are plaintext by design — relays route on them. Coordinates are pre-truncated to ~110 m.';
+      note = 'Beacons are plaintext by design — relays route on them. Coordinates are sent at full GPS precision.';
     } catch {
       note = 'POSITION body could not be decoded.';
     }

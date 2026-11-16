@@ -1,6 +1,7 @@
 import React, { useState, useCallback, useEffect } from 'react';
-import { View, Text, ScrollView, StyleSheet } from 'react-native';
-import { useNavigation } from '@react-navigation/native';
+import { View, Text, ScrollView, StyleSheet, Pressable } from 'react-native';
+import { useNavigation, useFocusEffect } from '@react-navigation/native';
+import * as Location from 'expo-location';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { colors, fonts } from '../theme';
 import { bleService } from '../services/ble';
@@ -12,6 +13,7 @@ import { getOrCreateConversation, getAllPeers } from '../db/database';
 import { ensureIdentity } from '../services/identity';
 import { positionProvider } from '../services/position';
 import { getLocationTable, haversineMeters, bearingDegrees } from '../services/location';
+import { rssiToMeters, formatSignalM } from '../services/proximity';
 import { StatusBadge } from '../components/StatusBadge';
 import { Btn, Cells, Chip, KV, Label, Meter, Panel, Row } from '../components/ui';
 import { Radar, Stagger, type RadarPeer } from '../components/viz';
@@ -20,6 +22,17 @@ import type { Peer } from '../types';
 import type { RootStackParamList } from '../navigation';
 
 type NavProp = NativeStackNavigationProp<RootStackParamList>;
+
+/** Low-pass weight for the compass (unit-vector filter), and when to emit a change. */
+const HEADING_ALPHA = 0.25;
+const HEADING_MIN_STEP_DEG = 2;
+const HEADING_MIN_INTERVAL_MS = 100;
+
+/** Smallest absolute difference between two compass bearings, in degrees. */
+function angleDelta(a: number, b: number): number {
+  const d = Math.abs(a - b) % 360;
+  return d > 180 ? 360 - d : d;
+}
 
 /**
  * Phase 3 — The Nearby screen is now a *view* over the neighbor table that
@@ -51,6 +64,9 @@ export function NearbyScreen() {
   const [routeLog, setRouteLog] = useState<RouteLogEntry[]>([]);
   const [gpsOn, setGpsOn] = useState(positionProvider.isEnabled());
   const [, setPosTick] = useState(0);
+  /** Compass heading in degrees (null = unavailable) and the user's radar orientation choice. */
+  const [heading, setHeading] = useState<number | null>(null);
+  const [headingMode, setHeadingMode] = useState<'heading' | 'north'>('heading');
 
   const refreshNeighbors = useCallback(() => {
     setNeighbors(mesh.getNeighbors());
@@ -108,6 +124,57 @@ export function NearbyScreen() {
     };
   }, [refreshNeighbors, refreshKnown]);
 
+  // Compass + periodic repaint, only while this screen is focused. The
+  // heading watch is GPS-gated because the radar only draws with our own fix.
+  // The table has no change event, so repaint every 2 s to pick up peers.
+  useFocusEffect(
+    useCallback(() => {
+      const repaint = setInterval(() => setPosTick(n => n + 1), 2000);
+      if (!gpsOn) {
+        setHeading(null);
+        return () => clearInterval(repaint);
+      }
+      let cancelled = false;
+      let sub: Location.LocationSubscription | null = null;
+      // Low-pass filter on the unit vector so 359° -> 1° does not swing the long way.
+      const f = { x: 0, y: 0, primed: false, shown: null as number | null, lastEmit: 0 };
+      Location.watchHeadingAsync(
+        h => {
+          const deg = h.trueHeading >= 0 ? h.trueHeading : h.magHeading;
+          if (!(deg >= 0)) return; // -1 or NaN: no reading yet
+          const rad = (deg * Math.PI) / 180;
+          if (!f.primed) {
+            f.x = Math.sin(rad);
+            f.y = Math.cos(rad);
+            f.primed = true;
+          } else {
+            f.x += HEADING_ALPHA * (Math.sin(rad) - f.x);
+            f.y += HEADING_ALPHA * (Math.cos(rad) - f.y);
+          }
+          const smooth = (((Math.atan2(f.x, f.y) * 180) / Math.PI) + 360) % 360;
+          const now = Date.now();
+          const moved = f.shown == null || angleDelta(smooth, f.shown) >= HEADING_MIN_STEP_DEG;
+          if (moved && now - f.lastEmit >= HEADING_MIN_INTERVAL_MS) {
+            f.shown = smooth;
+            f.lastEmit = now;
+            setHeading(smooth);
+          }
+        },
+        () => setHeading(null),
+      )
+        .then(s => {
+          if (cancelled) s.remove();
+          else sub = s;
+        })
+        .catch(() => setHeading(null));
+      return () => {
+        cancelled = true;
+        clearInterval(repaint);
+        sub?.remove();
+      };
+    }, [gpsOn]),
+  );
+
   const handleScan = useCallback(() => {
     setScanCount(c => c + 1);
     setLog('// requesting immediate scan...');
@@ -162,24 +229,40 @@ export function NearbyScreen() {
   );
   const peerCount = neighbors.length + scanResults.length + knownNotLinked.length;
 
-  // Radar: real bearing + haversine distance from our (truncated) fix to each
+  // Radar: real bearing + haversine distance from our full-precision fix to each
   // peer's last known position. Needs our own fix, so it is GPS-gated.
   const me = positionProvider.getCurrent();
   const table = getLocationTable();
   const radarCandidates = [
-    ...neighbors.map(n => ({ id: n.fingerprintHex, label: n.displayName, linked: true })),
-    ...knownNotLinked.map(p => ({ id: p.deviceId, label: p.displayName, linked: false })),
+    ...neighbors.map(n => ({ id: n.fingerprintHex, label: n.displayName, linked: true, rssi: n.rssi })),
+    ...knownNotLinked.map(p => ({ id: p.deviceId, label: p.displayName, linked: false, rssi: null as number | null })),
   ];
   const radarPeers: RadarPeer[] = [];
-  const unplaced: string[] = [];
+  const unplacedSignal: string[] = []; // linked, no GPS fix, but a signal estimate
+  const unplacedNoSignal: string[] = [];
   for (const c of radarCandidates) {
     const pos = me ? table.get(c.id) : null;
+    const signalM = c.linked && c.rssi != null ? rssiToMeters(c.rssi) : undefined;
     if (me && pos) {
-      radarPeers.push({ ...c, distanceM: haversineMeters(me, pos), bearing: bearingDegrees(me, pos) });
+      radarPeers.push({
+        id: c.id,
+        label: c.label,
+        linked: c.linked,
+        distanceM: haversineMeters(me, pos),
+        bearing: bearingDegrees(me, pos),
+        accuracy: pos.accuracy,
+        signalM,
+      });
+    } else if (signalM !== undefined) {
+      unplacedSignal.push(`${c.label} ${formatSignalM(signalM)} by signal`);
     } else {
-      unplaced.push(c.label);
+      unplacedNoSignal.push(c.label);
     }
   }
+  const headingAvailable = heading != null;
+  const radarMode: 'heading' | 'north' = headingMode === 'heading' && headingAvailable ? 'heading' : 'north';
+  const modeLabel =
+    radarMode === 'heading' ? 'HEADING-UP' : headingAvailable ? 'NORTH-UP' : 'NORTH-UP · NO COMPASS';
   const distanceTo = (fp: string): string => {
     const pos = me ? table.get(fp) : null;
     return me && pos ? ` · ${Math.round(haversineMeters(me, pos))}m` : '';
@@ -208,19 +291,29 @@ export function NearbyScreen() {
         <Panel title="neighbour field" right={me ? 'live gps' : 'no gps fix'}>
           {me ? (
             <>
-              <Radar peers={radarPeers} active={isScanning} />
+              <View style={styles.radarBar}>
+                <Pressable
+                  onPress={() => setHeadingMode(m => (m === 'heading' ? 'north' : 'heading'))}
+                  hitSlop={8}
+                  accessibilityRole="button"
+                  accessibilityLabel={`radar orientation: ${modeLabel.toLowerCase()}, tap to switch`}>
+                  <Chip label={modeLabel} tone="cyan" />
+                </Pressable>
+              </View>
+              <Radar
+                peers={radarPeers}
+                active={isScanning}
+                heading={heading}
+                mode={radarMode}
+                myAccuracy={me.accuracy}
+              />
               <View style={styles.legend}>
                 <LegendDot color={colors.success} filled label="linked" />
                 <LegendDot color={colors.warning} label="known · no link" />
                 <LegendDot color={colors.primary} filled square label="you" />
               </View>
-              {unplaced.length > 0 ? (
-                <Text style={styles.unplaced}>
-                  no position yet: {unplaced.join(', ')}
-                </Text>
-              ) : null}
               <Text style={styles.unplaced}>
-                Positions are truncated to ~110 m on the wire, so close peers cluster near the centre.
+                {`gps ${me.accuracy != null ? `±${Math.round(me.accuracy)}m` : 'accuracy unknown'} · positions shared at full precision`}
               </Text>
             </>
           ) : (
@@ -233,6 +326,12 @@ export function NearbyScreen() {
               </Text>
             </View>
           )}
+          {unplacedSignal.length > 0 ? (
+            <Text style={styles.unplaced}>{unplacedSignal.join(' · ')}</Text>
+          ) : null}
+          {unplacedNoSignal.length > 0 ? (
+            <Text style={styles.unplaced}>no position yet: {unplacedNoSignal.join(', ')}</Text>
+          ) : null}
         </Panel>
 
         <Panel title="node" right={`mesh ${mesh.isRunning() ? 'on' : 'off'}`} variant="flat">
@@ -401,6 +500,7 @@ const styles = StyleSheet.create({
   legendItem: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   legendText: { fontFamily: fonts.mono, fontSize: 10, color: colors.textMuted },
   unplaced: { marginTop: 10, fontFamily: fonts.mono, fontSize: 10, lineHeight: 16, color: colors.textMuted },
+  radarBar: { flexDirection: 'row', justifyContent: 'flex-end', paddingBottom: 10 },
   logList: { gap: 8 },
   logLine: { fontFamily: fonts.mono, fontSize: 11, lineHeight: 17, color: colors.text },
   footer: {

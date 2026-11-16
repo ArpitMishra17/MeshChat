@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { View, Text, Animated, Easing, StyleSheet, type LayoutChangeEvent } from 'react-native';
 import { colors, fonts } from '../theme';
+import { formatSignalM } from '../services/proximity';
 
 /* ------------------------------------------------------------------ */
 /* motion                                                              */
@@ -191,25 +192,63 @@ export interface RadarPeer {
   distanceM: number;
   bearing: number;
   linked: boolean;
+  /** Peer's reported GPS accuracy radius in metres, when known. */
+  accuracy?: number;
+  /** Rough RSSI-based distance in metres (about ±50%), for linked peers. */
+  signalM?: number;
 }
 
-const RANGE_STEPS = [50, 100, 200, 500, 1000, 2000, 5000, 10000, 50000];
+/** Range snaps to these steps; the 5–20 m rungs keep close peers apart. */
+const RANGE_STEPS = [5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 50000];
+const NO_PEER_RANGE_M = 20;
+/** Peers closer than this are still drawn this far out, so they never sit on YOU. */
+const MIN_PEER_RADIUS_PX = 8;
+/** Smallest drawn accuracy circle, so a tight fix still shows as a ring. */
+const MIN_ACCURACY_RADIUS_PX = 6;
 const fmtM = (m: number) => (m >= 1000 ? `${m / 1000}km` : `${Math.round(m)}m`);
+/** Peer distance: one decimal under 10 m so close peers read apart. */
+const fmtDist = (m: number) => (m < 10 ? `${m.toFixed(1)}m` : `${Math.round(m)}m`);
 
 /**
- * Polar neighbour plot. Peers are placed by real bearing + haversine
- * distance from the location table; the range snaps to the next nice step
- * past the farthest peer. Positions are truncated to ~110 m on the wire, so
- * peers closer than that cluster near the centre.
+ * Polar neighbour plot. Peers are placed by real bearing + haversine distance
+ * from the location table; the range snaps to the next nice step past the
+ * farthest peer. Positions are shared at full precision, so close peers
+ * separate; the faint rings show each fix's GPS accuracy.
+ *
+ * `mode="heading"` rotates the plot so the phone's forward direction is at the
+ * top (▲). Without a `heading` it falls back to north-up.
  */
-export function Radar({ peers, active }: { peers: RadarPeer[]; active?: boolean }) {
+export function Radar({
+  peers, active, heading = null, mode = 'north', myAccuracy,
+}: {
+  peers: RadarPeer[];
+  active?: boolean;
+  heading?: number | null;
+  mode?: 'heading' | 'north';
+  myAccuracy?: number;
+}) {
   const [w, onLayout] = useWidth();
   const size = w;
   const cx = size / 2;
   const cy = size / 2;
   const R = size / 2 - 22;
   const farthest = Math.max(...peers.map(p => p.distanceM), 0);
-  const range = RANGE_STEPS.find(r => r >= farthest * 1.15) ?? RANGE_STEPS[RANGE_STEPS.length - 1];
+  const range = peers.length === 0
+    ? NO_PEER_RANGE_M
+    : RANGE_STEPS.find(r => r >= farthest * 1.15) ?? RANGE_STEPS[RANGE_STEPS.length - 1];
+
+  const headingUp = mode === 'heading' && heading != null;
+  const rot = headingUp ? heading : 0;
+  /** Screen point at `r` px from centre, `deg` clockwise from the top. */
+  const polar = (deg: number, r: number) => {
+    const a = (deg * Math.PI) / 180;
+    return { x: cx + Math.sin(a) * r, y: cy - Math.cos(a) * r };
+  };
+  /** Accuracy radius in px for a metre value, or null when unknown. */
+  const accuracyPx = (m?: number) =>
+    m != null && m > 0 ? Math.min(Math.max((m / range) * R, MIN_ACCURACY_RADIUS_PX), R) : null;
+  const northPt = headingUp ? polar(-rot, R) : null;
+  const meAcc = accuracyPx(myAccuracy);
 
   const ring = (f: number) => (
     <View
@@ -239,7 +278,14 @@ export function Radar({ peers, active }: { peers: RadarPeer[]; active?: boolean 
           {([1 / 3, 2 / 3, 1] as const).map(f => (
             <Text key={f} style={[s.radarTick, { left: cx + 3, top: cy - R * f + 1 }]}>{fmtM(range * f)}</Text>
           ))}
-          <Text style={[s.radarCardinal, { left: cx - 4, top: 2 }]}>N</Text>
+          {northPt ? (
+            <>
+              <Text style={[s.radarForward, { left: cx - 5, top: cy - R - 13 }]}>▲</Text>
+              <Text style={[s.radarCardinal, s.radarCardinalRing, { left: northPt.x - 5, top: northPt.y - 6 }]}>N</Text>
+            </>
+          ) : (
+            <Text style={[s.radarCardinal, { left: cx - 4, top: 2 }]}>N</Text>
+          )}
           <Text style={s.radarCaption}>RANGE {fmtM(range)}</Text>
           <View style={s.radarLive}>
             <Text style={[s.radarLiveText, { color: active ? colors.warning : colors.textMuted }]}>
@@ -247,15 +293,33 @@ export function Radar({ peers, active }: { peers: RadarPeer[]; active?: boolean 
             </Text>
           </View>
 
+          {meAcc != null ? (
+            <View
+              pointerEvents="none"
+              style={{
+                position: 'absolute', left: cx - meAcc, top: cy - meAcc, width: meAcc * 2, height: meAcc * 2,
+                borderRadius: meAcc, borderWidth: 1, borderColor: colors.primary, opacity: 0.3,
+              }}
+            />
+          ) : null}
+
           {peers.map(p => {
-            const rr = Math.max((p.distanceM / range) * R, 16);
-            const a = (p.bearing * Math.PI) / 180;
-            const x = cx + Math.sin(a) * rr;
-            const y = cy - Math.cos(a) * rr;
+            const rr = Math.max((p.distanceM / range) * R, MIN_PEER_RADIUS_PX);
+            const { x, y } = polar(p.bearing - rot, rr);
             const tone = p.linked ? colors.success : colors.warning;
             const right = x >= cx;
+            const acc = accuracyPx(p.accuracy);
             return (
               <React.Fragment key={p.id}>
+                {acc != null ? (
+                  <View
+                    pointerEvents="none"
+                    style={{
+                      position: 'absolute', left: x - acc, top: y - acc, width: acc * 2, height: acc * 2,
+                      borderRadius: acc, borderWidth: 1, borderColor: tone, opacity: 0.3,
+                    }}
+                  />
+                ) : null}
                 {p.linked ? (
                   <View
                     pointerEvents="none"
@@ -281,7 +345,10 @@ export function Radar({ peers, active }: { peers: RadarPeer[]; active?: boolean 
                   <Text style={[s.peerLabel, { color: p.linked ? colors.text : colors.textMuted }]} numberOfLines={1}>
                     {p.label.toUpperCase()}
                   </Text>
-                  <Text style={s.peerDist}>{fmtM(p.distanceM)}</Text>
+                  <Text style={s.peerDist} numberOfLines={1}>
+                    {fmtDist(p.distanceM)}
+                    {p.signalM != null ? ` · sig ${formatSignalM(p.signalM)}` : ''}
+                  </Text>
                 </View>
               </React.Fragment>
             );
@@ -421,36 +488,6 @@ export function HexDump({ bytes }: { bytes: Uint8Array }) {
 /* ------------------------------------------------------------------ */
 
 /**
- * Position-privacy grid. Coordinates are truncated to a fixed decimal grid
- * before leaving the phone, so peers only ever learn which cell you are in.
- * The centre cell is that cell; `cellMeters` is its real size.
- */
-export function PrecisionDial({ cellMeters, decimals }: { cellMeters: number; decimals: number }) {
-  const cell = 28;
-  return (
-    <View style={{ width: cell * 3 + 2, alignItems: 'center' }}>
-      <View style={{ width: cell * 3, height: cell * 3, borderWidth: 1, borderColor: colors.line }}>
-        {[1, 2].map(i => (
-          <View key={`v${i}`} style={{ position: 'absolute', left: i * cell, top: 0, bottom: 0, width: 1, backgroundColor: colors.line }} />
-        ))}
-        {[1, 2].map(i => (
-          <View key={`h${i}`} style={{ position: 'absolute', top: i * cell, left: 0, right: 0, height: 1, backgroundColor: colors.line }} />
-        ))}
-        <View
-          style={{
-            position: 'absolute', left: cell, top: cell, width: cell, height: cell,
-            borderWidth: 1, borderColor: colors.warning, borderStyle: 'dashed',
-            backgroundColor: colors.warningFaint, alignItems: 'center', justifyContent: 'center',
-          }}>
-          <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: colors.warning }} />
-        </View>
-      </View>
-      <Text style={s.dialCaption}>{cellMeters} m · {decimals} dp</Text>
-    </View>
-  );
-}
-
-/**
  * The MeshChat mark, drawn from Views. Mirrors the geometry in
  * `scripts/generate-icons.py` (cropped to the mark's bounding box): a lime
  * "you" square, a live green link, a hollow known peer, and an amber dashed
@@ -542,6 +579,8 @@ const s = StyleSheet.create({
   spoke: { position: 'absolute', backgroundColor: colors.line },
   radarTick: { position: 'absolute', fontFamily: fonts.mono, fontSize: 8, color: colors.line3 },
   radarCardinal: { position: 'absolute', fontFamily: fonts.dispBold, fontSize: 8, color: colors.textMuted },
+  radarCardinalRing: { width: 10, textAlign: 'center', lineHeight: 12, backgroundColor: colors.bgInput },
+  radarForward: { position: 'absolute', width: 10, textAlign: 'center', fontFamily: fonts.mono, fontSize: 8, color: colors.primary },
   radarCaption: { position: 'absolute', left: 8, top: 14, fontFamily: fonts.mono, fontSize: 8, letterSpacing: 0.6, color: colors.textMuted },
   radarLive: { position: 'absolute', right: 8, top: 6 },
   radarLiveText: { fontFamily: fonts.dispBold, fontSize: 8, letterSpacing: 0.9 },

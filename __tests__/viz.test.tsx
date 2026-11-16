@@ -5,7 +5,8 @@
  */
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
-import { BarChart, StepChart, Radar, Topology, HexDump, PrecisionDial, Logo, HEADER_FIELDS } from '../src/components/viz';
+import { StyleSheet, Text } from 'react-native';
+import { BarChart, StepChart, Radar, Topology, HexDump, Logo, HEADER_FIELDS } from '../src/components/viz';
 import { Chip, Ladder, Meter, BlockBar, Cells, KV, Fingerprint } from '../src/components/ui';
 
 // The charts/chips start Animated timers (entrance, blinking cursor). Under real
@@ -87,7 +88,45 @@ describe('Radar', () => {
     act(() => { r = TestRenderer.create(<Radar peers={[]} />); });
     layout(r, 300);
     expect(text(r)).toContain('YOU');
-    expect(text(r)).toContain('RANGE 50m');
+    expect(text(r)).toContain('RANGE 20m');
+  });
+});
+
+describe('Radar close range and heading', () => {
+  it('zooms to 5 m for close peers and reads distances to one decimal', () => {
+    let r!: TestRenderer.ReactTestRenderer;
+    const peers = [{ id: 'a', label: 'rahul', distanceM: 3.2, bearing: 0, linked: true, accuracy: 2 }];
+    act(() => { r = TestRenderer.create(<Radar peers={peers} />); });
+    layout(r, 300);
+    const out = text(r);
+    expect(out).toContain('RANGE 5m');
+    expect(out).toContain('3.2m');
+  });
+
+  it('shows signal-estimated distance next to a linked peer', () => {
+    let r!: TestRenderer.ReactTestRenderer;
+    const peers = [{ id: 'a', label: 'rahul', distanceM: 40, bearing: 0, linked: true, signalM: 3 }];
+    act(() => { r = TestRenderer.create(<Radar peers={peers} />); });
+    layout(r, 300);
+    expect(text(r)).toContain('40m · sig ~3m');
+  });
+
+  it('puts N on the outer ring opposite the heading in heading-up mode', () => {
+    let r!: TestRenderer.ReactTestRenderer;
+    act(() => { r = TestRenderer.create(<Radar peers={[]} heading={90} mode="heading" />); });
+    layout(r, 300);
+    const north = r.root.findAll(n => n.type === Text && n.props.children === 'N')[0];
+    // Phone facing east: north sits on the left edge (cx 150 - R 128 = 22, minus half the label box).
+    const left = StyleSheet.flatten(north.props.style).left;
+    expect(left).toBeCloseTo(17, 0);
+    expect(text(r)).toContain('▲');
+  });
+
+  it('keeps north at the top and skips the forward tick in north-up mode', () => {
+    let r!: TestRenderer.ReactTestRenderer;
+    act(() => { r = TestRenderer.create(<Radar peers={[]} heading={90} mode="north" />); });
+    layout(r, 300);
+    expect(text(r)).not.toContain('▲');
   });
 });
 
@@ -134,7 +173,6 @@ describe('ui atoms', () => {
           <Cells items={[{ k: 'a', v: 1 }, { k: 'b', v: '—' }]} />
           <KV k="k" v="v" />
           <Fingerprint hex="0123456789abcdef" />
-          <PrecisionDial cellMeters={111} decimals={3} />
           <Logo size={64} />
         </>,
       );

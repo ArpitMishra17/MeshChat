@@ -478,6 +478,9 @@ class BLEService {
       // Subscribe to handshake (resolves on first HELLO) + ongoing MESSAGE/ACK
       // traffic for the life of this central connection.
       const handshakePromise = this.subscribeToHandshake(central);
+      // If sending our HELLO throws first, nobody awaits this promise; mark its
+      // timeout as handled so it is not reported as an unhandled rejection.
+      handshakePromise.catch(() => {});
       this.subscribeToTraffic(central);
       this.recomputeState();
 

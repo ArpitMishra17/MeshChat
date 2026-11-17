@@ -144,7 +144,6 @@ export function MessageBubble({
               </Text>
             ) : null}
             {failed ? <Text style={styles.failed}>failed · tap to retry</Text> : null}
-            {message.status === 'queued' ? <Text style={styles.queued}>queued</Text> : null}
           </>
         ) : hopLabel ? (
           <Text style={styles.hop}>{hopLabel}</Text>
@@ -152,7 +151,6 @@ export function MessageBubble({
       </View>
       {!isMine && hops != null && hops > 1 ? (
         <View style={styles.ribbon}>
-          <Chip label={`${hops} hops`} tone="amber" />
           {/* TTL left on arrival: every relay forward spent one of DEFAULT_TTL. */}
           <Chip label={`ttl ${Math.max(0, DEFAULT_TTL - (hops - 1))}`} />
         </View>
@@ -186,6 +184,5 @@ const styles = StyleSheet.create({
   read: { fontFamily: fonts.mono, fontSize: 10, color: colors.accent },
   delivered: { fontFamily: fonts.mono, fontSize: 10, color: colors.primary },
   failed: { fontFamily: fonts.mono, fontSize: 10, color: colors.error },
-  queued: { fontFamily: fonts.mono, fontSize: 10, color: colors.warning },
   ribbon: { flexDirection: 'row', gap: 6 },
 });

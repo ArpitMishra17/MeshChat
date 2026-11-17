@@ -14,7 +14,7 @@ import { getLocationTable } from '../services/location';
 import { syncRelayService } from '../services/boot';
 import BlePeripheral from '../../modules/BlePeripheral';
 import { TerminalHeader } from '../components/TerminalHeader';
-import { BlockBar, Btn, Chip, Fingerprint, KV, Label, Panel, Rule, Toggle } from '../components/ui';
+import { BlockBar, Btn, Fingerprint, KV, Label, Panel, Rule, Toggle } from '../components/ui';
 import { Stagger } from '../components/viz';
 
 export function SettingsScreen() {
@@ -81,15 +81,10 @@ export function SettingsScreen() {
 
   return (
     <View style={styles.container}>
-      <TerminalHeader
-        title="config"
-        subtitle="local only"
-        right={<Chip label="encrypted" tone="lime" dot pulse />}
-      />
+      <TerminalHeader title="config" />
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
         <Stagger>
-        <Panel title="identity" right={<Chip label="tofu" tone="amber" />}>
-          <KV k="fingerprint" v={identity.deviceId} color={colors.primary} />
+        <Panel title="identity">
           <View style={styles.fp}>
             <Fingerprint hex={identity.deviceId} />
           </View>
@@ -108,14 +103,14 @@ export function SettingsScreen() {
                 cursorColor={colors.primary}
                 selectionColor={colors.primary}
               />
-              <Btn label={saved ? 'ok' : 'save'} onPress={handleSave} tone={saved ? 'on' : 'default'} style={styles.save} />
+              <Btn label={saved ? 'ok' : 'save'} onPress={handleSave} tone={saved ? 'on' : 'default'} />
             </View>
           </View>
         </Panel>
 
         <Rule title="messages" />
 
-        <Panel title="alerts" right={notifyEnabled ? '[ on ]' : '[ off ]'} variant={notifyEnabled ? 'hot' : 'default'}>
+        <Panel title="alerts">
           <View style={styles.toggleRow}>
             <View style={{ flex: 1 }}>
               <Label>notifications</Label>
@@ -142,7 +137,7 @@ export function SettingsScreen() {
           </View>
         </Panel>
 
-        <Panel title="background relay" right={relayEnabled ? '[ on ]' : '[ off ]'} variant={relayEnabled ? 'hot' : 'default'}>
+        <Panel title="background relay">
           <View style={[styles.toggleRow, !batteryExempt && { marginBottom: 12 }]}>
             <View style={{ flex: 1 }}>
               <Label>keep relaying</Label>
@@ -163,7 +158,7 @@ export function SettingsScreen() {
 
         <Rule title="geographic routing" />
 
-        <Panel title="gps routing" right={gpsEnabled ? '[ on ]' : '[ off ]'} variant={gpsEnabled ? 'hot' : 'default'}>
+        <Panel title="gps routing">
           <View style={styles.toggleRow}>
             <View style={{ flex: 1 }}>
               <Label>greedy forwarding</Label>
@@ -186,7 +181,7 @@ export function SettingsScreen() {
 
         <Rule title="link" />
 
-        <Panel title="radio" right="read-only" variant="flat">
+        <Panel title="radio" variant="flat">
           <KV k="role" v="dual · central + peripheral" />
           <KV k="negotiated mtu" v={mtus.length ? mtus.join(' / ') : 'no central link'} dim={!mtus.length} />
           <KV k="mtu requested" v={REQUESTED_MTU} dim />
@@ -205,7 +200,7 @@ export function SettingsScreen() {
 
         <Rule title="storage" />
 
-        <Panel title="local db" right="sqlite" variant="flat">
+        <Panel title="local db" variant="flat">
           {tableCounts.map(r => (
             <View key={r.table} style={styles.slab}>
               <Text style={styles.slabLabel}>{r.table}</Text>
@@ -222,13 +217,8 @@ export function SettingsScreen() {
         <Panel title="build" variant="flat">
           <KV k="version" v="0.2.0-alpha" />
           <KV k="protocol" v="BLE v2 · versioned, addressed" />
-          <KV k="storage" v="local only (SQLite)" />
-          <KV k="crypto" v="X25519 + AES-256-GCM" color={colors.success} />
-          <KV k="identity" v="cryptographic (TOFU)" dim last />
-        </Panel>
-
-        <Panel title="on-device only" variant="flat">
-          <Text style={styles.diag}>
+          <KV k="crypto" v="X25519 + AES-256-GCM" color={colors.success} last />
+          <Text style={[styles.tip, { marginTop: 12 }]}>
             Nothing leaves this phone. No analytics, no crash upload, no account. Wiping the app destroys the
             identity permanently.
           </Text>
@@ -261,7 +251,6 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: colors.border, backgroundColor: colors.bgInput,
     fontFamily: fonts.mono, fontSize: 13, color: colors.primary,
   },
-  save: { paddingVertical: 11 },
   batteryBtn: { alignSelf: 'flex-start', marginBottom: 0 },
   slab: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 10 },
   slabLabel: {
@@ -270,5 +259,4 @@ const styles = StyleSheet.create({
   slabVal: { width: 30, textAlign: 'right', fontFamily: fonts.mono, fontSize: 11, color: colors.textDim },
   toggleRow: { flexDirection: 'row', alignItems: 'center', gap: 16, marginBottom: 10 },
   tip: { marginTop: 6, fontFamily: fonts.mono, fontSize: 11, lineHeight: 19, color: colors.textMuted },
-  diag: { fontFamily: fonts.mono, fontSize: 11, lineHeight: 19, color: colors.textDim },
 });

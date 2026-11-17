@@ -487,55 +487,6 @@ export function HexDump({ bytes }: { bytes: Uint8Array }) {
 /* decorative-but-honest                                               */
 /* ------------------------------------------------------------------ */
 
-/**
- * The MeshChat mark, drawn from Views. Mirrors the geometry in
- * `scripts/generate-icons.py` (cropped to the mark's bounding box): a lime
- * "you" square, a live green link, a hollow known peer, and an amber dashed
- * link to a node reachable through the relay edge.
- */
-export function Logo({ size = 56 }: { size?: number }) {
-  const x0 = 250, y0 = 262, W = 580, H = 520; // design-space crop
-  const k = size / W;
-  const P = (x: number, y: number) => ({ x: (x - x0) * k, y: (y - y0) * k });
-  const YOU = P(512, 512), LIVE = P(748, 340), STEEL = P(318, 322), RELAY = P(372, 736), FAR = P(738, 722);
-  const ring = (p: { x: number; y: number }, r: number, color: string, stroke: number) => (
-    <View
-      style={{
-        position: 'absolute', left: p.x - r * k, top: p.y - r * k, width: r * 2 * k, height: r * 2 * k,
-        borderRadius: r * k, borderWidth: Math.max(1, stroke * k), borderColor: color, backgroundColor: colors.bg,
-      }}
-    />
-  );
-  const edge = (a: { x: number; y: number }, b: { x: number; y: number }, color: string, w: number, dashed?: boolean) => (
-    <Line x1={a.x} y1={a.y} x2={b.x} y2={b.y} color={color} width={Math.max(1, w * k)} dashed={dashed} />
-  );
-  return (
-    <View style={{ width: size, height: (H / W) * size }}>
-      {edge(YOU, LIVE, colors.primary, 16)}
-      {edge(YOU, STEEL, colors.line3, 10)}
-      {edge(YOU, RELAY, colors.warning, 10, true)}
-      {edge(LIVE, FAR, colors.line3, 8, true)}
-      {edge(FAR, RELAY, colors.line3, 8, true)}
-      {ring(LIVE, 70, '#2e732e', 8)}
-      <View
-        style={{
-          position: 'absolute', left: LIVE.x - 46 * k, top: LIVE.y - 46 * k, width: 92 * k, height: 92 * k,
-          borderRadius: 46 * k, backgroundColor: colors.success,
-        }}
-      />
-      {ring(STEEL, 46, colors.textDim, 13)}
-      {ring(RELAY, 46, colors.warning, 13)}
-      {ring(FAR, 34, colors.line3, 11)}
-      <View
-        style={{
-          position: 'absolute', left: YOU.x - 66 * k, top: YOU.y - 66 * k, width: 132 * k, height: 132 * k,
-          backgroundColor: colors.primary,
-        }}
-      />
-    </View>
-  );
-}
-
 /** "IDENTITY SEALED" stamp on a document card. */
 export function Seal() {
   return (

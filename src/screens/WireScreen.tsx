@@ -65,7 +65,6 @@ export function WireScreen() {
       <TerminalHeader
         title="wire"
         subtitle={sel ? `msg ${sel.msgIdHex.slice(0, 4)}` : 'no capture'}
-        right={<Chip label={sel ? 'captured' : 'idle'} tone={sel ? 'cyan' : 'default'} dot />}
       />
       <ScrollView contentContainerStyle={styles.content}>
         <Stagger>
@@ -106,7 +105,7 @@ export function WireScreen() {
             <KV k="duplicate rate" v={hitRate} last />
           </Panel>
 
-          <Panel title="reassembly" right="fragments" variant="flat">
+          <Panel title="reassembly" variant="flat">
             {reasm.inFlight.length === 0 ? (
               <Text style={[styles.empty, { marginBottom: 10 }]}>no fragments in flight</Text>
             ) : (
@@ -170,7 +169,7 @@ function Inspector({ p, nameOf }: { p: CapturedPacket; nameOf: (fp: string) => s
         />
       </Panel>
 
-      <Panel title="flags" right="1 byte" variant="flat">
+      <Panel title="flags" variant="flat">
         {flags.map(([name, bit, onText, offText], i) => {
           const on = (p.flags & bit) !== 0;
           return (
@@ -185,7 +184,7 @@ function Inspector({ p, nameOf }: { p: CapturedPacket; nameOf: (fp: string) => s
         })}
       </Panel>
 
-      <Panel title="body" right={`${p.payloadLen} B payload`} variant="flat">
+      <Panel title="body" variant="flat">
         <Body p={p} encrypted={encrypted} />
       </Panel>
     </>

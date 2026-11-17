@@ -12,7 +12,7 @@ import { ensureIdentity } from '../services/identity';
 import { messageRouter } from '../services/messageRouter';
 import { mesh } from '../services/mesh';
 import { TerminalHeader } from '../components/TerminalHeader';
-import { Btn, Chip, Label, Meter, Panel, Row, Seg, type Tone } from '../components/ui';
+import { Btn, Chip, Label, Meter, Row, Seg, type Tone } from '../components/ui';
 import type { Conversation, Peer } from '../types';
 import type { RootStackParamList } from '../navigation';
 
@@ -36,13 +36,6 @@ const STATUS_CHIP: Record<string, [string, Tone]> = {
   delivered: ['delivered', 'lime'],
   failed: ['failed', 'red'],
 };
-
-const LADDER: [string, string, string][] = [
-  ['queued', 'persisted locally', colors.warning],
-  ['sending', 'on an active link', colors.warning],
-  ['sent', 'handed to ble', colors.accent],
-  ['delivered', 'ack returned', colors.primary],
-];
 
 export function ConversationsScreen() {
   const navigation = useNavigation<NavProp>();
@@ -125,7 +118,6 @@ export function ConversationsScreen() {
     <View style={styles.container}>
       <TerminalHeader
         title="chats"
-        subtitle={`${threads.length} threads`}
         right={totalQueued > 0 ? <Chip label={`${totalQueued} queued`} tone="amber" dot pulse /> : undefined}
       />
       <FlatList
@@ -222,23 +214,6 @@ export function ConversationsScreen() {
             </Text>
           </View>
         }
-        ListFooterComponent={
-          <View style={styles.footer}>
-            <Panel title="delivery" right="ladder" variant="flat">
-              <View style={{ gap: 8 }}>
-                {LADDER.map(([name, desc, color]) => (
-                  <View key={name} style={styles.ladderLine}>
-                    <Text style={styles.ladderIdx}>{name[0].toUpperCase()}</Text>
-                    <Text style={styles.ladderText}>
-                      <Text style={{ color }}>{name}</Text>
-                      <Text style={{ color: colors.textDim }}> — {desc}</Text>
-                    </Text>
-                  </View>
-                ))}
-              </View>
-            </Panel>
-          </View>
-        }
       />
     </View>
   );
@@ -266,8 +241,4 @@ const styles = StyleSheet.create({
   ribbon: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   empty: { alignItems: 'center', paddingVertical: 48 },
   emptyHint: { marginTop: 8, fontFamily: fonts.mono, fontSize: 11, color: colors.textMuted },
-  footer: { padding: 16, paddingTop: 24 },
-  ladderLine: { flexDirection: 'row', gap: 10 },
-  ladderIdx: { width: 24, fontFamily: fonts.mono, fontSize: 11, lineHeight: 17, color: colors.line3 },
-  ladderText: { flex: 1, fontFamily: fonts.mono, fontSize: 11, lineHeight: 17 },
 });

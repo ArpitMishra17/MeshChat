@@ -18,6 +18,7 @@ import { StatusBadge } from '../components/StatusBadge';
 import { Btn, Cells, Chip, KV, Label, Meter, Panel, Row } from '../components/ui';
 import { Radar, Stagger, type RadarPeer } from '../components/viz';
 import { TerminalHeader } from '../components/TerminalHeader';
+import { Logo } from '../components/Logo';
 import type { ChatState, Peer } from '../types';
 import type { RootStackParamList } from '../navigation';
 
@@ -58,7 +59,6 @@ export function NearbyScreen() {
   const [scanResults, setScanResults] = useState<Peer[]>([]);
   const [knownPeers, setKnownPeers] = useState<Peer[]>([]);
   const [bleState, setBleState] = useState<BLEState>('idle');
-  const [scanCount, setScanCount] = useState(0);
   const [log, setLog] = useState('// mesh running');
   const [routeStats, setRouteStats] = useState<RouteStats>(messageRouter.getRouteStats());
   const [routeLog, setRouteLog] = useState<RouteLogEntry[]>([]);
@@ -177,7 +177,6 @@ export function NearbyScreen() {
   );
 
   const handleScan = useCallback(() => {
-    setScanCount(c => c + 1);
     setLog('// requesting immediate scan...');
     mesh.forceScanNow();
     setLog(`// scan kicked | central links: ${bleService.getCentralConnectionCount()}`);
@@ -283,7 +282,7 @@ export function NearbyScreen() {
     <View style={styles.container}>
       <TerminalHeader
         title="nearby"
-        subtitle={`scan#${scanCount}`}
+        left={<Logo size={20} />}
         right={<StatusBadge state={bleState} />}
       />
 
@@ -298,7 +297,7 @@ export function NearbyScreen() {
           ]}
         />
 
-        <Panel title="neighbour field" right={me ? 'live gps' : 'no gps fix'}>
+        <Panel title="neighbour field">
           {me ? (
             <>
               <View style={styles.radarBar}>
@@ -323,7 +322,7 @@ export function NearbyScreen() {
                 <LegendDot color={colors.primary} filled square label="you" />
               </View>
               <Text style={styles.unplaced}>
-                {`gps ${me.accuracy != null ? `±${Math.round(me.accuracy)}m` : 'accuracy unknown'} · positions shared at full precision`}
+                {`gps ${me.accuracy != null ? `±${Math.round(me.accuracy)}m` : 'accuracy unknown'}`}
               </Text>
             </>
           ) : (
@@ -433,7 +432,7 @@ export function NearbyScreen() {
         </Panel>
 
         {routeLog.length > 0 ? (
-          <Panel title="routing log" right={`${routeLog.length} shown`} variant="flat">
+          <Panel title="routing log" variant="flat">
             <View style={styles.logList}>
               {routeLog.map((entry, i) => {
                 const c =

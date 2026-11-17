@@ -125,23 +125,6 @@ export function Cells({ items }: { items: { k: string; v: string | number; u?: s
   );
 }
 
-/** Tinted alert / note block with a small caps heading. */
-export function Callout({
-  title, tone = 'red', children,
-}: { title: string; tone?: 'red' | 'green'; children: React.ReactNode }) {
-  const t = tone === 'red'
-    ? { fg: colors.error, border: 'rgba(255,81,72,0.45)', bg: colors.errorFaint }
-    : { fg: colors.success, border: 'rgba(92,230,92,0.4)', bg: colors.successFaint };
-  return (
-    <View style={{ borderWidth: 1, borderColor: t.border, backgroundColor: t.bg, padding: 14 }}>
-      <Text style={{ fontFamily: fonts.dispBold, fontSize: 10, letterSpacing: 1.2, color: t.fg, marginBottom: 10 }}>
-        {title}
-      </Text>
-      <Text style={{ fontFamily: fonts.mono, fontSize: 11, lineHeight: 19, color: colors.textDim }}>{children}</Text>
-    </View>
-  );
-}
-
 /* ------------------------------------------------------------------ */
 /* chips / indicators                                                  */
 /* ------------------------------------------------------------------ */
@@ -471,7 +454,7 @@ const s = StyleSheet.create({
 
   btn: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7,
-    paddingHorizontal: 14, paddingVertical: 13, borderWidth: 1,
+    paddingHorizontal: 14, paddingVertical: 14, borderWidth: 1,
   },
   btnGlow: { shadowColor: colors.primary, shadowOpacity: 0.2, shadowRadius: 10, shadowOffset: { width: 0, height: 0 } },
   btnText: { fontFamily: fonts.dispBold, fontSize: 11, lineHeight: 14, letterSpacing: 1.3, textTransform: 'uppercase' },

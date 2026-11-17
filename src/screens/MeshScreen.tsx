@@ -10,7 +10,7 @@ import {
 } from '../services/outbox';
 import { getAllOutboxEntries, getAllPeers, getPeerByFingerprint } from '../db/database';
 import { TerminalHeader } from '../components/TerminalHeader';
-import { Callout, Cells, Chip, KV, Panel, Label } from '../components/ui';
+import { Cells, Chip, KV, Panel, Label } from '../components/ui';
 import { Axis, BarChart, StepChart, Stagger, Topology, type TopoNode } from '../components/viz';
 import type { OutboxEntry } from '../types';
 
@@ -82,7 +82,6 @@ export function MeshScreen() {
     <View style={styles.container}>
       <TerminalHeader
         title="mesh"
-        subtitle="telemetry"
         right={<Chip label={`${neighbors.length} links`} tone="lime" dot pulse={neighbors.length > 0} />}
       />
       <ScrollView contentContainerStyle={styles.content}>
@@ -95,7 +94,7 @@ export function MeshScreen() {
             ]}
           />
 
-          <Panel title="packet throughput" right="2m window">
+          <Panel title="packet throughput">
             <View style={styles.chartHead}>
               <Label dim>pkt / s · {THROUGHPUT_BUCKETS} buckets</Label>
               <Label style={{ color: colors.warning }}>peak {peak.toFixed(2)}</Label>
@@ -104,7 +103,7 @@ export function MeshScreen() {
             <Axis labels={['-2m', '-1m', 'now']} />
           </Panel>
 
-          <Panel title="outbox depth" right="store & forward">
+          <Panel title="outbox depth">
             <View style={styles.chartHead}>
               <Label dim>queued messages</Label>
               <Label style={{ color: colors.accent }}>{outbox.length} pending</Label>
@@ -113,7 +112,7 @@ export function MeshScreen() {
             <Axis labels={['-30m', '-15m', 'now']} />
           </Panel>
 
-          <Panel title="topology" right="direct links">
+          <Panel title="topology">
             {topoNodes.length === 0 ? (
               <Text style={styles.empty}>no peers yet — nothing to draw</Text>
             ) : (
@@ -129,7 +128,7 @@ export function MeshScreen() {
             </Text>
           </Panel>
 
-          <Panel title="retry schedule" right="exponential backoff" variant="flat">
+          <Panel title="retry schedule" variant="flat">
             <View style={{ marginBottom: 10 }}>
               {retryRows.map((r, i) => {
                 const state = attempts === 0 ? 'idle' : r.n < attempts ? 'done' : r.n === attempts ? 'now' : 'idle';
@@ -181,17 +180,20 @@ export function MeshScreen() {
             )}
           </Panel>
 
-          {lastDrop ? (
-            <Callout title={`TTL EXHAUSTED · ${lastDrop.type.toLowerCase()} ${lastDrop.msgId}`}>
-              Arrived with no hop budget left and was not forwarded ({lastDrop.neighborCount}{' '}
-              {lastDrop.neighborCount === 1 ? 'neighbour' : 'neighbours'} at the time). {stats.ttlDrops} such{' '}
-              {stats.ttlDrops === 1 ? 'drop' : 'drops'} since launch.
-            </Callout>
-          ) : (
-            <Callout title="NO TTL DROPS" tone="green">
-              No packet has run out of hops since launch. Duplicates dropped by the seen-cache: {stats.duplicates}.
-            </Callout>
-          )}
+          <Panel
+            title="ttl"
+            right={`${stats.ttlDrops} ${stats.ttlDrops === 1 ? 'drop' : 'drops'}`}
+            variant="flat">
+            <KV
+              k="last drop"
+              v={lastDrop
+                ? `${lastDrop.type.toLowerCase()} ${lastDrop.msgId} · ${lastDrop.neighborCount} ${lastDrop.neighborCount === 1 ? 'neighbour' : 'neighbours'}`
+                : 'none since launch'}
+              dim={!lastDrop}
+            />
+            <KV k="duplicates dropped" v={stats.duplicates} last />
+            <Text style={styles.note}>A packet that arrives with no hop budget left is not forwarded.</Text>
+          </Panel>
         </Stagger>
       </ScrollView>
     </View>

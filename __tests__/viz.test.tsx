@@ -6,7 +6,7 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { StyleSheet, Text } from 'react-native';
-import { BarChart, StepChart, Radar, Topology, HexDump, Logo, HEADER_FIELDS } from '../src/components/viz';
+import { BarChart, StepChart, Radar, Topology, HexDump, HEADER_FIELDS } from '../src/components/viz';
 import { Chip, Ladder, Meter, BlockBar, Cells, KV, Fingerprint } from '../src/components/ui';
 
 // The charts/chips start Animated timers (entrance, blinking cursor). Under real
@@ -173,7 +173,6 @@ describe('ui atoms', () => {
           <Cells items={[{ k: 'a', v: 1 }, { k: 'b', v: '—' }]} />
           <KV k="k" v="v" />
           <Fingerprint hex="0123456789abcdef" />
-          <Logo size={64} />
         </>,
       );
     });

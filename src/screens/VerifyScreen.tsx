@@ -134,7 +134,7 @@ export function VerifyScreen({ route, navigation }: Props) {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
-  back: { paddingHorizontal: 10, paddingVertical: 7 },
+  back: { minWidth: 44, minHeight: 44, paddingHorizontal: 0, paddingVertical: 0 },
   content: { padding: 16, gap: 16 },
   gap: { height: 14 },
   fp: { marginTop: 8, letterSpacing: 1 },

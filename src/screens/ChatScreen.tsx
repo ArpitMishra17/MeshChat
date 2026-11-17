@@ -421,8 +421,8 @@ export function ChatScreen({ route, navigation }: Props) {
     : null;
 
   // Keyboard offset = the header's actual height (safe-area top + its padding
-  // + one line of content), so the composer clears the keyboard on iOS.
-  const headerHeight = insets.top + 16 + 36 + 15;
+  // + the 44 px back button), so the composer clears the keyboard on iOS.
+  const headerHeight = insets.top + 16 + 44 + 15;
   const keyboardOffset = Platform.OS === 'ios' ? headerHeight : 0;
   const canSend = input.trim().length > 0;
 
@@ -499,18 +499,11 @@ export function ChatScreen({ route, navigation }: Props) {
       <View style={styles.chips}>
         <Pressable
           onPress={openVerify}
+          hitSlop={8}
           accessibilityRole="button"
-          accessibilityLabel={peer?.verified ? 'verified, open safety number' : 'x25519 session, open safety number'}>
-          {peer?.verified ? <Chip label="verified" tone="green" /> : <Chip label="x25519 session" tone="green" />}
+          accessibilityLabel={peer?.verified ? 'verified, open safety number' : 'verify peer safety number'}>
+          {peer?.verified ? <Chip label="verified" tone="green" /> : <Chip label="verify" tone="amber" />}
         </Pressable>
-        {peer && !peer.verified ? (
-          <Pressable
-            onPress={openVerify}
-            accessibilityRole="button"
-            accessibilityLabel="verify peer safety number">
-            <Chip label="verify" tone="amber" />
-          </Pressable>
-        ) : null}
         <Chip label={`ttl ${DEFAULT_TTL}`} />
         <TypingIndicator active={peerTyping} />
         {busy ? <Chip label="preparing…" tone="amber" /> : null}
@@ -591,7 +584,7 @@ export function ChatScreen({ route, navigation }: Props) {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
-  back: { paddingHorizontal: 10, paddingVertical: 7 },
+  back: { minWidth: 44, minHeight: 44, paddingHorizontal: 0, paddingVertical: 0 },
   messageList: { paddingVertical: 20, gap: 18, flexGrow: 1 },
   empty: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingTop: 100 },
   emptyText: {
@@ -629,6 +622,7 @@ const styles = StyleSheet.create({
     includeFontPadding: false, textAlignVertical: 'center',
   },
   send: {
+    minHeight: 44, justifyContent: 'center',
     paddingHorizontal: 14, paddingVertical: 11,
     borderWidth: 1, borderColor: colors.border, backgroundColor: colors.bgInput,
   },

@@ -71,9 +71,6 @@ export function OnboardingScreen({ onComplete }: Props) {
       <View style={[styles.head, { paddingTop: insets.top + 16 }]}>
         <Text style={styles.headTitle}>boot</Text>
         <Text style={styles.headSub}>first run</Text>
-        <View style={{ marginLeft: 'auto' }}>
-          <Chip label="local only" tone="cyan" dot />
-        </View>
       </View>
 
       <ScrollView
@@ -148,12 +145,6 @@ export function OnboardingScreen({ onComplete }: Props) {
               </Label>
               <Fingerprint hex={identity.deviceId} />
             </View>
-            <View style={styles.chips}>
-              <Chip label="x25519" tone="green" />
-              <Chip label="aes-256-gcm" tone="green" />
-              <Chip label="no server" tone="cyan" />
-              <Chip label="no account" tone="cyan" />
-            </View>
             <Btn label="enter mesh →" tone="go" onPress={handleContinue} style={{ paddingVertical: 15 }} />
           </View>
         </Panel>
@@ -212,7 +203,6 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: colors.border, backgroundColor: colors.bgInput,
     fontFamily: fonts.mono, fontSize: 13, color: colors.primary,
   },
-  chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
 
   whatLine: { flexDirection: 'row', gap: 10 },
   whatIdx: { width: 24, fontFamily: fonts.mono, fontSize: 11, lineHeight: 17, color: colors.line3 },

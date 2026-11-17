@@ -7,7 +7,8 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors, fonts } from '../theme';
 import { createIdentity, updateDisplayName } from '../services/identity';
 import { BlockBar, Btn, Chip, Fingerprint, Label, Panel } from '../components/ui';
-import { Logo, Seal } from '../components/viz';
+import { Seal } from '../components/viz';
+import { Logo } from '../components/Logo';
 import { DEFAULT_TTL, PROTOCOL_VERSION } from '../services/protocol';
 import { NONCE_SIZE } from '../services/crypto';
 import { getTableCounts } from '../db/database';
@@ -80,7 +81,7 @@ export function OnboardingScreen({ onComplete }: Props) {
         keyboardShouldPersistTaps="handled">
         <View style={styles.wm}>
           <View style={styles.wmTop}>
-            <Logo size={64} />
+            <Logo size={96} />
             <Text style={styles.wmText} numberOfLines={1} adjustsFontSizeToFit>
               MESH<Text style={{ color: colors.primary }}>CHAT</Text>
             </Text>

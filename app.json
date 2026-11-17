@@ -76,6 +76,13 @@
           "microphonePermission": "MeshChat records voice messages you choose to send."
         }
       ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#d8f24b"
+        }
+      ],
       "expo-asset"
     ],
     "extra": {

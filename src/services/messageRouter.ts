@@ -31,6 +31,8 @@ import { saveMediaBytes, readMediaBytes, deleteMediaFile } from './media';
 import { TypingTracker, TYPING_HOLD_MS } from './typingTracker';
 import type {
   AckPayload,
+  ChatOp,
+  ChatState,
   ControlPayload,
   MediaChunkPayload,
   MediaMeta,
@@ -67,8 +69,20 @@ import {
   getDueOutboxEntries,
   getAllOutboxEntries,
   getStuckSentMessages,
+  getChatState,
+  setChatState,
+  getOutgoingRequests,
 } from '../db/database';
 import { Emitter, PayloadEmitter } from './events';
+import {
+  decideIncomingRequest,
+  nextStateOnAccept,
+  canAdmitMessage,
+  stateAfterAdmittedMessage,
+  canAdmitSignal,
+  canSendChat,
+  shouldResendRequest,
+} from './chatConsent';
 
 /**
  * P0.1 / Phase 3 / Phase 4 — App-level packet router + relay engine.
@@ -219,8 +233,14 @@ class MessageRouter {
   readonly mediaProgress = new PayloadEmitter<MediaProgressEvent>();
   /** Feature batch — fires once per NEW incoming message row (notifications, haptics). */
   readonly messageReceived = new PayloadEmitter<MessageReceivedEvent>();
+  /** Message requests — fires once per NEW incoming chat request (notifications). */
+  readonly chatRequest = new PayloadEmitter<{ deviceId: string; displayName: string }>();
+  /** Message requests — fires on every consent-state change (badges, chat panels). */
+  readonly chatStateChanged = new Emitter();
 
   private started = false;
+  /** Last time a chat REQUEST went out to each peer, for background resend throttling. */
+  private lastChatRequestSent = new Map<string, number>();
   /** Transport-level flood dedup. In-memory for Phase 3 (persisted best-effort is Phase 5). */
   private seen = new SeenCache();
   private myFingerprintHex = '';
@@ -267,6 +287,8 @@ class MessageRouter {
       // addressed to someone reachable through it, even if it isn't the
       // destination itself (the mesh may relay further).
       bleService.linkUp.subscribe(() => void this.drainOutbox({ onlyDue: false })),
+      // Message requests — a peer we are waiting on just came back into range.
+      bleService.linkUp.subscribe(e => this.resendChatRequestTo(e.fingerprintHex)),
     );
 
     // Phase 5 — periodic backoff tick (drains due entries + escalates
@@ -309,6 +331,11 @@ class MessageRouter {
     text: string,
     opts?: { replyTo?: string; media?: { bytes: Uint8Array; meta: MediaMeta } },
   ): Message {
+    // Defence in depth: the UI only offers the composer once accepted, but a
+    // send to a peer who has not accepted must never leave the device.
+    if (!canSendChat(getChatState(dstFingerprintHex))) {
+      throw new Error('sendMessage: chat with this peer is not accepted yet');
+    }
     const replyTo = opts?.replyTo ?? null;
     if (!opts?.media) {
       const msg = replyTo
@@ -464,6 +491,7 @@ class MessageRouter {
   notifyTyping(peerFingerprintHex: string, typing: boolean): void {
     try {
       if (!this.isLinked(peerFingerprintHex)) return;
+      if (!canSendChat(getChatState(peerFingerprintHex))) return;
       if (typing && !this.typing.tryAcquireSend(peerFingerprintHex)) return;
       void bleService.sendControl({ type: 'control', sub: 'typing', typing }, peerFingerprintHex);
     } catch (e: any) {
@@ -503,6 +531,7 @@ class MessageRouter {
       if (!emoji || utf8ByteLength(emoji) > MAX_EMOJI_BYTES) return;
       const msg = getMessageById(messageId);
       if (!msg || peerOfConversation(msg.conversationId) !== peerFingerprintHex) return;
+      if (!canSendChat(getChatState(peerFingerprintHex))) return;
 
       const mine = getReactionsForConversation(msg.conversationId)[messageId]
         ?.find(r => r.reactorDeviceId === this.myFingerprintHex);
@@ -536,6 +565,149 @@ class MessageRouter {
     } catch (e: any) {
       console.warn('[router] deleteMessageLocal failed:', e?.message ?? e);
     }
+  }
+
+  /** Message requests — my consent state for a peer ('none' when unknown). */
+  getChatState(deviceId: string): ChatState {
+    return getChatState(deviceId);
+  }
+
+  /**
+   * Message requests — ask a peer to chat. Acts as accept when they already
+   * asked me (or I ignored them). Returns false when the request could not be
+   * made (no public key known yet for this peer).
+   */
+  requestChat(deviceId: string): boolean {
+    try {
+      const state = getChatState(deviceId);
+      if (state === 'accepted') return true;
+      if (state === 'incoming' || state === 'declined') {
+        this.acceptChat(deviceId);
+        return true;
+      }
+      const peer = getPeerByFingerprint(deviceId);
+      if (!peer?.publicKey) {
+        console.warn(`[router] no public key for ${deviceId.slice(0, 8)} yet, chat request not sent`);
+        return false;
+      }
+      // Also the manual resend path while outgoing: this re-stamps chat_state_at.
+      setChatState(deviceId, 'outgoing', peer.displayName);
+      this.sendChatOp(deviceId, 'request');
+      this.chatStateChanged.emit();
+      return true;
+    } catch (e: any) {
+      console.warn('[router] requestChat failed:', e?.message ?? e);
+      return false;
+    }
+  }
+
+  /** Message requests — accept a peer's chat request (or start chatting after an ignore). */
+  acceptChat(deviceId: string): void {
+    try {
+      const peer = getPeerByFingerprint(deviceId);
+      setChatState(deviceId, 'accepted', peer?.displayName);
+      // An accepted chat needs its thread row so it shows in the chats list
+      // even before the first message.
+      getOrCreateConversation(deviceId, peer?.displayName ?? deviceId);
+      this.sendChatOp(deviceId, 'accept');
+      this.chatStateChanged.emit();
+      this.peersChanged.emit();
+    } catch (e: any) {
+      console.warn('[router] acceptChat failed:', e?.message ?? e);
+    }
+  }
+
+  /**
+   * Message requests — ignore a peer's chat request. Nothing is sent: the
+   * requester is never told (the same as a request that goes unanswered).
+   */
+  declineChat(deviceId: string): void {
+    try {
+      const peer = getPeerByFingerprint(deviceId);
+      setChatState(deviceId, 'declined', peer?.displayName);
+      this.chatStateChanged.emit();
+      this.peersChanged.emit();
+    } catch (e: any) {
+      console.warn('[router] declineChat failed:', e?.message ?? e);
+    }
+  }
+
+  /** Message requests — send a CTRL chat op. Best effort, flooded over the mesh. */
+  private sendChatOp(deviceId: string, op: ChatOp): void {
+    if (op === 'request') this.lastChatRequestSent.set(deviceId, Date.now());
+    void bleService.sendControl({ type: 'control', sub: 'chat', op }, deviceId);
+  }
+
+  /**
+   * Message requests — re-send outgoing requests that have gone unanswered.
+   * Runs from the existing outbox tick; throttled per peer and stopped after
+   * 24 h by `shouldResendRequest`.
+   */
+  private resendChatRequests(): void {
+    const now = Date.now();
+    for (const peer of getOutgoingRequests()) {
+      if (shouldResendRequest('outgoing', peer.chatStateAt ?? null, this.lastChatRequestSent.get(peer.deviceId), now)) {
+        this.sendChatOp(peer.deviceId, 'request');
+      }
+    }
+  }
+
+  /** Message requests — a link to `deviceId` just came up: retry its pending request now. */
+  private resendChatRequestTo(deviceId: string): void {
+    if (getChatState(deviceId) !== 'outgoing') return;
+    const chatStateAt = getPeerByFingerprint(deviceId)?.chatStateAt ?? null;
+    if (shouldResendRequest('outgoing', chatStateAt, undefined, Date.now())) {
+      this.sendChatOp(deviceId, 'request');
+    }
+  }
+
+  /**
+   * Message requests — apply an inbound CTRL chat op from `src`. The state
+   * machine lives in chatConsent.ts; this only performs the effects.
+   */
+  private applyChatOp(src: string, op: ChatOp): void {
+    const state = getChatState(src);
+    const name = getPeerByFingerprint(src)?.displayName ?? src;
+    if (op === 'request') {
+      const d = decideIncomingRequest(state);
+      const changed = d.next !== state || d.refreshAt;
+      if (changed) setChatState(src, d.next, name);
+      if (d.replyAccept) this.sendChatOp(src, 'accept');
+      if (d.notify) this.chatRequest.emit({ deviceId: src, displayName: name });
+      if (changed) {
+        this.chatStateChanged.emit();
+        this.peersChanged.emit();
+      }
+    } else if (op === 'accept') {
+      const next = nextStateOnAccept(state);
+      if (next !== state) {
+        setChatState(src, next, name);
+        getOrCreateConversation(src, name);
+        this.chatStateChanged.emit();
+        this.peersChanged.emit();
+      }
+    }
+    // 'decline' is reserved: a requester is never told, so nothing to apply.
+  }
+
+  /**
+   * Message requests — receiver-side gate for MESSAGE-class packets. Returns
+   * true when the packet may be stored. An 'outgoing' peer is promoted to
+   * 'accepted': it could only have messaged us after accepting our request.
+   */
+  private admitInboundMessage(srcFingerprintHex: string): boolean {
+    const state = getChatState(srcFingerprintHex);
+    if (!canAdmitMessage(state)) {
+      console.log(`[router] dropped message from unaccepted peer ${srcFingerprintHex.slice(0, 8)}`);
+      return false;
+    }
+    const next = stateAfterAdmittedMessage(state);
+    if (next !== state) {
+      setChatState(srcFingerprintHex, next);
+      this.chatStateChanged.emit();
+      this.peersChanged.emit();
+    }
+    return true;
   }
 
   /** Feature batch — true when `peer` is one of our currently established links. */
@@ -588,6 +760,7 @@ class MessageRouter {
    */
   private async tickOutbox(): Promise<void> {
     this.escalateStuckSent();
+    this.resendChatRequests();
     await this.drainOutbox({ onlyDue: true });
   }
 
@@ -774,6 +947,15 @@ class MessageRouter {
       if (!plaintext) return;
       const ctrl = decodeBody(TYPE_CTRL, plaintext) as ControlPayload;
       const src = bytesToHex(p.header.src);
+      if (ctrl.sub === 'chat') {
+        this.applyChatOp(src, ctrl.op);
+        return;
+      }
+      // Typing and reactions from a peer we have not accepted are dropped
+      // silently, before they can light an indicator or touch a message.
+      if ((ctrl.sub === 'typing' || ctrl.sub === 'reaction') && !canAdmitSignal(getChatState(src))) {
+        return;
+      }
       if (ctrl.sub === 'typing') {
         this.setRemoteTyping(src, ctrl.typing);
       } else if (ctrl.sub === 'read') {
@@ -824,6 +1006,7 @@ class MessageRouter {
   private deliverMessageExt(p: IncomingPacket): void {
     try {
       const src = bytesToHex(p.header.src);
+      if (!this.admitInboundMessage(src)) return;
       const plaintext = this.decryptFrom(p);
       if (!plaintext) return;
       const msg = decodeBody(TYPE_MESSAGE_EXT, plaintext) as MessagePayload;
@@ -914,6 +1097,7 @@ class MessageRouter {
     bleService.markBulkTransfer();
     try {
       const src = bytesToHex(p.header.src);
+      if (!this.admitInboundMessage(src)) return;
       const plaintext = this.decryptFrom(p);
       if (!plaintext) return;
       const chunk = decodeBody(TYPE_MEDIA, plaintext) as MediaChunkPayload;
@@ -990,6 +1174,8 @@ class MessageRouter {
    */
   private deliverMessage(p: IncomingPacket): void {
     const senderFpHex = bytesToHex(p.header.src);
+    // Consent gate before any decryption, storage, ACK or notification.
+    if (!this.admitInboundMessage(senderFpHex)) return;
 
     let plaintext: Uint8Array;
     try {

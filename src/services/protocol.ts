@@ -24,7 +24,7 @@
  *   0x04 POSITION    position beacon (Phase 4, reserved now)
  *   0x05 SYNC_OFFER  history sync (Phase 6, reserved now)
  *   0x06 SYNC_REQ    history sync (Phase 6, reserved now)
- *   0x07 CTRL        typing / read / reaction signals (best effort, never ACKed)
+ *   0x07 CTRL        typing / read / reaction / chat-request signals (best effort, never ACKed)
  *   0x08 MESSAGE_EXT MESSAGE + reply-to and/or attachment descriptor
  *   0x09 MEDIA       one chunk of an attachment
  *
@@ -380,6 +380,12 @@ const MEDIA_KIND_AUDIO = 2;
 const CTRL_TYPING = 0x01;
 const CTRL_READ = 0x02;
 const CTRL_REACTION = 0x03;
+const CTRL_CHAT = 0x04;
+
+/** Wire values for the CTRL chat op byte. */
+const CHAT_OP_REQUEST = 0;
+const CHAT_OP_ACCEPT = 1;
+const CHAT_OP_DECLINE = 2;
 
 const MAX_EMOJI_BYTES = 16;
 
@@ -619,6 +625,16 @@ function encodeControlBody(payload: ControlPayload): Uint8Array {
       w.raw(emoji);
       return w.toBytes();
     }
+    case 'chat': {
+      const opByte = payload.op === 'request' ? CHAT_OP_REQUEST
+        : payload.op === 'accept' ? CHAT_OP_ACCEPT
+        : payload.op === 'decline' ? CHAT_OP_DECLINE
+        : -1;
+      if (opByte < 0) throw new ProtocolError(`unknown chat op: ${String(payload.op)}`);
+      w.u8(CTRL_CHAT, 'ctrl sub');
+      w.u8(opByte, 'chat op');
+      return w.toBytes();
+    }
     default:
       throw new ProtocolError('unknown control sub-type');
   }
@@ -659,6 +675,14 @@ function decodeControlBody(bytes: Uint8Array): ControlPayload {
         emoji: bytesToStr(emoji),
         add: op === 1,
       };
+    }
+    case CTRL_CHAT: {
+      const op = r.u8('chat op');
+      r.end();
+      if (op === CHAT_OP_REQUEST) return { type: 'control', sub: 'chat', op: 'request' };
+      if (op === CHAT_OP_ACCEPT) return { type: 'control', sub: 'chat', op: 'accept' };
+      if (op === CHAT_OP_DECLINE) return { type: 'control', sub: 'chat', op: 'decline' };
+      throw new ProtocolError(`CTRL chat: invalid op ${op}`);
     }
     default:
       throw new ProtocolError(`unknown CTRL sub-type: 0x${sub.toString(16)}`);

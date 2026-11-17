@@ -18,7 +18,7 @@ import { StatusBadge } from '../components/StatusBadge';
 import { Btn, Cells, Chip, KV, Label, Meter, Panel, Row } from '../components/ui';
 import { Radar, Stagger, type RadarPeer } from '../components/viz';
 import { TerminalHeader } from '../components/TerminalHeader';
-import type { Peer } from '../types';
+import type { ChatState, Peer } from '../types';
 import type { RootStackParamList } from '../navigation';
 
 type NavProp = NativeStackNavigationProp<RootStackParamList>;
@@ -81,6 +81,7 @@ export function NearbyScreen() {
 
     const unsubNeighbors = mesh.neighborsChanged.subscribe(refreshNeighbors);
     const unsubPeers = messageRouter.peersChanged.subscribe(refreshKnown);
+    const unsubChat = messageRouter.chatStateChanged.subscribe(refreshKnown);
     const unsubState = bleService.subscribeState(setBleState);
 
     // Live scan results — dedup by bleId, expire after 20s of no re-seen.
@@ -228,6 +229,15 @@ export function NearbyScreen() {
     p => p.publicKey && !neighbors.some(n => n.fingerprintHex === p.deviceId),
   );
   const peerCount = neighbors.length + scanResults.length + knownNotLinked.length;
+  // Message-request state per peer, shown as a small chip. 'none' and 'accepted' stay quiet.
+  const chatById = new Map<string, ChatState>(knownPeers.map(p => [p.deviceId, p.chatState ?? 'none']));
+  const requestChip = (deviceId: string) => {
+    const st = chatById.get(deviceId) ?? 'none';
+    if (st === 'outgoing') return <Chip label="request sent" tone="cyan" />;
+    if (st === 'incoming') return <Chip label="wants to chat" tone="amber" />;
+    if (st === 'declined') return <Chip label="ignored" />;
+    return null;
+  };
 
   // Radar: real bearing + haversine distance from our full-precision fix to each
   // peer's last known position. Needs our own fix, so it is GPS-gated.
@@ -368,6 +378,7 @@ export function NearbyScreen() {
               }
               right={
                 <>
+                  {requestChip(n.fingerprintHex)}
                   <Chip label={n.hasCentral ? 'central' : 'peripheral'} tone="green" />
                   <Meter rssi={n.rssi} />
                 </>
@@ -388,6 +399,7 @@ export function NearbyScreen() {
               }
               right={
                 <>
+                  {requestChip(p.deviceId)}
                   <Chip label="advert" tone="amber" />
                   <Meter rssi={p.rssi} />
                 </>
@@ -408,7 +420,12 @@ export function NearbyScreen() {
                   {distanceTo(p.deviceId)}
                 </Text>
               }
-              right={<Chip label="offline" />}
+              right={
+                <>
+                  {requestChip(p.deviceId)}
+                  <Chip label="offline" />
+                </>
+              }
               onPress={() => handleKnownPress(p)}
               last={neighbors.length + scanResults.length + i === peerCount - 1}
             />

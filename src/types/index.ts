@@ -30,6 +30,10 @@ export interface Peer {
   verified?: boolean;
   /** When a key-change warning was raised for this peer; null once verified. */
   keyWarningAt?: number | null;
+  /** Message-request consent state from my side. Defaults to 'none'. */
+  chatState?: ChatState;
+  /** When chatState last changed (ms epoch), or null. */
+  chatStateAt?: number | null;
 }
 
 export interface Conversation {
@@ -141,7 +145,21 @@ export interface MessagePayload {
 export type ControlPayload =
   | { type: 'control'; sub: 'typing'; typing: boolean }
   | { type: 'control'; sub: 'read'; ids: string[] }
-  | { type: 'control'; sub: 'reaction'; messageId: string; emoji: string; add: boolean };
+  | { type: 'control'; sub: 'reaction'; messageId: string; emoji: string; add: boolean }
+  | { type: 'control'; sub: 'chat'; op: ChatOp };
+
+/** Message-request ops carried by a CTRL chat signal. */
+export type ChatOp = 'request' | 'accept' | 'decline';
+
+/**
+ * Anti-spam consent state for a peer, from MY side:
+ * - none:     no request exchanged yet
+ * - outgoing: I sent a chat request and am waiting for them
+ * - incoming: they sent a chat request I have not answered
+ * - accepted: either side accepted; messages flow both ways
+ * - declined: I ignored their incoming request (they are not told)
+ */
+export type ChatState = 'none' | 'outgoing' | 'incoming' | 'accepted' | 'declined';
 
 /** One slice of an attachment (TYPE_MEDIA). `index` is 0-based. */
 export interface MediaChunkPayload {

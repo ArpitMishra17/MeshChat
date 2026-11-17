@@ -18,7 +18,7 @@ import { AppState } from 'react-native';
 import * as Notifications from 'expo-notifications';
 import * as Haptics from 'expo-haptics';
 import { messageRouter } from './messageRouter';
-import { getBoolSetting } from '../db/database';
+import { getBoolSetting, getOrCreateConversation } from '../db/database';
 import type { MessageKind } from '../types';
 
 const CHANNEL_ID = 'messages';
@@ -150,6 +150,43 @@ async function onMessage(ev: MessageEvent): Promise<void> {
   await feedback.catch(() => undefined);
 }
 
+interface ChatRequestEvent {
+  deviceId: string;
+  displayName: string;
+}
+
+/**
+ * A peer asked to chat (message request). Same channel and data shape as a
+ * message banner, so tapping it opens that peer's thread where the request
+ * panel offers accept / ignore.
+ */
+async function onChatRequest(ev: ChatRequestEvent): Promise<void> {
+  const notify = getBoolSetting(SETTING_NOTIFICATIONS, true);
+  const haptics = getBoolSetting(SETTING_HAPTICS, true);
+
+  if (!isAppActive()) {
+    if (!notify) return;
+    if (!(await ensurePermission(false))) return;
+    const name = ev.displayName || ev.deviceId;
+    const conversation = getOrCreateConversation(ev.deviceId, name);
+    await ensureChannel();
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title: `${name} wants to message you`,
+        body: 'Open MeshChat to accept or ignore',
+        sound: 'default',
+        data: { conversationId: conversation.id, peerDeviceId: ev.deviceId },
+      },
+      trigger: { channelId: CHANNEL_ID },
+    });
+    return;
+  }
+
+  if (notify) void ensurePermission(true);
+  if (!haptics) return;
+  await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
+}
+
 function dataString(data: Record<string, unknown> | undefined, key: string): string | null {
   const v = data?.[key];
   return typeof v === 'string' && v.length > 0 ? v : null;
@@ -202,6 +239,9 @@ export const notifier = {
     }
     messageRouter.messageReceived.subscribe((ev: MessageEvent) => {
       onMessage(ev).catch(e => warn('message', e));
+    });
+    messageRouter.chatRequest.subscribe((ev: ChatRequestEvent) => {
+      onChatRequest(ev).catch(e => warn('chat request', e));
     });
   },
 

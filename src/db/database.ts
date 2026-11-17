@@ -9,6 +9,7 @@ import type {
   MediaMeta,
   OutboxEntry,
   Reaction,
+  ChatState,
 } from '../types';
 import { generateMessageId, generateConversationId } from '../services/ids';
 
@@ -48,7 +49,9 @@ function initSchema() {
       public_key TEXT,
       key_pinned INTEGER NOT NULL DEFAULT 0,
       verified INTEGER NOT NULL DEFAULT 0,
-      key_warning_at INTEGER
+      key_warning_at INTEGER,
+      chat_state TEXT NOT NULL DEFAULT 'none',
+      chat_state_at INTEGER
     );
   `);
 
@@ -159,6 +162,12 @@ function initSchema() {
  * v9 adds `peers.verified` (the user compared safety numbers in person) and
  * `peers.key_warning_at` (when a key-change warning was raised for this peer,
  * cleared once the user verifies). Both default to "not verified, no warning".
+ *
+ * v10 adds the message-request consent state to `peers`: `chat_state`
+ * ('none' | 'outgoing' | 'incoming' | 'accepted' | 'declined', from my side)
+ * and `chat_state_at`. Existing peers that already have a conversation with
+ * at least one message are backfilled to 'accepted' so current chats keep
+ * working; everyone else starts at 'none'.
  */
 function runMigrations() {
   const versionRow = db.getAllSync<{ user_version: number }>('PRAGMA user_version');
@@ -256,6 +265,27 @@ function runMigrations() {
       if (!has('key_warning_at')) db.execSync('ALTER TABLE peers ADD COLUMN key_warning_at INTEGER');
     }
     version = 9;
+  }
+
+  if (version < 10) {
+    const cols = db.getAllSync<{ name: string }>('PRAGMA table_info(peers)');
+    if (cols.length > 0) {
+      const has = (name: string) => cols.some(c => c.name === name);
+      if (!has('chat_state')) {
+        db.execSync("ALTER TABLE peers ADD COLUMN chat_state TEXT NOT NULL DEFAULT 'none'");
+        // Backfill: a peer already in a live conversation predates consent
+        // gating, so treat it as accepted.
+        db.execSync(`
+          UPDATE peers SET chat_state = 'accepted'
+           WHERE device_id IN (
+             SELECT c.peer_device_id FROM conversations c
+               JOIN messages m ON m.conversation_id = c.id
+           )
+        `);
+      }
+      if (!has('chat_state_at')) db.execSync('ALTER TABLE peers ADD COLUMN chat_state_at INTEGER');
+    }
+    version = 10;
   }
 
   db.runSync(`PRAGMA user_version = ${version}`);
@@ -387,11 +417,15 @@ export function flagPeerKeyWarning(deviceId: string, displayName: string): void 
   );
 }
 
-export function getAllPeers(): Peer[] {
-  const rows = db.getAllSync<any>(
-    `SELECT * FROM peers ORDER BY last_seen DESC`,
-  );
-  return rows.map(row => ({
+const CHAT_STATES: readonly ChatState[] = ['none', 'outgoing', 'incoming', 'accepted', 'declined'];
+
+function parseChatState(raw: unknown): ChatState {
+  return CHAT_STATES.includes(raw as ChatState) ? (raw as ChatState) : 'none';
+}
+
+/** Map a `peers` row to a Peer. */
+function rowToPeer(row: any): Peer {
+  return {
     deviceId: row.device_id,
     displayName: row.display_name,
     lastSeen: row.last_seen,
@@ -401,7 +435,69 @@ export function getAllPeers(): Peer[] {
     keyPinned: row.key_pinned === 1,
     verified: row.verified === 1,
     keyWarningAt: row.key_warning_at ?? null,
-  }));
+    chatState: parseChatState(row.chat_state),
+    chatStateAt: row.chat_state_at ?? null,
+  };
+}
+
+/**
+ * Message-request consent state for a peer (from my side). Unknown peers
+ * are 'none'.
+ */
+export function getChatState(deviceId: string): ChatState {
+  const rows = db.getAllSync<{ chat_state: string }>(
+    'SELECT chat_state FROM peers WHERE device_id = ? LIMIT 1',
+    [deviceId],
+  );
+  return rows.length === 0 ? 'none' : parseChatState(rows[0].chat_state);
+}
+
+/**
+ * Set the consent state for a peer and stamp `chat_state_at`. If the peer row
+ * does not exist yet (a request can arrive before the HELLO upserts the peer),
+ * a stub row is inserted, mirroring flagPeerKeyWarning.
+ */
+export function setChatState(deviceId: string, state: ChatState, displayName = deviceId): void {
+  const now = Date.now();
+  db.runSync(
+    `INSERT INTO peers (device_id, display_name, last_seen, chat_state, chat_state_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(device_id) DO UPDATE SET
+       chat_state = excluded.chat_state,
+       chat_state_at = excluded.chat_state_at`,
+    [deviceId, displayName, now, state, now],
+  );
+}
+
+/** Peers who sent me a chat request I have not answered, newest first. */
+export function getIncomingRequests(): Peer[] {
+  const rows = db.getAllSync<any>(
+    `SELECT * FROM peers WHERE chat_state = 'incoming'
+     ORDER BY chat_state_at DESC, last_seen DESC`,
+  );
+  return rows.map(rowToPeer);
+}
+
+/** Peers I have sent a chat request to that have not answered yet. */
+export function getOutgoingRequests(): Peer[] {
+  const rows = db.getAllSync<any>(
+    "SELECT * FROM peers WHERE chat_state = 'outgoing' ORDER BY chat_state_at DESC",
+  );
+  return rows.map(rowToPeer);
+}
+
+export function countIncomingRequests(): number {
+  const rows = db.getAllSync<{ n: number }>(
+    "SELECT COUNT(*) AS n FROM peers WHERE chat_state = 'incoming'",
+  );
+  return rows[0]?.n ?? 0;
+}
+
+export function getAllPeers(): Peer[] {
+  const rows = db.getAllSync<any>(
+    `SELECT * FROM peers ORDER BY last_seen DESC`,
+  );
+  return rows.map(rowToPeer);
 }
 
 /**
@@ -417,18 +513,7 @@ export function getPeerByFingerprint(fingerprintHex: string): Peer | null {
     [fingerprintHex],
   );
   if (rows.length === 0) return null;
-  const row = rows[0];
-  return {
-    deviceId: row.device_id,
-    displayName: row.display_name,
-    lastSeen: row.last_seen,
-    rssi: row.rssi,
-    bleId: row.ble_id,
-    publicKey: row.public_key ?? null,
-    keyPinned: row.key_pinned === 1,
-    verified: row.verified === 1,
-    keyWarningAt: row.key_warning_at ?? null,
-  };
+  return rowToPeer(rows[0]);
 }
 
 // --- Conversations ---

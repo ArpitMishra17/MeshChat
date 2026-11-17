@@ -25,9 +25,10 @@ import { TerminalHeader } from '../components/TerminalHeader';
 import { AttachmentView } from '../components/AttachmentView';
 import { AttachButton } from '../components/AttachButton';
 import { VoiceButton, type VoiceButtonHandle } from '../components/VoiceButton';
-import { Btn, Chip } from '../components/ui';
+import { Btn, Chip, Mono } from '../components/ui';
 import { DEFAULT_TTL } from '../services/protocol';
-import type { MediaMeta, Message, Peer, Reaction } from '../types';
+import { CHAT_REQUEST_RESEND_MS } from '../services/chatConsent';
+import type { ChatState, MediaMeta, Message, Peer, Reaction } from '../types';
 import type { RootStackParamList } from '../navigation';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Chat'>;
@@ -40,6 +41,57 @@ interface PreparedMedia {
 
 /** How long auto-scroll-to-end yields after a quote jump, so the jump is not undone. */
 const QUOTE_SCROLL_HOLD_MS = 1000;
+
+interface ConsentBarProps {
+  state: Exclude<ChatState, 'accepted'>;
+  name: string;
+  resendReady: boolean;
+  onRequest: () => void;
+  onResend: () => void;
+  onAccept: () => void;
+  onIgnore: () => void;
+  bottomInset: number;
+}
+
+/**
+ * Message-request panel shown in place of the composer until the chat is
+ * accepted. The receiver enforces this too; this is the visible gate.
+ */
+function ConsentBar({
+  state, name, resendReady, onRequest, onResend, onAccept, onIgnore, bottomInset,
+}: ConsentBarProps) {
+  let text: string;
+  let actions: React.ReactNode;
+  switch (state) {
+    case 'none':
+      text = `You can't message ${name} yet. Send a request — they'll need to accept first.`;
+      actions = <Btn label="send chat request" tone="go" onPress={onRequest} />;
+      break;
+    case 'outgoing':
+      text = `Request sent · waiting for ${name} to accept`;
+      actions = <Btn label="resend" disabled={!resendReady} onPress={onResend} />;
+      break;
+    case 'incoming':
+      text = `${name} wants to message you`;
+      actions = (
+        <>
+          <Btn label="accept" tone="go" onPress={onAccept} />
+          <Btn label="ignore" onPress={onIgnore} />
+        </>
+      );
+      break;
+    case 'declined':
+      text = `You ignored ${name}'s request`;
+      actions = <Btn label="accept" tone="go" onPress={onAccept} />;
+      break;
+  }
+  return (
+    <View style={[styles.consent, { paddingBottom: bottomInset + 12 }]}>
+      <Mono size={11} color={colors.textDim}>{text}</Mono>
+      <View style={styles.consentActions}>{actions}</View>
+    </View>
+  );
+}
 
 export function ChatScreen({ route, navigation }: Props) {
   const { conversationId, peerName, peerDeviceId } = route.params;
@@ -57,6 +109,10 @@ export function ChatScreen({ route, navigation }: Props) {
   const busyRef = useRef(false);
   const [recording, setRecording] = useState(false);
   const [peer, setPeer] = useState<Peer | null>(null);
+  // Message-request consent state for this peer, from my side.
+  const [chatState, setChatState] = useState<ChatState>('none');
+  const [chatStateAt, setChatStateAt] = useState<number | null>(null);
+  const [, setClock] = useState(0);
   const voiceRef = useRef<VoiceButtonHandle>(null);
   const flatListRef = useRef<FlatList<Message>>(null);
   const inputRef = useRef<TextInput>(null);
@@ -128,6 +184,36 @@ export function ChatScreen({ route, navigation }: Props) {
 
   useEffect(() => messageRouter.peersChanged.subscribe(loadPeer), [loadPeer]);
 
+  // Message requests — the composer is only offered once the chat is accepted.
+  const loadChatState = useCallback(() => {
+    setChatState(messageRouter.getChatState(peerDeviceId));
+    setChatStateAt(getPeerByFingerprint(peerDeviceId)?.chatStateAt ?? null);
+  }, [peerDeviceId]);
+
+  useFocusEffect(useCallback(() => {
+    loadChatState();
+  }, [loadChatState]));
+
+  useEffect(() => messageRouter.chatStateChanged.subscribe(loadChatState), [loadChatState]);
+
+  // The resend button re-enables once the cooldown has passed; wake the screen then.
+  useEffect(() => {
+    if (chatState !== 'outgoing' || chatStateAt == null) return;
+    const wait = chatStateAt + CHAT_REQUEST_RESEND_MS - Date.now();
+    if (wait <= 0) return;
+    const t = setTimeout(() => setClock(c => c + 1), wait);
+    return () => clearTimeout(t);
+  }, [chatState, chatStateAt]);
+  const resendReady = chatStateAt == null || Date.now() >= chatStateAt + CHAT_REQUEST_RESEND_MS;
+
+  const handleRequestChat = useCallback(() => {
+    if (!messageRouter.requestChat(peerDeviceId)) {
+      Alert.alert('Request not sent', 'This device does not have their key yet. Try again once they are in range.');
+    }
+  }, [peerDeviceId]);
+  const handleAcceptChat = useCallback(() => messageRouter.acceptChat(peerDeviceId), [peerDeviceId]);
+  const handleIgnoreChat = useCallback(() => messageRouter.declineChat(peerDeviceId), [peerDeviceId]);
+
   const openVerify = useCallback(() => {
     navigation.navigate('Verify', { peerDeviceId, peerName });
   }, [navigation, peerDeviceId, peerName]);
@@ -170,9 +256,14 @@ export function ChatScreen({ route, navigation }: Props) {
     messageRouter.notifyTyping(peerDeviceId, false);
     const quoted = replyTo;
     setReplyTo(null);
-    messageRouter.sendMessage(conversationId, peerDeviceId, text, quoted ? { replyTo: quoted.id } : undefined);
+    try {
+      messageRouter.sendMessage(conversationId, peerDeviceId, text, quoted ? { replyTo: quoted.id } : undefined);
+    } catch (e: any) {
+      console.warn('[chat] send refused:', e?.message ?? e);
+      loadChatState();
+    }
     refresh();
-  }, [input, replyTo, conversationId, peerDeviceId, refresh]);
+  }, [input, replyTo, conversationId, peerDeviceId, refresh, loadChatState]);
 
   // Attachment preparation is async and the picker is modal, so one at a time.
   // The ref guards the window before React re-renders with the new `busy` value.
@@ -193,10 +284,16 @@ export function ChatScreen({ route, navigation }: Props) {
    * (only if the input still holds the text it was built from) and the reply.
    */
   const sendPrepared = useCallback((media: PreparedMedia, caption: string, quotedId: string | null) => {
-    messageRouter.sendMessage(conversationId, peerDeviceId, caption, {
-      media,
-      replyTo: quotedId ?? undefined,
-    });
+    try {
+      messageRouter.sendMessage(conversationId, peerDeviceId, caption, {
+        media,
+        replyTo: quotedId ?? undefined,
+      });
+    } catch (e: any) {
+      console.warn('[chat] attachment refused:', e?.message ?? e);
+      loadChatState();
+      return;
+    }
     setInput(cur => (cur.trim() === caption ? '' : cur));
     setReplyTo(cur => (quotedId != null && cur?.id === quotedId ? null : cur));
     // Only a send that consumed a caption ends the typing signal. A voice note
@@ -206,7 +303,7 @@ export function ChatScreen({ route, navigation }: Props) {
       messageRouter.notifyTyping(peerDeviceId, false);
     }
     refresh();
-  }, [conversationId, peerDeviceId, refresh]);
+  }, [conversationId, peerDeviceId, refresh, loadChatState]);
 
   const handlePickPhoto = useCallback(async () => {
     if (!beginBusy()) return;
@@ -427,7 +524,19 @@ export function ChatScreen({ route, navigation }: Props) {
         />
       ) : null}
 
-      {/* Composer row. While recording, only the voice controls and a disabled input show. */}
+      {chatState !== 'accepted' ? (
+        <ConsentBar
+          state={chatState}
+          name={peer?.displayName ?? peerName}
+          resendReady={resendReady}
+          onRequest={handleRequestChat}
+          onResend={handleRequestChat}
+          onAccept={handleAcceptChat}
+          onIgnore={handleIgnoreChat}
+          bottomInset={keyboardOpen ? 0 : insets.bottom}
+        />
+      ) : (
+      /* Composer row. While recording, only the voice controls and a disabled input show. */
       <View style={[styles.composer, { paddingBottom: keyboardOpen ? 12 : insets.bottom + 12 }]}>
         {recording ? null : <AttachButton onPress={handlePickPhoto} disabled={busy} />}
         <VoiceButton
@@ -464,6 +573,7 @@ export function ChatScreen({ route, navigation }: Props) {
           </Pressable>
         )}
       </View>
+      )}
 
       <MessageActionSheet
         visible={actionFor !== null}
@@ -495,6 +605,11 @@ const styles = StyleSheet.create({
   },
   keyWarningText: { fontFamily: fonts.mono, fontSize: 11, lineHeight: 17, color: colors.textDim },
   keyWarningTitle: { fontFamily: fonts.dispBold, fontSize: 10, letterSpacing: 1.2, color: colors.error },
+  consent: {
+    paddingHorizontal: 16, paddingTop: 12, gap: 12,
+    borderTopWidth: 1, borderTopColor: colors.border, backgroundColor: colors.bgSecondary,
+  },
+  consentActions: { flexDirection: 'row', gap: 8 },
   composer: {
     flexDirection: 'row', alignItems: 'flex-end', gap: 10,
     paddingHorizontal: 16, paddingTop: 12,

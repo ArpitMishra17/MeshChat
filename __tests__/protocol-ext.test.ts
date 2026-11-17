@@ -191,6 +191,9 @@ describe('CTRL round-trip', () => {
     { type: 'control', sub: 'reaction', messageId: 'abcdef0123456789', emoji: '❤️', add: false },
     // Exactly 16 bytes of emoji is the upper bound.
     { type: 'control', sub: 'reaction', messageId: 'm', emoji: '👍👍👍👍', add: true },
+    { type: 'control', sub: 'chat', op: 'request' },
+    { type: 'control', sub: 'chat', op: 'accept' },
+    { type: 'control', sub: 'chat', op: 'decline' },
   ];
 
   it.each(cases.map((c, i) => [i, c]))('case %i round-trips', (_i, c) => {
@@ -322,6 +325,31 @@ describe('decoder rejects malformed input', () => {
     const emoji = new TextEncoder().encode('👍'.repeat(5)); // 20 bytes
     const bytes = Uint8Array.from([0x03, 1, 0x6d, 1, ...emoji]);
     expect(() => decodeBody(TYPE_CTRL, bytes)).toThrow(ProtocolError);
+  });
+
+  it('encodes chat ops as [0x04][op]', () => {
+    expect(Array.from(encodeBody({ type: 'control', sub: 'chat', op: 'request' }))).toEqual([0x04, 0]);
+    expect(Array.from(encodeBody({ type: 'control', sub: 'chat', op: 'accept' }))).toEqual([0x04, 1]);
+    expect(Array.from(encodeBody({ type: 'control', sub: 'chat', op: 'decline' }))).toEqual([0x04, 2]);
+  });
+
+  it('CTRL chat with an unknown op is rejected on encode', () => {
+    expect(() =>
+      encodeBody({ type: 'control', sub: 'chat', op: 'bogus' as unknown as 'request' }),
+    ).toThrow(ProtocolError);
+  });
+
+  it('CTRL chat with an unknown op byte', () => {
+    expect(() => decodeBody(TYPE_CTRL, Uint8Array.of(0x04, 3))).toThrow(ProtocolError);
+    expect(() => decodeBody(TYPE_CTRL, Uint8Array.of(0x04, 0xff))).toThrow(ProtocolError);
+  });
+
+  it('CTRL chat with trailing bytes', () => {
+    expect(() => decodeBody(TYPE_CTRL, Uint8Array.of(0x04, 0, 0))).toThrow(ProtocolError);
+  });
+
+  it('CTRL chat with no op byte', () => {
+    expect(() => decodeBody(TYPE_CTRL, Uint8Array.of(0x04))).toThrow(ProtocolError);
   });
 
   it('CTRL reaction with no emoji bytes', () => {

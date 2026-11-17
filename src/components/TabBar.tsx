@@ -3,7 +3,7 @@ import { View, Text, Pressable, StyleSheet } from 'react-native';
 import type { BottomTabBarProps } from '@react-navigation/bottom-tabs';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors, fonts } from '../theme';
-import { getTotalUnread } from '../db/database';
+import { getTotalUnread, countIncomingRequests } from '../db/database';
 import { ensureIdentity } from '../services/identity';
 import { messageRouter } from '../services/messageRouter';
 
@@ -16,13 +16,16 @@ const TAB_META: Record<string, { icon: string; label: string }> = {
   Settings: { icon: '[*]', label: 'CFG' },
 };
 
-/** Total unread messages, refreshed whenever messages or conversations change. */
+/**
+ * Chats badge: unread messages plus unanswered message requests, refreshed
+ * whenever messages, conversations or chat consent state change.
+ */
 function useUnreadTotal(): number {
   const [count, setCount] = useState(0);
   useEffect(() => {
     const compute = () => {
       try {
-        setCount(getTotalUnread(ensureIdentity().deviceId));
+        setCount(getTotalUnread(ensureIdentity().deviceId) + countIncomingRequests());
       } catch {
         setCount(0);
       }
@@ -30,9 +33,11 @@ function useUnreadTotal(): number {
     compute();
     const unsubMessages = messageRouter.messagesChanged.subscribe(compute);
     const unsubConversations = messageRouter.conversationsChanged.subscribe(compute);
+    const unsubChat = messageRouter.chatStateChanged.subscribe(compute);
     return () => {
       unsubMessages();
       unsubConversations();
+      unsubChat();
     };
   }, []);
   return count;

@@ -1,18 +1,19 @@
 import React, { useState, useCallback, useEffect, useMemo } from 'react';
-import { View, Text, FlatList, StyleSheet } from 'react-native';
+import { View, Text, FlatList, Pressable, StyleSheet } from 'react-native';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { colors, fonts } from '../theme';
 import {
   getAllConversations, getOutboxCountsByConversation, getConversationSummaries,
+  getIncomingRequests, getOrCreateConversation,
   type ConversationSummary,
 } from '../db/database';
 import { ensureIdentity } from '../services/identity';
 import { messageRouter } from '../services/messageRouter';
 import { mesh } from '../services/mesh';
 import { TerminalHeader } from '../components/TerminalHeader';
-import { Chip, Label, Meter, Panel, Row, Seg, type Tone } from '../components/ui';
-import type { Conversation } from '../types';
+import { Btn, Chip, Label, Meter, Panel, Row, Seg, type Tone } from '../components/ui';
+import type { Conversation, Peer } from '../types';
 import type { RootStackParamList } from '../navigation';
 
 type NavProp = NativeStackNavigationProp<RootStackParamList>;
@@ -51,11 +52,14 @@ export function ConversationsScreen() {
   const [linked, setLinked] = useState<Map<string, number | null>>(new Map());
   const [summaries, setSummaries] = useState<Record<string, ConversationSummary>>({});
   const [filter, setFilter] = useState<Filter>('all');
+  // Message requests waiting for my answer. Shown above the threads.
+  const [requests, setRequests] = useState<Peer[]>([]);
 
   const refresh = useCallback(() => {
     setConversations(getAllConversations());
     setOutboxCounts(getOutboxCountsByConversation());
     setSummaries(getConversationSummaries(ensureIdentity().deviceId));
+    setRequests(getIncomingRequests());
   }, []);
   const refreshLinks = useCallback(() => {
     setLinked(new Map(mesh.getNeighbors().map(n => [n.fingerprintHex, n.rssi])));
@@ -71,12 +75,22 @@ export function ConversationsScreen() {
     const unsubConversations = messageRouter.conversationsChanged.subscribe(refresh);
     const unsubMessages = messageRouter.messagesChanged.subscribe(refresh);
     const unsubNeighbors = mesh.neighborsChanged.subscribe(refreshLinks);
+    const unsubChat = messageRouter.chatStateChanged.subscribe(refresh);
     return () => {
       unsubConversations();
       unsubMessages();
       unsubNeighbors();
+      unsubChat();
     };
   }, [refresh, refreshLinks]);
+
+  // Requesters who have not been answered live in the requests section, not
+  // as threads, so a request never shows up twice.
+  const requesterIds = useMemo(() => new Set(requests.map(r => r.deviceId)), [requests]);
+  const threads = useMemo(
+    () => conversations.filter(c => !requesterIds.has(c.peerDeviceId)),
+    [conversations, requesterIds],
+  );
 
   const totalQueued = useMemo(
     () => Object.values(outboxCounts).reduce((a, b) => a + b, 0),
@@ -84,10 +98,10 @@ export function ConversationsScreen() {
   );
   const visible = useMemo(
     () =>
-      filter === 'queued' ? conversations.filter(c => (outboxCounts[c.id] ?? 0) > 0) :
-      filter === 'unread' ? conversations.filter(c => (summaries[c.id]?.unread ?? 0) > 0) :
-      conversations,
-    [conversations, outboxCounts, summaries, filter],
+      filter === 'queued' ? threads.filter(c => (outboxCounts[c.id] ?? 0) > 0) :
+      filter === 'unread' ? threads.filter(c => (summaries[c.id]?.unread ?? 0) > 0) :
+      threads,
+    [threads, outboxCounts, summaries, filter],
   );
 
   const handlePress = (conv: Conversation) => {
@@ -98,11 +112,20 @@ export function ConversationsScreen() {
     });
   };
 
+  const openRequest = (req: Peer) => {
+    const conv = getOrCreateConversation(req.deviceId, req.displayName);
+    navigation.navigate('Chat', {
+      conversationId: conv.id,
+      peerName: req.displayName,
+      peerDeviceId: req.deviceId,
+    });
+  };
+
   return (
     <View style={styles.container}>
       <TerminalHeader
         title="chats"
-        subtitle={`${conversations.length} threads`}
+        subtitle={`${threads.length} threads`}
         right={totalQueued > 0 ? <Chip label={`${totalQueued} queued`} tone="amber" dot pulse /> : undefined}
       />
       <FlatList
@@ -111,6 +134,30 @@ export function ConversationsScreen() {
         contentContainerStyle={styles.list}
         ListHeaderComponent={
           <View style={styles.header}>
+            {requests.length > 0 ? (
+              <View>
+                <View style={styles.sectionHead}>
+                  <Text style={styles.sectionTitle}>requests</Text>
+                  <Text style={styles.sectionCount}>{requests.length}</Text>
+                </View>
+                {requests.map(req => (
+                  <View key={req.deviceId} style={styles.requestRow}>
+                    <Pressable
+                      style={styles.requestBody}
+                      onPress={() => openRequest(req)}
+                      accessibilityRole="button"
+                      accessibilityLabel={`open chat request from ${req.displayName}`}>
+                      <Text style={styles.requestName} numberOfLines={1}>{req.displayName}</Text>
+                      <Text style={styles.preview} numberOfLines={1}>
+                        {`${req.deviceId.slice(0, 8)}… · wants to message you`}
+                      </Text>
+                    </Pressable>
+                    <Btn label="accept" tone="go" onPress={() => messageRouter.acceptChat(req.deviceId)} />
+                    <Btn label="ignore" onPress={() => messageRouter.declineChat(req.deviceId)} />
+                  </View>
+                ))}
+              </View>
+            ) : null}
             <Seg
               value={filter}
               onChange={setFilter}
@@ -209,6 +256,12 @@ const styles = StyleSheet.create({
     fontFamily: fonts.dispBold, fontSize: 11, letterSpacing: 1.3, textTransform: 'uppercase', color: colors.textBright,
   },
   sectionCount: { fontFamily: fonts.disp, fontSize: 10, letterSpacing: 0.8, color: colors.textMuted },
+  requestRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: colors.line,
+  },
+  requestBody: { flex: 1, minWidth: 0, gap: 4 },
+  requestName: { fontFamily: fonts.mono, fontSize: 12, color: colors.textBright },
   preview: { fontFamily: fonts.mono, fontSize: 11, color: colors.textMuted },
   ribbon: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   empty: { alignItems: 'center', paddingVertical: 48 },

@@ -8,9 +8,7 @@ import { OnboardingScreen } from './src/screens/OnboardingScreen';
 import { getDB, getIdentity, getOrCreateConversation, getPeerByFingerprint } from './src/db/database';
 import { messageRouter } from './src/services/messageRouter';
 import { notifier } from './src/services/notifier';
-import { mesh } from './src/services/mesh';
-import { positionProvider } from './src/services/position';
-import { telemetry } from './src/services/telemetry';
+import { startMeshServices, syncRelayService } from './src/services/boot';
 import { colors, fonts, fontAssets } from './src/theme';
 
 const navTheme = {
@@ -53,6 +51,16 @@ function openChatFromNotification(conversationId: string, peerDeviceId: string):
   });
 }
 
+/**
+ * Start the mesh once an identity exists, then keep the native relay service in
+ * line with the user's setting. Runs only from the foreground (see syncRelayService).
+ * The open-chat handler is set first: notifier.start() may replay a cold-start tap.
+ */
+function startForegroundMesh(): void {
+  notifier.setOpenChatHandler(openChatFromNotification);
+  if (startMeshServices()) syncRelayService();
+}
+
 export default function App() {
   const [showOnboarding, setShowOnboarding] = useState<boolean | null>(null);
   // If the fonts fail to load we still render (system fallback) rather than
@@ -63,23 +71,10 @@ export default function App() {
     getDB();
     const identity = getIdentity();
     setShowOnboarding(!identity);
-    // P0.1 — start the app-level message router as soon as we know who we
-    // are. It owns the BLE message/ack callbacks for the lifetime of the
-    // app, so messages are persisted and ACKed regardless of which screen
-    // is mounted. Also started after onboarding completes (below).
-    if (identity) {
-      messageRouter.start();
-      notifier.setOpenChatHandler(openChatFromNotification);
-      notifier.start();
-      telemetry.start();
-      // Phase 3 — start the neighbor manager: duty-cycled scan +
-      // auto-connect keeps the link pool fed for multi-hop relaying.
-      mesh.start();
-      // Phase 4 — start the GPS watch if the user has enabled it. No-op
-      // (returns false) when the toggle is off; the node then participates
-      // as a flooding-only relay.
-      void positionProvider.start();
-    }
+    // The message router owns the BLE callbacks for the app's lifetime, so it
+    // starts as soon as an identity exists. The same call is also made by the
+    // background relay's headless task, and startMeshServices is idempotent.
+    if (identity) startForegroundMesh();
   }, []);
 
   // A peer's key changed: the router saves the warning, then emits. Alert once
@@ -108,16 +103,9 @@ export default function App() {
     });
   }, []);
 
-  // P0.1 — onboarding just created an identity; start the router now.
+  // Onboarding just created an identity; start the mesh now.
   useEffect(() => {
-    if (showOnboarding === false) {
-      messageRouter.start();
-      notifier.setOpenChatHandler(openChatFromNotification);
-      notifier.start();
-      telemetry.start();
-      mesh.start();
-      void positionProvider.start();
-    }
+    if (showOnboarding === false) startForegroundMesh();
   }, [showOnboarding]);
 
   if (showOnboarding === null || (!fontsLoaded && !fontError)) return null;

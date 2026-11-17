@@ -16,3 +16,8 @@ android {
     abortOnError false
   }
 }
+
+dependencies {
+  // HeadlessJsTaskService (background relay) lives in react-android.
+  implementation 'com.facebook.react:react-android'
+}

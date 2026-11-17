@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
-import { View, Text, TextInput, StyleSheet, Alert, ScrollView } from 'react-native';
+import { View, Text, TextInput, StyleSheet, Alert, ScrollView, AppState } from 'react-native';
 import { colors, fonts } from '../theme';
 import { ensureIdentity, updateDisplayName } from '../services/identity';
 import { bytesToHex } from '../services/ids';
@@ -11,6 +11,8 @@ import { DEFAULT_TTL } from '../services/protocol';
 import { LOCATION_TTL_MS } from '../services/location';
 import { getBoolSetting, getTableCounts, setBoolSetting } from '../db/database';
 import { getLocationTable } from '../services/location';
+import { syncRelayService } from '../services/boot';
+import BlePeripheral from '../../modules/BlePeripheral';
 import { TerminalHeader } from '../components/TerminalHeader';
 import { BlockBar, Btn, Chip, Fingerprint, KV, Label, Panel, Rule, Toggle } from '../components/ui';
 import { Stagger } from '../components/viz';
@@ -24,6 +26,8 @@ export function SettingsScreen() {
   const [notifyEnabled, setNotifyEnabled] = useState(() => getBoolSetting('notifications_enabled', true));
   const [hapticsEnabled, setHapticsEnabled] = useState(() => getBoolSetting('haptics_enabled', true));
   const [readReceipts, setReadReceipts] = useState(() => getBoolSetting('read_receipts', true));
+  const [relayEnabled, setRelayEnabled] = useState(() => getBoolSetting('background_relay_enabled', true));
+  const [batteryExempt, setBatteryExempt] = useState(() => BlePeripheral.isIgnoringBatteryOptimizations());
   const [, bump] = useState(0);
 
   // Table counts, link MTUs and the position table are read at render time, so
@@ -31,8 +35,22 @@ export function SettingsScreen() {
   useFocusEffect(useCallback(() => {
     bump(n => n + 1);
     setKnownPositions(getLocationTable().size);
+    setBatteryExempt(BlePeripheral.isIgnoringBatteryOptimizations());
   }, []));
   useEffect(() => mesh.neighborsChanged.subscribe(() => bump(n => n + 1)), []);
+  // The battery prompt opens a system screen, so re-check when the app returns.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', state => {
+      if (state === 'active') setBatteryExempt(BlePeripheral.isIgnoringBatteryOptimizations());
+    });
+    return () => sub.remove();
+  }, []);
+
+  const handleRelayToggle = (value: boolean) => {
+    setRelayEnabled(value);
+    setBoolSetting('background_relay_enabled', value);
+    syncRelayService();
+  };
 
   const handleGpsToggle = async (value: boolean) => {
     setGpsEnabled(value);
@@ -122,6 +140,25 @@ export function SettingsScreen() {
             </View>
             <Toggle value={readReceipts} onValueChange={toggleSetting('read_receipts', setReadReceipts)} />
           </View>
+        </Panel>
+
+        <Panel title="background relay" right={relayEnabled ? '[ on ]' : '[ off ]'} variant={relayEnabled ? 'hot' : 'default'}>
+          <View style={[styles.toggleRow, !batteryExempt && { marginBottom: 12 }]}>
+            <View style={{ flex: 1 }}>
+              <Label>keep relaying</Label>
+              <Text style={styles.tip}>
+                Keeps relaying and receiving while the app is closed. Shows a quiet ongoing notification.
+              </Text>
+            </View>
+            <Toggle value={relayEnabled} onValueChange={handleRelayToggle} />
+          </View>
+          {!batteryExempt && (
+            <Btn
+              label="allow unrestricted battery"
+              onPress={() => BlePeripheral.requestIgnoreBatteryOptimizations()}
+              style={styles.batteryBtn}
+            />
+          )}
         </Panel>
 
         <Rule title="geographic routing" />
@@ -225,6 +262,7 @@ const styles = StyleSheet.create({
     fontFamily: fonts.mono, fontSize: 13, color: colors.primary,
   },
   save: { paddingVertical: 11 },
+  batteryBtn: { alignSelf: 'flex-start', marginBottom: 0 },
   slab: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 10 },
   slabLabel: {
     width: 96, fontFamily: fonts.disp, fontSize: 9.5, letterSpacing: 0.8, textTransform: 'uppercase', color: colors.textMuted,

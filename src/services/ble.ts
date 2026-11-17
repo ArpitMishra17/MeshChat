@@ -1,5 +1,5 @@
-import { BleManager, Device, type Subscription } from 'react-native-ble-plx';
-import { Platform, PermissionsAndroid } from 'react-native';
+import { BleManager, Device, ScanMode, type Subscription } from 'react-native-ble-plx';
+import { AppState, Platform, PermissionsAndroid } from 'react-native';
 import BlePeripheral from '../../modules/BlePeripheral';
 import { ensureIdentity, getCrypto } from './identity';
 import { upsertPeer, checkPeerKeyChange, getAllPeers, getPeerByFingerprint } from '../db/database';
@@ -43,6 +43,16 @@ const SERVICE_UUID = '12345678-1234-5678-1234-56789abcdef0';
 const HANDSHAKE_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef1';
 const MESSAGE_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef2';
 const ACK_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef3';
+
+/**
+ * True when the app has no visible UI (backgrounded, screen off, or the
+ * headless relay task). Android delivers no results to an unfiltered scan in
+ * that state, so the background scan filters on SERVICE_UUID instead.
+ */
+export function isInBackground(): boolean {
+  return AppState.currentState !== 'active';
+}
+
 
 /** P0.3 — How long the central waits for the peripheral's HELLO notification. */
 export const HANDSHAKE_TIMEOUT_MS = 8000;
@@ -374,11 +384,18 @@ class BLEService {
         resolve();
       }, durationMs);
 
-      // Scan without UUID filter — many Android devices don't advertise
-      // service UUIDs reliably. We filter by name prefix instead.
+      // Foreground: scan without a UUID filter. Many Android devices don't
+      // advertise service UUIDs reliably, so we filter by name prefix instead.
+      // Background: Android returns nothing for an unfiltered scan with the
+      // screen off, so filter on SERVICE_UUID (our advertisement carries it).
+      // The name check below still applies, since the name is in the scan
+      // response. LowPower keeps the radio duty cheap while backgrounded.
+      const background = isInBackground();
       this.manager.startDeviceScan(
-        null,
-        { allowDuplicates: false },
+        background ? [SERVICE_UUID] : null,
+        background
+          ? { allowDuplicates: false, scanMode: ScanMode.LowPower }
+          : { allowDuplicates: false },
         (error, device) => {
           if (error) {
             this.clearScanTimer();

@@ -4,8 +4,12 @@ import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.ParcelUuid
+import android.os.PowerManager
+import android.provider.Settings
 import android.util.Base64
 import android.util.Log
 import expo.modules.kotlin.modules.Module
@@ -214,6 +218,20 @@ class BlePeripheralModule : Module() {
     }
   }
 
+  /** Context for the relay functions. Throws when the React context is gone. */
+  private fun appCtx(): Context = appContext.reactContext?.applicationContext
+    ?: throw IllegalStateException("React context not available")
+
+  /** Starts an activity from the module's context; false if none can handle it. */
+  private fun startActivitySafely(ctx: Context, intent: Intent): Boolean = try {
+    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    ctx.startActivity(intent)
+    true
+  } catch (e: Exception) {
+    Log.w(TAG, "No activity for ${intent.action}: ${e.message}")
+    false
+  }
+
   override fun definition() = ModuleDefinition {
     Name("BlePeripheral")
 
@@ -404,6 +422,76 @@ class BlePeripheralModule : Module() {
       for (waiter in notifyWaiters.values) waiter.complete(BluetoothGatt.GATT_FAILURE)
       notifyWaiters.clear()
       "Stopped"
+    }
+
+    /**
+     * Background relay — remember that the user wants the relay, then start the
+     * foreground service. Returns false if the service could not be started
+     * (for example, Bluetooth permissions are missing on Android 14+).
+     */
+    Function("startRelayService") {
+      try {
+        val ctx = appCtx()
+        MeshRelayService.setEnabled(ctx, true)
+        val intent = Intent(ctx, MeshRelayService::class.java)
+        if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(intent) else ctx.startService(intent)
+        true
+      } catch (e: Exception) {
+        Log.w(TAG, "startRelayService failed: ${e.message}")
+        false
+      }
+    }
+
+    /** Background relay — clear the flag and stop the foreground service. */
+    Function("stopRelayService") {
+      try {
+        val ctx = appCtx()
+        MeshRelayService.setEnabled(ctx, false)
+        ctx.stopService(Intent(ctx, MeshRelayService::class.java))
+        true
+      } catch (e: Exception) {
+        Log.w(TAG, "stopRelayService failed: ${e.message}")
+        false
+      }
+    }
+
+    /** Whether the user left the background relay enabled (persisted natively). */
+    Function("isRelayServiceEnabled") {
+      try {
+        MeshRelayService.isEnabled(appCtx())
+      } catch (e: Exception) {
+        false
+      }
+    }
+
+    /** True when Android is not restricting this app's background work. */
+    Function("isIgnoringBatteryOptimizations") {
+      try {
+        val ctx = appCtx()
+        val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
+        pm.isIgnoringBatteryOptimizations(ctx.packageName)
+      } catch (e: Exception) {
+        false
+      }
+    }
+
+    /**
+     * Opens the system prompt that exempts the app from battery optimisation,
+     * falling back to the general battery settings screen if no prompt exists.
+     */
+    Function("requestIgnoreBatteryOptimizations") {
+      try {
+        val ctx = appCtx()
+        val request = Intent(
+          Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+          Uri.parse("package:${ctx.packageName}"),
+        )
+        startActivitySafely(ctx, request) ||
+          startActivitySafely(ctx, Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+      } catch (e: Exception) {
+        Log.w(TAG, "requestIgnoreBatteryOptimizations failed: ${e.message}")
+        false
+      }
     }
   }
 }

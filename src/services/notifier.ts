@@ -6,10 +6,10 @@
  *   - app active, another / no chat open    -> light haptic, no banner
  *   - app active, this chat is open         -> very light selection haptic
  *
- * Limitation: Android may suspend the JS runtime when the app is backgrounded
- * for a long time (there is no foreground service). Banners are only
- * guaranteed while the process is alive; a message that arrives while JS is
- * suspended is stored and shown in the chat list, but gets no banner.
+ * While the background relay (MeshRelayService) runs, JS stays alive with the
+ * app closed, so banners still arrive. With the relay turned off, Android may
+ * suspend JS in the background and a message then gets no banner until the
+ * app is opened.
  *
  * Failures here must never reach the router, so every entry point swallows
  * and warns.
@@ -39,6 +39,7 @@ interface MessageEvent {
 let started = false;
 let activeConversationId: string | null = null;
 let openChatHandler: OpenChatHandler | null = null;
+let pendingOpen: { conversationId: string; peerDeviceId: string } | null = null;
 // 'unknown' until the first attempt; a 'denied' result is cached for the session
 // so we never prompt repeatedly.
 let permission: 'unknown' | 'granted' | 'denied' = 'unknown';
@@ -157,7 +158,13 @@ function dataString(data: Record<string, unknown> | undefined, key: string): str
 function openFromResponse(data: Record<string, unknown> | undefined): void {
   const conversationId = dataString(data, 'conversationId');
   const peerDeviceId = dataString(data, 'peerDeviceId');
-  if (!conversationId || !peerDeviceId || !openChatHandler) return;
+  if (!conversationId || !peerDeviceId) return;
+  if (!openChatHandler) {
+    // The background relay started JS before any UI existed; hold the tap until
+    // App mounts and registers its handler.
+    pendingOpen = { conversationId, peerDeviceId };
+    return;
+  }
   try {
     openChatHandler(conversationId, peerDeviceId);
   } catch (e) {
@@ -206,5 +213,8 @@ export const notifier = {
   /** Registered by App.tsx; invoked when a notification is tapped. */
   setOpenChatHandler(handler: OpenChatHandler | null): void {
     openChatHandler = handler;
+    const pending = pendingOpen;
+    pendingOpen = null;
+    if (handler && pending) openFromResponse(pending);
   },
 };

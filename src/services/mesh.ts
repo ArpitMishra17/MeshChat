@@ -1,4 +1,4 @@
-import { bleService, type NeighborInfo } from './ble';
+import { bleService, isInBackground, type NeighborInfo } from './ble';
 import { Emitter } from './events';
 import type { Peer } from '../types';
 
@@ -32,6 +32,13 @@ import type { Peer } from '../types';
 
 export const SCAN_MS = 15_000;
 export const PAUSE_MS = 15_000;
+/**
+ * Background duty cycle (app not visible): shorter scan window, longer pause.
+ * The filtered background scan finds the same peers at a fraction of the
+ * radio time, and relaying does not need sub-minute discovery.
+ */
+export const BG_SCAN_MS = 8_000;
+export const BG_PAUSE_MS = 45_000;
 /** Android's practical concurrent central GATT connection cap. */
 export const MAX_CENTRAL_CONNECTIONS = 4;
 /** How often central-side link RSSI is re-read for the signal meters. */
@@ -165,8 +172,9 @@ class MeshManager {
       return;
     }
     this.discoveredThisCycle.clear();
+    const background = isInBackground();
     try {
-      await bleService.startScan(SCAN_MS);
+      await bleService.startScan(background ? BG_SCAN_MS : SCAN_MS);
     } catch (e: any) {
       console.warn('[mesh] scan failed:', e?.message ?? e);
     }
@@ -174,7 +182,10 @@ class MeshManager {
     // Scan ended — drain discovered peers into the link pool.
     await this.drainDiscovered();
     if (!this.running) return;
-    this.cycleTimer = setTimeout(() => void this.dutyCycle(), PAUSE_MS);
+    this.cycleTimer = setTimeout(
+      () => void this.dutyCycle(),
+      background ? BG_PAUSE_MS : PAUSE_MS,
+    );
   }
 
   /**

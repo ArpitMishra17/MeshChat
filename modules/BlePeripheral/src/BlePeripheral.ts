@@ -26,6 +26,20 @@ declare class BlePeripheralNative extends NativeModule<BlePeripheralEvents> {
    */
   getMtu(deviceAddress: string): number;
   stop(): Promise<string>;
+  /**
+   * Background relay — persist the "relay on" flag and start the foreground
+   * service. Call only from the foreground (Android 12+ forbids starting a
+   * foreground service from the background). Returns false on failure.
+   */
+  startRelayService(): boolean;
+  /** Background relay — clear the flag and stop the foreground service. */
+  stopRelayService(): boolean;
+  /** Whether the user left the background relay enabled. */
+  isRelayServiceEnabled(): boolean;
+  /** Whether Android has exempted the app from battery optimisation. */
+  isIgnoringBatteryOptimizations(): boolean;
+  /** Opens the system battery-optimisation exemption prompt. */
+  requestIgnoreBatteryOptimizations(): boolean;
 }
 
 export default requireNativeModule<BlePeripheralNative>('BlePeripheral');
